@@ -15,6 +15,8 @@ let supportDir = FileManager.default.homeDirectoryForCurrentUser.appendingPathCo
 let isPreview = ProcessInfo.processInfo.environment["MULTICLAUDE_PREVIEW"] != nil
 // Releases are signed in CI with the matching private key (repo secret UPDATE_SIGNING_KEY).
 let updatePublicKey = "ovYVjB5Bst53pHaSwbk7KKX+JRAqv7zuponiduhHa+w="
+// Command-line modes (--list, --selftest-*, ...) only read; the menu bar app owns the profile list.
+let isCLI = CommandLine.arguments.count > 1
 let isDemo = ProcessInfo.processInfo.environment["MULTICLAUDE_DEMO"] != nil   // sample profiles for README screenshots
 
 extension Color {
@@ -33,6 +35,7 @@ struct Profile: Codable, Identifiable, Hashable {
     var dir: String?   // nil = the default Claude profile, launched without --user-data-dir
     var color: Int?    // index into Palette.colors; nil until the first load assigns one
     var openAtLaunch: Bool?
+    var codeDir: String?   // pinned Claude Code folder, kept when the data folder is renamed
 
     var isDefault: Bool { dir == nil }
     var initial: String { String(name.prefix(1)).uppercased() }
@@ -50,6 +53,7 @@ struct Profile: Codable, Identifiable, Hashable {
     // so each profile gets ~/.claude-<folder suffix>. The default profile keeps ~/.claude.
     var codeConfigDir: String? {
         guard let dir else { return nil }
+        if let codeDir { return codeDir }
         let suffix = URL(fileURLWithPath: dir).lastPathComponent.replacingOccurrences(of: "Claude-", with: "").lowercased()
         return FileManager.default.homeDirectoryForCurrentUser.path + "/.claude-" + suffix
     }
@@ -184,6 +188,7 @@ final class Engine: ObservableObject {
             profiles = Seed.profiles()
         }
         for i in profiles.indices where profiles[i].color == nil { profiles[i].color = nextColor() }
+        discoverFolders()
     }
 
     private func nextColor() -> Int {
@@ -275,8 +280,8 @@ final class Engine: ObservableObject {
         for app in NSWorkspace.shared.runningApplications where app.bundleIdentifier == claudeBundleID && !app.isTerminated {
             let dir = ProcArgs.of(app.processIdentifier)
                 .first { $0.hasPrefix("--user-data-dir=") }
-                .map { URL(fileURLWithPath: String($0.dropFirst(16))).standardizedFileURL.path }
-            if let p = profiles.first(where: { $0.dir.map { URL(fileURLWithPath: $0).standardizedFileURL.path } == dir }) {
+                .map { Folders.canonical(String($0.dropFirst(16))) }
+            if let p = profiles.first(where: { $0.dir.map(Folders.canonical) == dir }) {
                 found[p.id] = app
             }
         }
@@ -306,6 +311,7 @@ final class Engine: ObservableObject {
             onChange?()
         }
         reopenAfterUpdate(now: now)
+        alignFolders()   // after `running` is current, so an open profile is never moved
     }
 
     // Claude relaunches itself without --user-data-dir when it installs an update, so profile windows
@@ -463,18 +469,63 @@ final class Engine: ObservableObject {
         }
     }
 
+    // The folder follows the new name on its own (see alignFolders), once the profile is closed.
     func rename(_ p: Profile, to raw: String) {
         let name = raw.trimmingCharacters(in: .whitespaces)
         guard !name.isEmpty, let i = profiles.firstIndex(of: p) else { return }
-        profiles[i].name = name   // the data folder keeps its path, so sign-ins survive a rename
+        profiles[i].name = name
+        save()
+        alignFolders()
+    }
+
+    // Takes the profile off the list. Its data folder stays on disk and is not added back.
+    func remove(_ p: Profile) {
+        guard !p.isDefault, let dir = p.dir else { return }
+        defaults.set(Array(Set(ignoredFolders + [Folders.canonical(dir)])), forKey: "ignoredFolders")
+        profiles.removeAll { $0.id == p.id }
         save()
     }
 
-    // Takes the profile off the list. Its data folder stays on disk.
-    func remove(_ p: Profile) {
-        guard !p.isDefault else { return }
-        profiles.removeAll { $0.id == p.id }
+    private var ignoredFolders: [String] { defaults.stringArray(forKey: "ignoredFolders") ?? [] }
+
+    // Adds every Claude-* folder in Application Support that no profile uses yet.
+    func discoverFolders() {
+        guard !isDemo, !isCLI else { return }
+        let known = Set(profiles.compactMap(\.dir).map(Folders.canonical) + ignoredFolders)
+        let found = Folders.candidates(in: supportDir.path).filter { !known.contains(Folders.canonical($0)) }
+        guard !found.isEmpty else { return }
+        for dir in found {
+            let name = String(URL(fileURLWithPath: dir).lastPathComponent.dropFirst(7))
+            profiles.append(Profile(name: name, dir: dir, color: nextColor()))
+        }
         save()
+    }
+
+    // Renames each closed profile's folder to Claude-<name>. A symlink stays at the old path because
+    // Claude writes absolute paths into its data (agent sessions, git config), and old aliases keep working.
+    func alignFolders() {
+        guard !isDemo, !isCLI else { return }
+        // Read the live processes here rather than trusting `running`, which may not be filled in yet.
+        let live = Set(NSWorkspace.shared.runningApplications
+            .filter { $0.bundleIdentifier == claudeBundleID && !$0.isTerminated }
+            .compactMap { ProcArgs.of($0.processIdentifier).first { $0.hasPrefix("--user-data-dir=") } }
+            .map { Folders.canonical(String($0.dropFirst(16))) })
+        var changed = false
+        for i in profiles.indices {
+            let p = profiles[i]
+            guard let dir = p.dir, !live.contains(Folders.canonical(dir)), !isRunning(p), pending[p.id] == nil,
+                  !Folders.inUse(dir),
+                  let target = Folders.target(for: p.name, current: dir, in: supportDir.path) else { continue }
+            let oldCode = p.codeConfigDir
+            if Folders.move(dir, to: target) {
+                if p.codeDir == nil, let oldCode, FileManager.default.fileExists(atPath: oldCode) {
+                    profiles[i].codeDir = oldCode   // its Keychain sign-in is tied to this path
+                }
+                profiles[i].dir = target
+                changed = true
+            }
+        }
+        if changed { save() }
     }
 
     func setColor(_ p: Profile, _ c: Int) {
@@ -492,7 +543,7 @@ final class Engine: ObservableObject {
     }
 
     private func save() {
-        if !isDemo, let data = try? JSONEncoder().encode(profiles) { defaults.set(data, forKey: "profiles") }
+        if !isDemo, !isCLI, let data = try? JSONEncoder().encode(profiles) { defaults.set(data, forKey: "profiles") }
         updateHotKeys()
         onChange?()
     }
@@ -623,6 +674,58 @@ enum Updater {
         try? sh.run()
         relaunching = true
         NSApp.terminate(nil)
+    }
+}
+
+enum Folders {
+    static func canonical(_ path: String) -> String {
+        URL(fileURLWithPath: path).standardizedFileURL.resolvingSymlinksInPath().path
+    }
+
+    // Electron keeps a SingletonLock link in the folder while an instance uses it.
+    static func inUse(_ dir: String) -> Bool {
+        (try? FileManager.default.destinationOfSymbolicLink(atPath: dir + "/SingletonLock")) != nil
+    }
+
+    static func slug(_ name: String) -> String {
+        name.filter { $0.isLetter || $0.isNumber || $0 == "-" || $0 == "_" }
+    }
+
+    // Real Claude-* folders (not the symlinks left by renames, not Claude's own Claude-3p).
+    static func candidates(in support: String) -> [String] {
+        let fm = FileManager.default
+        return ((try? fm.contentsOfDirectory(atPath: support)) ?? []).sorted().compactMap { n in
+            guard n.hasPrefix("Claude-"), n != "Claude-3p", n.count > 7 else { return nil }
+            let path = support + "/" + n
+            let type = (try? fm.attributesOfItem(atPath: path))?[.type] as? FileAttributeType
+            return type == .typeDirectory ? path : nil
+        }
+    }
+
+    // Where a profile's folder should live, or nil when it already does or the name is taken.
+    static func target(for name: String, current: String, in support: String) -> String? {
+        let slug = self.slug(name)
+        guard !slug.isEmpty else { return nil }
+        let target = support + "/Claude-" + slug
+        let fm = FileManager.default
+        guard URL(fileURLWithPath: current).lastPathComponent != "Claude-" + slug,
+              URL(fileURLWithPath: current).deletingLastPathComponent().standardizedFileURL.path
+                == URL(fileURLWithPath: support).standardizedFileURL.path,
+              fm.fileExists(atPath: current), !fm.fileExists(atPath: target),
+              (try? fm.destinationOfSymbolicLink(atPath: target)) == nil else { return nil }
+        return target
+    }
+
+    static func move(_ from: String, to: String) -> Bool {
+        let fm = FileManager.default
+        do {
+            try fm.moveItem(atPath: from, toPath: to)
+            try fm.createSymbolicLink(atPath: from, withDestinationPath: to)
+            return true
+        } catch {
+            if !fm.fileExists(atPath: from), fm.fileExists(atPath: to) { try? fm.moveItem(atPath: to, toPath: from) }
+            return false
+        }
     }
 }
 
@@ -1227,6 +1330,7 @@ final class PanelController {
         let x = min(max(b.minX - 12, screen.visibleFrame.minX + 6), screen.visibleFrame.maxX - width - 6)
         anchor = NSPoint(x: x, y: b.minY - 6)
         resize(to: host?.fittingSize ?? NSSize(width: width, height: 300))
+        Engine.shared.discoverFolders()
         Engine.shared.refresh()
         p.makeKeyAndOrderFront(nil)
         monitor = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown]) { _ in
@@ -1562,6 +1666,20 @@ if args.count == 2, args[1] == "--selftest-profiles" {
     check("copy leaves a backup", backups.count == 1)
     try? Data("not json".utf8).write(to: MCP.configURL(pb))
     check("copy refuses a broken target file", (try? MCP.copy(from: pa, to: pb)) == nil)
+    let sup = tmp.appendingPathComponent("Support").path
+    try? FileManager.default.createDirectory(atPath: sup + "/Claude-Work/Local Storage", withIntermediateDirectories: true)
+    try? FileManager.default.createDirectory(atPath: sup + "/Claude-3p", withIntermediateDirectories: true)
+    try? FileManager.default.createDirectory(atPath: sup + "/Claude-Moonsun", withIntermediateDirectories: true)
+    check("candidates skip Claude-3p", Folders.candidates(in: sup).map { URL(fileURLWithPath: $0).lastPathComponent } == ["Claude-Moonsun", "Claude-Work"])
+    let tgt = Folders.target(for: "Augura", current: sup + "/Claude-Work", in: sup)
+    check("target follows the name", tgt == sup + "/Claude-Augura")
+    check("no target when already aligned", Folders.target(for: "Moonsun", current: sup + "/Claude-Moonsun", in: sup) == nil)
+    check("no target onto another profile's folder", Folders.target(for: "Moonsun", current: sup + "/Claude-Work", in: sup) == nil)
+    check("move succeeds", Folders.move(sup + "/Claude-Work", to: sup + "/Claude-Augura"))
+    check("old path is a symlink to the new one", (try? FileManager.default.destinationOfSymbolicLink(atPath: sup + "/Claude-Work")) == sup + "/Claude-Augura")
+    check("candidates skip the symlink", Folders.candidates(in: sup).map { URL(fileURLWithPath: $0).lastPathComponent } == ["Claude-Augura", "Claude-Moonsun"])
+    check("canonical resolves the old path", Folders.canonical(sup + "/Claude-Work") == Folders.canonical(sup + "/Claude-Augura"))
+    check("no target onto a leftover symlink", Folders.target(for: "Work", current: sup + "/Claude-Augura", in: sup) == nil)
     try? FileManager.default.removeItem(at: tmp)
     exit(ok ? 0 : 1)
 }

@@ -6,6 +6,8 @@
 - **Copy MCP servers between profiles.** Right-click a profile, **Copy MCP Servers From**, pick the source. Servers with the same name are replaced, the target's config is backed up first, and a running target can be reopened in the same step.
 - **Open When MultiClaude Starts**, per profile. A restart after a MultiClaude update doesn't reopen them.
 - **Duplicate as New Profile.** Clones a profile's data folder, sign-in and chats included, into a new profile with APFS clones (instant, no extra space). A running source quits for the copy and reopens after.
+- **The list matches your folders.** Any `Claude-*` folder in Application Support that no profile uses yet is added to the list. Folders removed with **Remove from List** stay out.
+- **Folders follow profile names.** After a rename, the profile's folder becomes `Claude-<Name>` once that account is closed, with a link left at the old path for old aliases and the absolute paths Claude saves in its data. A profile's Claude Code folder keeps its old path so its sign-in survives.
 - **Signed updates.** Each release zip is signed with an Ed25519 key held as a repository secret. MultiClaude only installs an update whose signature matches the public key built into the app.
 
 ### Fixed

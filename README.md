@@ -71,7 +71,8 @@ MultiClaude is that trick with a proper interface.
 - **Open accounts at startup.** Right-click a profile and tick **Open When MultiClaude Starts**. With Launch at Login on, your accounts are waiting every morning.
 - **Duplicate a profile.** **Duplicate as New Profile** clones a profile's whole data folder, sign-in and chats included, into a new one. Handy for keeping your current history under a name like "Personal" before signing the default app in to another account. On APFS the copy is instant and takes no extra space.
 - **Right-click** a profile to rename it, move it, show its data folder in Finder, copy a shell alias for it, or take it off the list.
-- **Imports your setup.** First launch picks up your default Claude account, any `--user-data-dir` aliases in `~/.zshrc`, and any `Claude-*` folder in Application Support.
+- **Imports your setup.** First launch picks up your default Claude account, any `--user-data-dir` aliases in `~/.zshrc`, and any `Claude-*` folder in Application Support. A `Claude-*` folder created later, by an alias for example, joins the list on its own.
+- **Folders follow names.** Rename a profile and its folder becomes `Claude-<Name>` the next time that account is closed. A link stays at the old path, so old aliases and Claude's own saved paths keep working.
 - **Global shortcuts.** ⌃⌥⌘M opens the panel; turn on Profile Shortcuts and ⌃⌥1 to ⌃⌥9 jump straight to each account.
 - **Updates itself.** Once a day MultiClaude checks for a new release, installs it in the background and restarts while the panel is closed. Your Claude windows stay open.
 - **Launch at login**, light and dark mode, colored menu bar icon.
@@ -117,7 +118,7 @@ Your default Claude account is always the first profile. It uses the app's norma
 
 - **Opening** a profile runs `open -n -a Claude --args --user-data-dir=<folder>`, exactly like the alias. The default profile runs `open -a Claude`.
 - **Status** comes from the running Claude processes: MultiClaude reads each one's `--user-data-dir` argument and matches it to a profile.
-- **Profiles** are a small list in MultiClaude's own preferences (`me.somalabs.multiclaude`). Data folders live in `~/Library/Application Support/Claude-<Name>`, next to Claude's own.
+- **Profiles** are a small list in MultiClaude's own preferences (`me.somalabs.multiclaude`). Data folders live in `~/Library/Application Support/Claude-<Name>`, next to Claude's own. MultiClaude never moves the folder of an account that is open. **Remove from List** keeps the folder and stops MultiClaude from adding it back.
 
 ### Privacy
 
