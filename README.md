@@ -8,6 +8,14 @@ Each profile is its own Claude data folder (`--user-data-dir`), so every profile
 
 ## Install
 
+With [Homebrew](https://brew.sh):
+
+```bash
+brew install --cask quentincar0n/tap/multiclaude
+```
+
+Or by hand:
+
 1. Download `MultiClaude-<version>.zip` from [Releases](https://github.com/QuentinCar0n/multiclaude/releases) and unzip it.
 2. Move `MultiClaude.app` to Applications.
 3. The app is not notarized, so macOS blocks the first launch. Either right-click the app and choose Open, or run:
