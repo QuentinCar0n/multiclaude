@@ -1,11 +1,15 @@
-<div align="center">
+<a href="https://github.com/QuentinCar0n/multiclaude/releases/latest">
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="preview/hero-dark.png">
+  <img src="preview/hero-light.png" width="100%" alt="MultiClaude: all your Claude accounts, open at once. The menu bar panel lists Personal, Work, Client and Research profiles, with Personal and Work running.">
+</picture>
+</a>
 
-<img src="preview/icon.png" width="128" alt="MultiClaude icon">
+<div align="center">
 
 # MultiClaude
 
-**Run several Claude accounts side by side on one Mac.**
-Personal, work, client: each one signed in, each one a click away in your menu bar.
+**All your Claude accounts, open at once.** A free menu bar app for macOS.
 
 [![Release](https://img.shields.io/github/v/release/QuentinCar0n/multiclaude?color=D97757)](https://github.com/QuentinCar0n/multiclaude/releases/latest)
 [![Homebrew](https://img.shields.io/badge/brew-quentincar0n%2Ftap%2Fmulticlaude-D97757)](https://github.com/QuentinCar0n/homebrew-tap)
@@ -17,33 +21,28 @@ Personal, work, client: each one signed in, each one a click away in your menu b
 brew install --cask quentincar0n/tap/multiclaude
 ```
 
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="preview/panel-dark.png">
-  <img src="preview/panel-light.png" width="360" alt="MultiClaude menu bar panel with four profiles, two of them running">
-</picture>
+[**Download the latest release**](https://github.com/QuentinCar0n/multiclaude/releases/latest) &nbsp;&middot;&nbsp; [Why](#why) &nbsp;&middot;&nbsp; [Features](#features) &nbsp;&middot;&nbsp; [How it works](#how-it-works) &nbsp;&middot;&nbsp; [FAQ](#faq)
 
 </div>
 
 ## Why
 
-The Claude desktop app signs in to **one account at a time**. Many people have more than one:
+The Claude desktop app signs in to **one account at a time**. Plenty of people have more than one:
 
 - a personal Pro or Max plan, and a Team or Enterprise seat from work,
 - a separate organization per client, so their projects and data never mix,
 - a test account to try a setup before rolling it out to a team.
 
-Switching means signing out, signing back in, waiting for the email code, and losing your place. Running two accounts at once is not possible from the app itself.
+Switching means signing out, signing back in, waiting for the email code and losing your place. The app can't run two accounts at once.
 
-### The workaround, and its limits
+Claude desktop does accept `--user-data-dir`: give each copy its own folder and each one keeps its own sign-in, chats and settings. Power users wire that into shell aliases. It works, but you can't see what's open, re-running an alias doesn't bring the right window forward, and every new account means editing `~/.zshrc`.
 
-Claude desktop is an Electron app, so it accepts `--user-data-dir`. Point each copy at its own folder and each one keeps its own sign-in, chats and settings. Power users end up with aliases like these in `~/.zshrc`:
+MultiClaude is that trick with a proper interface.
 
-```bash
-alias work='open -n -a "Claude" --args --user-data-dir="$HOME/Library/Application Support/Claude-Work"'
-alias client='open -n -a "Claude" --args --user-data-dir="$HOME/Library/Application Support/Claude-Client"'
-```
-
-It works, but:
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="preview/before-after-dark.png">
+  <img src="preview/before-after-light.png" width="100%" alt="Before: Claude aliases in ~/.zshrc and a terminal. After: the MultiClaude panel with live status for each account.">
+</picture>
 
 | | Shell aliases | MultiClaude |
 | --- | :---: | :---: |
@@ -54,8 +53,6 @@ It works, but:
 | Add an account | edit `~/.zshrc`, reload the shell | type a name, press Return |
 | Rename, reorder, find its data | by hand | right-click |
 | Keep your existing aliases | | imported on first launch |
-
-MultiClaude is that workaround with a proper interface. It does nothing your shell could not do, it just makes it pleasant.
 
 ## Features
 
@@ -69,6 +66,13 @@ MultiClaude is that workaround with a proper interface. It does nothing your she
 - **Global shortcut** ⌃⌥⌘M opens the panel from anywhere.
 - **Launch at login**, light and dark mode, colored menu bar icon.
 - **Tiny.** A single Swift file, no dependencies, under 1.5 MB installed.
+
+<p align="center">
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="preview/settings-dark.png">
+  <img src="preview/settings-light.png" width="300" alt="The MultiClaude panel with its Settings section open">
+</picture>
+</p>
 
 ## Install
 
