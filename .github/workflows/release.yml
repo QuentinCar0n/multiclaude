@@ -1,0 +1,71 @@
+# Builds MultiClaude on every v* tag and publishes the zip as a GitHub release.
+# The tag sets the version: v1.1 builds MultiClaude-1.1.zip with CFBundleShortVersionString 1.1.
+# Release notes come from the matching "## <version>" section of CHANGELOG.md.
+# With a HOMEBREW_TAP_TOKEN secret (fine-grained PAT, contents write on QuentinCar0n/homebrew-tap),
+# the job also bumps the cask. Run by hand (workflow_dispatch) to build without releasing.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: macos-15
+    env:
+      TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Version
+        run: |
+          if [[ "$GITHUB_REF_TYPE" == "tag" ]]; then
+            echo "VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"
+          else
+            echo "VERSION=0.0.0-ci" >> "$GITHUB_ENV"
+          fi
+          echo "BUILD=${{ github.run_number }}" >> "$GITHUB_ENV"
+
+      - name: Build
+        run: |
+          swiftc --version
+          ./build.sh --no-install
+          lipo -archs build/MultiClaude.app/Contents/MacOS/MultiClaude
+          codesign -v build/MultiClaude.app
+          shasum -a 256 "build/MultiClaude-$VERSION.zip" | tee build/sha256.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: MultiClaude-${{ env.VERSION }}
+          path: build/MultiClaude-${{ env.VERSION }}.zip
+
+      - name: Release
+        if: github.ref_type == 'tag'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          awk -v v="$VERSION" '
+            /^## / { on = index($0, "## " v " ") == 1 || $0 == "## " v; next }
+            on' CHANGELOG.md > build/notes.md
+          cat >> build/notes.md <<'NOTES'
+
+          **Install:** `brew install --cask quentincar0n/tap/multiclaude`, or unzip and move MultiClaude.app to Applications. The app is not notarized, so right-click it and choose Open the first time.
+          NOTES
+          gh release create "$GITHUB_REF_NAME" "build/MultiClaude-$VERSION.zip" \
+            --title "MultiClaude $VERSION" --notes-file build/notes.md
+
+      - name: Bump Homebrew cask
+        if: github.ref_type == 'tag' && env.TAP_TOKEN != ''
+        run: |
+          SHA=$(cut -d' ' -f1 build/sha256.txt)
+          git clone "https://x-access-token:${TAP_TOKEN}@github.com/QuentinCar0n/homebrew-tap.git" tap
+          cd tap
+          sed -i '' -E "s/^  version \".*\"/  version \"$VERSION\"/; s/^  sha256 \".*\"/  sha256 \"$SHA\"/" Casks/multiclaude.rb
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -am "multiclaude $VERSION"
+          git push
