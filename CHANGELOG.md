@@ -1,6 +1,6 @@
 # MultiClaude release notes
 
-## Unreleased
+## 1.3 (build 4), 2026-10-09
 
 ### New
 - **Copy MCP servers between profiles.** Right-click a profile, **Copy MCP Servers From**, pick the source. Servers with the same name are replaced, the target's config is backed up first, and a running target can be reopened in the same step.
