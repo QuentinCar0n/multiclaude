@@ -53,17 +53,23 @@ MultiClaude is that trick with a proper interface.
 | Add an account | edit `~/.zshrc`, reload the shell | type a name, press Return |
 | Rename, reorder, find its data | by hand | right-click |
 | Keep your existing aliases | | imported on first launch |
+| Tell accounts apart | every window has the same icon | a color per account, active one named in the menu bar |
+| After Claude updates itself | windows come back on the default account | profiles reopen on their own accounts |
 
 ## Features
 
 - **One profile per account.** Each profile is its own Claude data folder, so sign-ins and chats never leak between accounts.
-- **Live status.** An orange badge marks every account that is running. The menu bar shows how many are open.
+- **A color per account.** Each profile gets its own color, so you can tell Personal from Work at a glance. Right-click to change it.
+- **Know which account is in front.** While a Claude window is active, the menu bar shows its account name in that account's color.
+- **Live status.** A filled badge marks every account that is running. The menu bar shows how many are open.
+- **Survives Claude updates.** When Claude updates itself it relaunches on the default account, which breaks every `--user-data-dir` setup. MultiClaude notices and reopens each profile on its own account.
+- **Claude Code per account.** Right-click a profile and choose **Open Claude Code in Terminal**: the CLI runs signed in as that account, with its own `CLAUDE_CONFIG_DIR`.
 - **Click to open, click again to focus.** No duplicate windows.
 - **Hover to quit** a single account. The header switch opens or quits all of them at once.
 - **New Profile** in one line: type a name, press Return, sign in to the new account in the window that opens.
 - **Right-click** a profile to rename it, move it, show its data folder in Finder, copy a shell alias for it, or take it off the list.
 - **Imports your setup.** First launch picks up your default Claude account, any `--user-data-dir` aliases in `~/.zshrc`, and any `Claude-*` folder in Application Support.
-- **Global shortcut** ⌃⌥⌘M opens the panel from anywhere.
+- **Global shortcuts.** ⌃⌥⌘M opens the panel; turn on Profile Shortcuts and ⌃⌥1 to ⌃⌥9 jump straight to each account.
 - **Launch at login**, light and dark mode, colored menu bar icon.
 - **Tiny.** A single Swift file, no dependencies, under 1.5 MB installed.
 
@@ -118,8 +124,8 @@ MultiClaude makes **no network requests** and has **no analytics**. It never ope
 **Is this made by Anthropic?**
 No. MultiClaude is an independent open source tool. It launches the official Claude app and does not change it.
 
-**Does it work with Claude Code in the desktop app?**
-Yes. Each Claude window, and the Code tab inside it, runs with the account of its profile.
+**Does it work with Claude Code?**
+Yes. In the desktop app, each Claude window and the Code tab inside it run with the account of its profile. For the CLI, right-click a profile and choose **Open Claude Code in Terminal**, or **Copy Claude Code Alias** for your shell. Each profile gets its own `~/.claude-<name>` folder, and Claude Code keeps a separate sign-in for each.
 
 **Can I still use my aliases?**
 Yes. MultiClaude reads the same folders, so an account opened from an alias shows as running in the panel. Right-click a profile and choose **Copy Shell Alias** to get one for a new profile.

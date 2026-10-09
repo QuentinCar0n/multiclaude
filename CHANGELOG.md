@@ -1,5 +1,17 @@
 # MultiClaude release notes
 
+## 1.2 (build 3), 2026-10-09
+
+### New
+- **Reopen after Claude updates.** Claude relaunches on the default account when it installs an update, so profile windows came back signed in as the wrong account. MultiClaude now reopens each profile that closed around the update, and says so at the top of the panel. On by default; switch it off in Settings.
+- **Claude Code per account.** Right-click a profile: **Open Claude Code in Terminal** runs the CLI with `CLAUDE_CONFIG_DIR=~/.claude-<name>`, so it signs in and keeps history separately for that account. **Copy Claude Code Alias** gives the same as a shell alias.
+- **A color per profile.** Badges, the running label and the menu bar use it. Change it from the right-click menu.
+- **Active account in the menu bar.** While a Claude window is in front, the menu bar shows its account name in the profile's color, and the row says Active.
+- **Profile Shortcuts.** ⌃⌥1 to ⌃⌥9 open or bring forward the profiles in list order. Off by default.
+
+### Changed
+- `MultiClaude --list` also prints whether each profile is active and its color.
+
 ## 1.1 (build 2), 2026-10-09
 
 - Open source under the Apache License 2.0.

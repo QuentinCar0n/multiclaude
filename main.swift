@@ -28,17 +28,48 @@ struct Profile: Codable, Identifiable, Hashable {
     var id = UUID()
     var name: String
     var dir: String?   // nil = the default Claude profile, launched without --user-data-dir
+    var color: Int?    // index into Palette.colors; nil until the first load assigns one
 
     var isDefault: Bool { dir == nil }
     var initial: String { String(name.prefix(1)).uppercased() }
     var folderURL: URL { dir.map { URL(fileURLWithPath: $0) } ?? supportDir.appendingPathComponent("Claude") }
+    var tint: Color { Color(nsColor: nsTint) }
+    var nsTint: NSColor { Palette.colors[(color ?? 0) % Palette.colors.count].color }
+    private var key: String { name.lowercased().filter { $0.isLetter || $0.isNumber } }
 
     var shellAlias: String {
-        let key = name.lowercased().filter { $0.isLetter || $0.isNumber }
         guard let dir else { return "alias \(key)='open -a \"Claude\"'" }
         return "alias \(key)='open -n -a \"Claude\" --args --user-data-dir=\"\(dir)\"'"
     }
+
+    // Claude Code keeps its sign-in per config folder (and per Keychain entry on macOS),
+    // so each profile gets ~/.claude-<folder suffix>. The default profile keeps ~/.claude.
+    var codeConfigDir: String? {
+        guard let dir else { return nil }
+        let suffix = URL(fileURLWithPath: dir).lastPathComponent.replacingOccurrences(of: "Claude-", with: "").lowercased()
+        return FileManager.default.homeDirectoryForCurrentUser.path + "/.claude-" + suffix
+    }
+
+    var codeAlias: String {
+        guard let codeConfigDir else { return "alias claude-\(key)='claude'" }
+        return "alias claude-\(key)='CLAUDE_CONFIG_DIR=\"\(codeConfigDir)\" claude'"
+    }
 }
+
+enum Palette {
+    static let colors: [(name: String, color: NSColor)] = [
+        ("Orange", .claude),
+        ("Blue", NSColor(srgbRed: 0.29, green: 0.55, blue: 0.96, alpha: 1)),
+        ("Green", NSColor(srgbRed: 0.27, green: 0.69, blue: 0.44, alpha: 1)),
+        ("Purple", NSColor(srgbRed: 0.62, green: 0.45, blue: 0.91, alpha: 1)),
+        ("Pink", NSColor(srgbRed: 0.91, green: 0.41, blue: 0.62, alpha: 1)),
+        ("Teal", NSColor(srgbRed: 0.18, green: 0.66, blue: 0.71, alpha: 1)),
+        ("Yellow", NSColor(srgbRed: 0.88, green: 0.67, blue: 0.18, alpha: 1)),
+        ("Graphite", NSColor(srgbRed: 0.52, green: 0.52, blue: 0.55, alpha: 1)),
+    ]
+}
+
+func shellQuote(_ s: String) -> String { "'" + s.replacingOccurrences(of: "'", with: "'\\''") + "'" }
 
 enum Seed {
     // First run: the default profile, the Claude aliases in ~/.zshrc, then any other Claude-* folder.
@@ -66,14 +97,19 @@ enum Seed {
 // MARK: - Settings
 
 enum Setting: String, CaseIterable, Identifiable {
-    case launchAtLogin, shortcut, showCount, coloredIcon, quitWithApp
+    case launchAtLogin, reopenAfterUpdate, shortcut, profileShortcuts, showActive, showCount, coloredIcon, quitWithApp
+
+    static let onByDefault: Set<Setting> = [.reopenAfterUpdate, .showActive, .showCount]
 
     var id: String { rawValue }
 
     var title: String {
         switch self {
         case .launchAtLogin: "Launch at Login"
+        case .reopenAfterUpdate: "Reopen After Claude Updates"
         case .shortcut: "Keyboard Shortcut"
+        case .profileShortcuts: "Profile Shortcuts"
+        case .showActive: "Show Active Account in Menu Bar"
         case .showCount: "Show Count in Menu Bar"
         case .coloredIcon: "Colored Menu Bar Icon"
         case .quitWithApp: "Quit Profiles with MultiClaude"
@@ -83,14 +119,23 @@ enum Setting: String, CaseIterable, Identifiable {
     var symbol: String {
         switch self {
         case .launchAtLogin: "power"
+        case .reopenAfterUpdate: "arrow.clockwise"
         case .shortcut: "command"
+        case .profileShortcuts: "keyboard"
+        case .showActive: "menubar.rectangle"
         case .showCount: "number"
         case .coloredIcon: "paintpalette"
         case .quitWithApp: "xmark.circle"
         }
     }
 
-    var hint: String? { self == .shortcut ? "⌃⌥⌘M" : nil }
+    var hint: String? {
+        switch self {
+        case .shortcut: "⌃⌥⌘M"
+        case .profileShortcuts: "⌃⌥1 to 9"
+        default: nil
+        }
+    }
 }
 
 // MARK: - Engine
@@ -101,19 +146,28 @@ final class Engine: ObservableObject {
 
     @Published private(set) var profiles: [Profile]
     @Published private(set) var running: [UUID: NSRunningApplication] = [:]
+    @Published private(set) var frontID: UUID?     // profile of the frontmost Claude window
+    @Published private(set) var notice: String?    // one-line message at the top of the panel
 
     var onChange: (() -> Void)?
+    var onPanelHotKey: (() -> Void)?
 
     private let defaults = UserDefaults.standard
     private var pending: [UUID: Date] = [:]   // launched, process not seen yet
     private var demoRunning: Set<UUID> = []
+    private var claudeVersion = UpdateWatch.installedVersion()
+    private var updatedAt: Date?
+    private var quitAt: [UUID: Date] = [:]    // profiles that stopped without MultiClaude quitting them
+    private var userQuit: Set<UUID> = []
 
     private init() {
         if isDemo {
             profiles = ["Personal", "Work", "Client", "Research"].enumerated().map { i, n in
                 Profile(name: n, dir: i == 0 ? nil : "/tmp/multiclaude-demo/Claude-\(n)")
             }
+            for i in profiles.indices { profiles[i].color = i }
             demoRunning = [profiles[0].id, profiles[1].id]
+            frontID = profiles[1].id
             return
         }
         if let data = defaults.data(forKey: "profiles"), let list = try? JSONDecoder().decode([Profile].self, from: data) {
@@ -121,13 +175,19 @@ final class Engine: ObservableObject {
         } else {
             profiles = Seed.profiles()
         }
+        for i in profiles.indices where profiles[i].color == nil { profiles[i].color = nextColor() }
+    }
+
+    private func nextColor() -> Int {
+        let used = Set(profiles.compactMap(\.color))
+        return Palette.colors.indices.first { !used.contains($0) } ?? profiles.count % Palette.colors.count
     }
 
     func boot() {
         save()
-        HotKey.set(isOn(.shortcut))
         let nc = NSWorkspace.shared.notificationCenter
-        for name in [NSWorkspace.didLaunchApplicationNotification, NSWorkspace.didTerminateApplicationNotification] {
+        for name in [NSWorkspace.didLaunchApplicationNotification, NSWorkspace.didTerminateApplicationNotification,
+                     NSWorkspace.didActivateApplicationNotification] {
             nc.addObserver(forName: name, object: nil, queue: .main) { _ in
                 MainActor.assumeIsolated { Engine.shared.refresh() }
             }
@@ -143,7 +203,7 @@ final class Engine: ObservableObject {
 
     func isOn(_ s: Setting) -> Bool {
         if s == .launchAtLogin { return SMAppService.mainApp.status == .enabled }
-        if s == .showCount && defaults.object(forKey: s.rawValue) == nil { return true }
+        if Setting.onByDefault.contains(s) && defaults.object(forKey: s.rawValue) == nil { return true }
         return defaults.bool(forKey: s.rawValue)
     }
 
@@ -156,9 +216,33 @@ final class Engine: ObservableObject {
             return
         }
         defaults.set(on, forKey: s.rawValue)
-        if s == .shortcut { HotKey.set(on) }
+        if s == .shortcut || s == .profileShortcuts { updateHotKeys() }
         onChange?()
     }
+
+    // ⌃⌥⌘M opens the panel; ⌃⌥1 to ⌃⌥9 open or focus the profiles in list order.
+    func updateHotKeys() {
+        var keys: [HotKey.Binding] = []
+        if isOn(.shortcut) {
+            keys.append(.init(key: kVK_ANSI_M, mods: cmdKey | optionKey | controlKey) { Engine.shared.onPanelHotKey?() })
+        }
+        if isOn(.profileShortcuts) {
+            for (i, p) in profiles.prefix(9).enumerated() {
+                let id = p.id
+                keys.append(.init(key: HotKey.digits[i], mods: optionKey | controlKey) {
+                    if let p = Engine.shared.profiles.first(where: { $0.id == id }) { Engine.shared.open(p) }
+                })
+            }
+        }
+        HotKey.register(keys)
+    }
+
+    func shortcutHint(for p: Profile) -> String? {
+        guard isOn(.profileShortcuts), let i = profiles.firstIndex(of: p), i < 9 else { return nil }
+        return "⌃⌥\(i + 1)"
+    }
+
+    func dismissNotice() { notice = nil }
 
     // MARK: running instances
 
@@ -176,10 +260,42 @@ final class Engine: ObservableObject {
         }
         for id in found.keys { pending[id] = nil }
         pending = pending.filter { $0.value.timeIntervalSinceNow > -15 }
-        if found.keys.sorted(by: { $0.uuidString < $1.uuidString }) != running.keys.sorted(by: { $0.uuidString < $1.uuidString }) {
+
+        let now = Date()
+        for id in running.keys where found[id] == nil {
+            if userQuit.remove(id) == nil { quitAt[id] = now }
+        }
+        for id in found.keys { quitAt[id] = nil }
+        quitAt = quitAt.filter { now.timeIntervalSince($0.value) < 300 }
+        if let v = UpdateWatch.installedVersion(), v != claudeVersion {
+            claudeVersion = v
+            updatedAt = now
+        }
+
+        let front = NSWorkspace.shared.frontmostApplication?.processIdentifier
+        let newFront = found.first { $0.value.processIdentifier == front }?.key
+        if Set(found.keys) != Set(running.keys) || newFront != frontID {
             running = found
+            frontID = newFront
             onChange?()
         }
+        reopenAfterUpdate(now: now)
+    }
+
+    // Claude relaunches itself without --user-data-dir when it installs an update, so profile windows
+    // come back on the default account. Reopen each profile that stopped around the update.
+    private func reopenAfterUpdate(now: Date) {
+        guard isOn(.reopenAfterUpdate), let updatedAt else { return }
+        let relaunched = running.values.contains { ($0.launchDate ?? .distantPast) > updatedAt.addingTimeInterval(-10) }
+        let due = UpdateWatch.due(quitAt: quitAt, updatedAt: updatedAt, relaunched: relaunched, now: now)
+        let reopen = profiles.filter { due.contains($0.id) && !$0.isDefault }
+        guard !reopen.isEmpty else { return }
+        for p in reopen {
+            quitAt[p.id] = nil
+            open(p)
+        }
+        notice = "Claude updated. Reopened " + ListFormatter.localizedString(byJoining: reopen.map(\.name)) + "."
+        onChange?()
     }
 
     func isRunning(_ p: Profile) -> Bool { running[p.id] != nil || demoRunning.contains(p.id) }
@@ -209,7 +325,25 @@ final class Engine: ObservableObject {
     }
 
     func quit(_ p: Profile) {
-        running[p.id]?.terminate()
+        guard let app = running[p.id] else { return }
+        userQuit.insert(p.id)
+        app.terminate()
+    }
+
+    // Opens Terminal running Claude Code signed in as this profile's account.
+    func openClaudeCode(_ p: Profile) {
+        var lines = ["#!/bin/zsh"]
+        if let dir = p.codeConfigDir {
+            try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+            lines.append("export CLAUDE_CONFIG_DIR=\(shellQuote(dir))")
+        }
+        lines += ["clear", "echo \(shellQuote("Claude Code as " + p.name))", "cd ~", "claude", "exec $SHELL -l"]
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent("MultiClaude-\(p.id.uuidString.prefix(8)).command")
+        do {
+            try lines.joined(separator: "\n").appending("\n").write(to: url, atomically: true, encoding: .utf8)
+            try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: url.path)
+        } catch { NSSound.beep(); return }
+        NSWorkspace.shared.open(url)
     }
 
     func openAll() { profiles.filter { !isRunning($0) }.forEach(open) }
@@ -225,7 +359,7 @@ final class Engine: ObservableObject {
             NSSound.beep(); return false
         }
         let dir = supportDir.appendingPathComponent("Claude-\(slug)").path
-        profiles.append(Profile(name: name, dir: dir))
+        profiles.append(Profile(name: name, dir: dir, color: nextColor()))
         save()
         return true
     }
@@ -244,6 +378,12 @@ final class Engine: ObservableObject {
         save()
     }
 
+    func setColor(_ p: Profile, _ c: Int) {
+        guard let i = profiles.firstIndex(of: p) else { return }
+        profiles[i].color = c
+        save()
+    }
+
     func move(_ p: Profile, by delta: Int) {
         guard let i = profiles.firstIndex(of: p) else { return }
         let j = i + delta
@@ -254,7 +394,27 @@ final class Engine: ObservableObject {
 
     private func save() {
         if !isDemo, let data = try? JSONEncoder().encode(profiles) { defaults.set(data, forKey: "profiles") }
+        updateHotKeys()
         onChange?()
+    }
+}
+
+enum UpdateWatch {
+    static func installedVersion() -> String? {
+        let app = NSWorkspace.shared.urlForApplication(withBundleIdentifier: claudeBundleID)
+            ?? URL(fileURLWithPath: "/Applications/Claude.app")
+        // Read the plist directly: Bundle caches its info dictionary and would miss the update.
+        let info = NSDictionary(contentsOf: app.appendingPathComponent("Contents/Info.plist"))
+        guard let short = info?["CFBundleShortVersionString"] as? String else { return nil }
+        return short + "+" + (info?["CFBundleVersion"] as? String ?? "")
+    }
+
+    // Profiles to reopen: stopped within 3 minutes of the version change, at least 4 s ago (so the new
+    // bundle is in place), and only when Claude relaunched itself. That last check skips the case where
+    // an update installs as someone quits Claude on purpose.
+    static func due(quitAt: [UUID: Date], updatedAt: Date, relaunched: Bool, now: Date) -> Set<UUID> {
+        guard relaunched else { return [] }
+        return Set(quitAt.filter { abs($0.value.timeIntervalSince(updatedAt)) < 180 && now.timeIntervalSince($0.value) >= 4 }.keys)
     }
 }
 
@@ -281,28 +441,44 @@ enum ProcArgs {
     }
 }
 
-// Global ⌃⌥⌘M through Carbon, which needs no Accessibility permission. Opens the panel.
+// Global shortcuts through Carbon, which needs no Accessibility permission.
 @MainActor
 enum HotKey {
-    static var ref: EventHotKeyRef?
-    static var installed = false
-    static var action: (() -> Void)?
+    struct Binding {
+        let key: Int
+        let mods: Int
+        let action: () -> Void
+    }
 
-    static func set(_ on: Bool) {
-        if let ref { UnregisterEventHotKey(ref) }
-        ref = nil
-        guard on else { return }
-        if !installed {
+    static let digits = [kVK_ANSI_1, kVK_ANSI_2, kVK_ANSI_3, kVK_ANSI_4, kVK_ANSI_5,
+                         kVK_ANSI_6, kVK_ANSI_7, kVK_ANSI_8, kVK_ANSI_9]
+    static var refs: [EventHotKeyRef] = []
+    static var actions: [UInt32: () -> Void] = [:]
+    static var installed = false
+
+    static func register(_ list: [Binding]) {
+        refs.forEach { UnregisterEventHotKey($0) }
+        refs = []
+        actions = [:]
+        if !installed && !list.isEmpty {
             var spec = EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: UInt32(kEventHotKeyPressed))
-            InstallEventHandler(GetApplicationEventTarget(), { _, _, _ in
-                MainActor.assumeIsolated { HotKey.action?() }
+            InstallEventHandler(GetApplicationEventTarget(), { _, event, _ in
+                var hk = EventHotKeyID()
+                GetEventParameter(event, EventParamName(kEventParamDirectObject), EventParamType(typeEventHotKeyID),
+                                  nil, MemoryLayout<EventHotKeyID>.size, nil, &hk)
+                MainActor.assumeIsolated { HotKey.actions[hk.id]?() }
                 return noErr
             }, 1, &spec, nil, nil)
             installed = true
         }
-        let id = EventHotKeyID(signature: OSType(0x4D43_4C44), id: 1)
-        RegisterEventHotKey(UInt32(kVK_ANSI_M), UInt32(cmdKey | optionKey | controlKey), id,
-                            GetApplicationEventTarget(), 0, &ref)
+        for (i, b) in list.enumerated() {
+            var ref: EventHotKeyRef?
+            let id = EventHotKeyID(signature: OSType(0x4D43_4C44), id: UInt32(i + 1))
+            if RegisterEventHotKey(UInt32(b.key), UInt32(b.mods), id, GetApplicationEventTarget(), 0, &ref) == noErr, let ref {
+                refs.append(ref)
+                actions[UInt32(i + 1)] = b.action
+            }
+        }
     }
 }
 
@@ -396,12 +572,14 @@ struct SectionHeader: View {
 // Round 24 pt badge, filled orange when on, like Cocaine's chips.
 struct Badge<Label: View>: View {
     let on: Bool
+    var tint: Color = .claude
+    var offTint: Color = .primary
     @ViewBuilder let label: Label
     var body: some View {
         label
-            .foregroundStyle(on ? Color.white : Color.primary)
+            .foregroundStyle(on ? Color.white : offTint)
             .frame(width: 24, height: 24)
-            .background(Circle().fill(on ? Color.claude : Color.primary.opacity(0.12)))
+            .background(Circle().fill(on ? tint : Color.primary.opacity(0.12)))
     }
 }
 
@@ -435,7 +613,7 @@ struct ProfileRow: View {
     var body: some View {
         let on = engine.isRunning(profile)
         HStack(spacing: 9) {
-            Badge(on: on) {
+            Badge(on: on, tint: profile.tint, offTint: profile.tint) {
                 if engine.isStarting(profile) {
                     ProgressView().controlSize(.mini)
                 } else {
@@ -451,6 +629,9 @@ struct ProfileRow: View {
                 if profile.isDefault {
                     Text("Default").font(.system(size: 10)).foregroundStyle(.tertiary)
                 }
+                if let hint = engine.shortcutHint(for: profile) {
+                    Text(hint).font(.system(size: 10)).foregroundStyle(.tertiary)
+                }
             }
             Spacer(minLength: 4)
             if on && hover {
@@ -461,7 +642,7 @@ struct ProfileRow: View {
                     .onTapGesture { engine.quit(profile) }
                     .help("Quit \(profile.name)")
             } else if on {
-                Text("Running").font(.system(size: 10)).foregroundStyle(Color.claude)
+                Text(engine.frontID == profile.id ? "Active" : "Running").font(.system(size: 10)).foregroundStyle(profile.tint)
             }
         }
         .padding(.horizontal, 8)
@@ -476,8 +657,15 @@ struct ProfileRow: View {
         .contextMenu {
             Button(on ? "Show \(profile.name)" : "Open \(profile.name)") { engine.open(profile) }
             if on { Button("Quit \(profile.name)") { engine.quit(profile) } }
+            Button("Open Claude Code in Terminal") { engine.openClaudeCode(profile) }
             Divider()
             Button("Rename…") { editing = profile.id }
+            Menu("Color") {
+                ForEach(Palette.colors.indices, id: \.self) { i in
+                    Toggle(Palette.colors[i].name, isOn: Binding(get: { (profile.color ?? 0) == i },
+                                                                 set: { _ in engine.setColor(profile, i) }))
+                }
+            }
             Button("Move Up") { engine.move(profile, by: -1) }
             Button("Move Down") { engine.move(profile, by: 1) }
             Divider()
@@ -485,6 +673,10 @@ struct ProfileRow: View {
             Button("Copy Shell Alias") {
                 NSPasteboard.general.clearContents()
                 NSPasteboard.general.setString(profile.shellAlias, forType: .string)
+            }
+            Button("Copy Claude Code Alias") {
+                NSPasteboard.general.clearContents()
+                NSPasteboard.general.setString(profile.codeAlias, forType: .string)
             }
             if !profile.isDefault {
                 Divider()
@@ -570,6 +762,18 @@ struct MenuView: View {
             .padding(.horizontal, 14)
             .padding(.top, 10)
             .padding(.bottom, 8)
+
+            if let notice = engine.notice {
+                HStack(alignment: .top, spacing: 8) {
+                    Image(systemName: "arrow.clockwise").foregroundStyle(Color.claude)
+                    Text(notice).fixedSize(horizontal: false, vertical: true)
+                    Spacer(minLength: 4)
+                    Image(systemName: "xmark").foregroundStyle(.secondary).onTapGesture { engine.dismissNotice() }
+                }
+                .font(.system(size: 12))
+                .padding(.horizontal, 14)
+                .padding(.bottom, 8)
+            }
 
             Divider().padding(.horizontal, 14)
             SectionHeader(title: "Profiles (\(engine.profiles.count))",
@@ -800,7 +1004,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         let engine = Engine.shared
         engine.onChange = { [weak self] in self?.refreshIcon() }
-        HotKey.action = { [weak self] in
+        engine.onPanelHotKey = { [weak self] in
             if let b = self?.item.button { PanelController.shared.toggle(below: b) }
         }
         engine.boot()
@@ -831,14 +1035,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let engine = Engine.shared
         let count = engine.runningCount
         let img = NSImage(systemSymbolName: "asterisk", accessibilityDescription: "MultiClaude")
-        if count > 0 && engine.isOn(.coloredIcon) {
+        // While a Claude window is in front, the menu bar names its account in the profile's color.
+        let front = engine.isOn(.showActive) ? engine.profiles.first { $0.id == engine.frontID } : nil
+        if let front {
+            b.image = img?.withSymbolConfiguration(.init(paletteColors: [front.nsTint]))
+            b.image?.isTemplate = false
+        } else if count > 0 && engine.isOn(.coloredIcon) {
             b.image = img?.withSymbolConfiguration(.init(paletteColors: [.claude]))
             b.image?.isTemplate = false
         } else {
             b.image = img
             b.image?.isTemplate = true
         }
-        b.title = count > 0 && engine.isOn(.showCount) ? " \(count)" : ""
+        if let front {
+            b.title = " " + front.name
+        } else {
+            b.title = count > 0 && engine.isOn(.showCount) ? " \(count)" : ""
+        }
         b.font = .monospacedDigitSystemFont(ofSize: 12, weight: .medium)
     }
 }
@@ -850,10 +1063,29 @@ if args.count == 2, args[1] == "--list" {
         let e = Engine.shared
         e.refresh()
         for p in e.profiles {
-            print("\(e.isRunning(p) ? "●" : "○") \(p.name)\t\(p.dir ?? "(default)")")
+            let state = e.frontID == p.id ? "active" : e.isRunning(p) ? "running" : "-"
+            print("\(e.isRunning(p) ? "●" : "○") \(p.name)\t\(state)\t\(Palette.colors[(p.color ?? 0) % Palette.colors.count].name)\t\(p.dir ?? "(default)")")
         }
     }
     exit(0)
+}
+if args.count == 2, args[1] == "--selftest-update" {
+    // Checks which profiles get reopened around a Claude update.
+    let a = UUID(), b = UUID(), c = UUID()
+    let t0 = Date(timeIntervalSince1970: 1_000_000)
+    let quitAt = [a: t0.addingTimeInterval(-2), b: t0.addingTimeInterval(-400), c: t0.addingTimeInterval(20)]
+    let cases: [(String, Bool, Date, Set<UUID>)] = [
+        ("relaunched, 30 s later", true, t0.addingTimeInterval(30), [a, c]),
+        ("relaunched, c quit 1 s ago", true, t0.addingTimeInterval(21), [a]),
+        ("no relaunch (quit on purpose)", false, t0.addingTimeInterval(30), []),
+    ]
+    var ok = true
+    for (name, relaunched, now, want) in cases {
+        let got = UpdateWatch.due(quitAt: quitAt, updatedAt: t0, relaunched: relaunched, now: now)
+        print(got == want ? "PASS" : "FAIL", name)
+        ok = ok && got == want
+    }
+    exit(ok ? 0 : 1)
 }
 if args.count == 2, args[1] == "--unregister-login" {
     try? SMAppService.mainApp.unregister()
