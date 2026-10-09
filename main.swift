@@ -5,6 +5,7 @@ import AppKit
 import SwiftUI
 import ServiceManagement
 import Carbon.HIToolbox
+import CryptoKit
 
 let appVersion = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "1.0"
 let websiteURL = URL(string: "https://somalabs.me")!
@@ -12,6 +13,8 @@ let supportURL = URL(string: "mailto:quentin@somalabs.me?subject=MultiClaude")!
 let claudeBundleID = "com.anthropic.claudefordesktop"
 let supportDir = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support")
 let isPreview = ProcessInfo.processInfo.environment["MULTICLAUDE_PREVIEW"] != nil
+// Releases are signed in CI with the matching private key (repo secret UPDATE_SIGNING_KEY).
+let updatePublicKey = "ovYVjB5Bst53pHaSwbk7KKX+JRAqv7zuponiduhHa+w="
 let isDemo = ProcessInfo.processInfo.environment["MULTICLAUDE_DEMO"] != nil   // sample profiles for README screenshots
 
 extension Color {
@@ -29,6 +32,7 @@ struct Profile: Codable, Identifiable, Hashable {
     var name: String
     var dir: String?   // nil = the default Claude profile, launched without --user-data-dir
     var color: Int?    // index into Palette.colors; nil until the first load assigns one
+    var openAtLaunch: Bool?
 
     var isDefault: Bool { dir == nil }
     var initial: String { String(name.prefix(1)).uppercased() }
@@ -196,6 +200,7 @@ final class Engine: ObservableObject {
                 MainActor.assumeIsolated { Engine.shared.refresh() }
             }
         }
+        let afterSelfUpdate = defaults.string(forKey: "updatedTo") != nil
         if let to = defaults.string(forKey: "updatedTo") {
             defaults.removeObject(forKey: "updatedTo")
             if to == appVersion { notice = "MultiClaude updated to \(to)." }
@@ -206,6 +211,13 @@ final class Engine: ObservableObject {
             MainActor.assumeIsolated { Engine.shared.refresh() }
         }
         refresh()
+        // A restart after a self-update keeps whatever is open; it does not reopen startup profiles.
+        if !isDemo && !afterSelfUpdate {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1) {
+                let e = Engine.shared
+                e.profiles.filter { $0.openAtLaunch == true && !e.isRunning($0) }.forEach(e.open)
+            }
+        }
     }
 
     // MARK: settings
@@ -379,15 +391,76 @@ final class Engine: ObservableObject {
 
     @discardableResult
     func add(name raw: String) -> Bool {
-        let name = raw.trimmingCharacters(in: .whitespaces)
-        let slug = name.filter { $0.isLetter || $0.isNumber || $0 == "-" || $0 == "_" }
-        guard !slug.isEmpty, !profiles.contains(where: { $0.name.caseInsensitiveCompare(name) == .orderedSame }) else {
-            NSSound.beep(); return false
-        }
-        let dir = supportDir.appendingPathComponent("Claude-\(slug)").path
-        profiles.append(Profile(name: name, dir: dir, color: nextColor()))
+        guard let p = newProfile(named: raw) else { NSSound.beep(); return false }
+        profiles.append(p)
         save()
         return true
+    }
+
+    // A profile with a fresh Claude-<name> folder, or nil when the name is empty, taken or its folder exists.
+    func newProfile(named raw: String) -> Profile? {
+        let name = raw.trimmingCharacters(in: .whitespaces)
+        let slug = name.filter { $0.isLetter || $0.isNumber || $0 == "-" || $0 == "_" }
+        let dir = supportDir.appendingPathComponent("Claude-\(slug)").path
+        guard !slug.isEmpty, !profiles.contains(where: { $0.name.caseInsensitiveCompare(name) == .orderedSame }),
+              !profiles.contains(where: { $0.dir == dir }) else { return nil }
+        return Profile(name: name, dir: dir, color: nextColor())
+    }
+
+    func setOpenAtLaunch(_ p: Profile, _ on: Bool) {
+        guard let i = profiles.firstIndex(of: p) else { return }
+        profiles[i].openAtLaunch = on
+        save()
+    }
+
+    // Quits a running profile and calls back once its process is gone (or after 15 s).
+    func quitAndWait(_ p: Profile, then done: @escaping @Sendable @MainActor () -> Void) {
+        guard let app = running[p.id] else { done(); return }
+        userQuit.insert(p.id)
+        app.terminate()
+        func poll(_ n: Int) {
+            if app.isTerminated || n > 60 {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { MainActor.assumeIsolated { done() } }
+                return
+            }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { poll(n + 1) }
+        }
+        poll(0)
+    }
+
+    // Clones a profile's whole data folder, sign-in and chats included, into a new profile.
+    // APFS clones make the copy instant and free until the two folders diverge.
+    func duplicate(_ source: Profile, as name: String) {
+        guard let p = newProfile(named: name), let dst = p.dir else { NSSound.beep(); return }
+        let wasRunning = isRunning(source)
+        notice = "Duplicating \(source.name)…"
+        quitAndWait(source) {
+            Task.detached {
+                let ok = Duplicate.clone(from: source.folderURL.path, to: dst)
+                await MainActor.run {
+                    let e = Engine.shared
+                    if ok {
+                        e.profiles.append(p)
+                        e.save()
+                        e.notice = "Duplicated \(source.name) as \(p.name). Both are signed in to the same account until you sign one out."
+                    } else {
+                        e.notice = "Couldn't duplicate \(source.name). Nothing was changed."
+                    }
+                    if wasRunning { e.open(source) }
+                }
+            }
+        }
+    }
+
+    func copyMCPServers(from source: Profile, to target: Profile, restart: Bool) {
+        do {
+            let n = try MCP.copy(from: source, to: target)
+            notice = "Copied \(n) MCP server\(n == 1 ? "" : "s") from \(source.name) to \(target.name)."
+                + (restart || !isRunning(target) ? "" : " Reopen \(target.name) to load them.")
+            if restart && isRunning(target) { quitAndWait(target) { Engine.shared.open(target) } }
+        } catch {
+            notice = "Couldn't copy MCP servers: \(target.name)'s config file isn't valid JSON."
+        }
     }
 
     func rename(_ p: Profile, to raw: String) {
@@ -427,14 +500,14 @@ final class Engine: ObservableObject {
 
 // Self-update from GitHub releases. Checks at launch and then once a day, installs in the background,
 // and relaunches only while the panel is closed. Claude windows are left alone.
-enum UpdateError: Error { case download, invalid, command(String) }
+enum UpdateError: Error { case download, invalid, signature, command(String) }
 
 enum Updater {
     static let latestURL = URL(string: "https://api.github.com/repos/QuentinCar0n/multiclaude/releases/latest")!
     nonisolated(unsafe) static var relaunching = false
     nonisolated(unsafe) static var busy = false
 
-    struct Release { let version: String; let zip: URL }
+    struct Release { let version: String; let zip: URL; let signature: URL }
 
     static var currentVersion: String { ProcessInfo.processInfo.environment["MULTICLAUDE_FAKE_VERSION"] ?? appVersion }
 
@@ -480,11 +553,17 @@ enum Updater {
               let tag = json["tag_name"] as? String,
               let assets = json["assets"] as? [[String: Any]],
               let asset = assets.first(where: { ($0["name"] as? String)?.hasSuffix(".zip") == true }),
-              let link = asset["browser_download_url"] as? String, let url = URL(string: link),
-              url.scheme == "https", url.host == "github.com",
-              url.path.hasPrefix("/QuentinCar0n/multiclaude/releases/download/")
+              let name = asset["name"] as? String,
+              let sigAsset = assets.first(where: { $0["name"] as? String == name + ".sig" }),
+              let url = trusted(asset["browser_download_url"]), let sigURL = trusted(sigAsset["browser_download_url"])
         else { return nil }
-        return Release(version: tag.hasPrefix("v") ? String(tag.dropFirst()) : tag, zip: url)
+        return Release(version: tag.hasPrefix("v") ? String(tag.dropFirst()) : tag, zip: url, signature: sigURL)
+    }
+
+    static func trusted(_ any: Any?) -> URL? {
+        guard let s = any as? String, let url = URL(string: s), url.scheme == "https", url.host == "github.com",
+              url.path.hasPrefix("/QuentinCar0n/multiclaude/releases/download/") else { return nil }
+        return url
     }
 
     static func isNewer(_ a: String, than b: String) -> Bool {
@@ -507,6 +586,11 @@ enum Updater {
         guard (resp as? HTTPURLResponse)?.statusCode == 200 else { throw UpdateError.download }
         let zip = work.appendingPathComponent("update.zip")
         try fm.moveItem(at: tmp, to: zip)
+        // The zip must carry a signature made with the release key; HTTPS alone would trust whoever controls the repo.
+        let (sigData, sigResp) = try await URLSession.shared.data(from: r.signature)
+        guard (sigResp as? HTTPURLResponse)?.statusCode == 200,
+              UpdateSignature.verify(try Data(contentsOf: zip), signatureBase64: String(decoding: sigData, as: UTF8.self))
+        else { throw UpdateError.signature }
         try run("/usr/bin/ditto", ["-x", "-k", zip.path, work.path])
         let app = work.appendingPathComponent("MultiClaude.app")
         let info = NSDictionary(contentsOf: app.appendingPathComponent("Contents/Info.plist"))
@@ -539,6 +623,78 @@ enum Updater {
         try? sh.run()
         relaunching = true
         NSApp.terminate(nil)
+    }
+}
+
+enum MCP {
+    static func configURL(_ p: Profile) -> URL { p.folderURL.appendingPathComponent("claude_desktop_config.json") }
+
+    static func read(_ url: URL) throws -> [String: Any] {
+        guard let data = try? Data(contentsOf: url), !data.isEmpty else { return [:] }
+        guard let obj = try JSONSerialization.jsonObject(with: data) as? [String: Any] else { throw CocoaError(.fileReadCorruptFile) }
+        return obj
+    }
+
+    static func servers(_ p: Profile) -> [String: Any] {
+        ((try? read(configURL(p)))?["mcpServers"] as? [String: Any]) ?? [:]
+    }
+
+    // Adds the source servers to the target config; a server with the same name is replaced. Other keys stay.
+    static func merge(_ target: [String: Any], adding servers: [String: Any]) -> [String: Any] {
+        var out = target
+        var current = target["mcpServers"] as? [String: Any] ?? [:]
+        for (k, v) in servers { current[k] = v }
+        out["mcpServers"] = current
+        return out
+    }
+
+    @discardableResult
+    static func copy(from source: Profile, to target: Profile) throws -> Int {
+        let servers = self.servers(source)
+        let url = configURL(target)
+        let merged = merge(try read(url), adding: servers)
+        let fm = FileManager.default
+        if fm.fileExists(atPath: url.path) {
+            let f = DateFormatter()
+            f.dateFormat = "yyyyMMdd-HHmmss"
+            try fm.copyItem(at: url, to: url.appendingPathExtension("bak-" + f.string(from: Date())))
+        } else {
+            try fm.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        }
+        let data = try JSONSerialization.data(withJSONObject: merged, options: [.prettyPrinted, .withoutEscapingSlashes])
+        try data.write(to: url, options: .atomic)
+        return servers.count
+    }
+}
+
+enum Duplicate {
+    // `cp -c` clones on APFS. The destination must not exist yet.
+    static func clone(from src: String, to dst: String) -> Bool {
+        let fm = FileManager.default
+        guard fm.fileExists(atPath: src), !fm.fileExists(atPath: dst) else { return false }
+        do { try Updater.run("/bin/cp", ["-cR", src, dst]) } catch {
+            try? fm.removeItem(atPath: dst)
+            return false
+        }
+        // Electron's single-instance lock files belong to the source process.
+        for lock in ["SingletonLock", "SingletonSocket", "SingletonCookie"] {
+            try? fm.removeItem(atPath: dst + "/" + lock)
+        }
+        return true
+    }
+}
+
+enum UpdateSignature {
+    static func sign(_ data: Data, keyBase64: String) throws -> String {
+        guard let raw = Data(base64Encoded: keyBase64.trimmingCharacters(in: .whitespacesAndNewlines)) else { throw UpdateError.invalid }
+        return try Curve25519.Signing.PrivateKey(rawRepresentation: raw).signature(for: data).base64EncodedString()
+    }
+
+    static func verify(_ data: Data, signatureBase64: String, publicKeyBase64: String = updatePublicKey) -> Bool {
+        guard let sig = Data(base64Encoded: signatureBase64.trimmingCharacters(in: .whitespacesAndNewlines)),
+              let raw = Data(base64Encoded: publicKeyBase64),
+              let key = try? Curve25519.Signing.PublicKey(rawRepresentation: raw) else { return false }
+        return key.isValidSignature(sig, for: data)
     }
 }
 
@@ -820,6 +976,8 @@ struct ProfileRow: View {
             Button(on ? "Show \(profile.name)" : "Open \(profile.name)") { engine.open(profile) }
             if on { Button("Quit \(profile.name)") { engine.quit(profile) } }
             Button("Open Claude Code in Terminal") { engine.openClaudeCode(profile) }
+            Toggle("Open When MultiClaude Starts", isOn: Binding(get: { profile.openAtLaunch == true },
+                                                                 set: { engine.setOpenAtLaunch(profile, $0) }))
             Divider()
             Button("Rename…") { editing = profile.id }
             Menu("Color") {
@@ -840,11 +998,74 @@ struct ProfileRow: View {
                 NSPasteboard.general.clearContents()
                 NSPasteboard.general.setString(profile.codeAlias, forType: .string)
             }
+            Divider()
+            Menu("Copy MCP Servers From") {
+                let sources = engine.profiles.filter { $0.id != profile.id }.map { ($0, MCP.servers($0).count) }.filter { $0.1 > 0 }
+                if sources.isEmpty {
+                    Text("No other profile has MCP servers")
+                }
+                ForEach(sources, id: \.0.id) { src, n in
+                    Button("\(src.name) (\(n))") { Dialogs.copyMCP(from: src, to: profile) }
+                }
+            }
+            Button("Duplicate as New Profile…") { Dialogs.duplicate(profile) }
             if !profile.isDefault {
                 Divider()
                 Button("Remove from List") { engine.remove(profile) }
             }
         }
+    }
+}
+
+// Confirmations for actions that quit a window or write into a profile's folder.
+@MainActor
+enum Dialogs {
+    static func alert(_ title: String, _ text: String, buttons: [String], field: String? = nil) -> (Int, String) {
+        PanelController.shared.close()
+        NSApp.activate()
+        let a = NSAlert()
+        a.messageText = title
+        a.informativeText = text
+        buttons.forEach { a.addButton(withTitle: $0) }
+        var input: NSTextField?
+        if let field {
+            let f = NSTextField(string: field)
+            f.frame = NSRect(x: 0, y: 0, width: 260, height: 24)
+            a.accessoryView = f
+            a.window.initialFirstResponder = f
+            input = f
+        }
+        let r = a.runModal().rawValue - NSApplication.ModalResponse.alertFirstButtonReturn.rawValue
+        return (r, input?.stringValue ?? "")
+    }
+
+    static func copyMCP(from src: Profile, to dst: Profile) {
+        let e = Engine.shared
+        let n = MCP.servers(src).count
+        let running = e.isRunning(dst)
+        let buttons = running ? ["Copy and Reopen \(dst.name)", "Copy", "Cancel"] : ["Copy", "Cancel"]
+        let (choice, _) = alert("Copy \(n) MCP server\(n == 1 ? "" : "s") from \(src.name) to \(dst.name)?",
+                                "Servers with the same name in \(dst.name) are replaced. \(dst.name)'s current config is backed up next to it first. Keys and tokens in the server settings are copied too.",
+                                buttons: buttons)
+        if choice == buttons.count - 1 { return }
+        e.copyMCPServers(from: src, to: dst, restart: running && choice == 0)
+    }
+
+    static func duplicate(_ src: Profile) {
+        let e = Engine.shared
+        let running = e.isRunning(src)
+        let text = "The new profile gets a copy of \(src.name)'s data: its sign-in, chats and settings. "
+            + "The copy is instant and uses no extra disk space until the two change."
+            + (running ? " \(src.name) has to quit while it's copied, then it reopens." : "")
+        let (choice, name) = alert("Duplicate \(src.name)", text,
+                                   buttons: [running ? "Quit \(src.name) and Duplicate" : "Duplicate", "Cancel"],
+                                   field: src.name + " copy")
+        guard choice == 0 else { return }
+        guard e.newProfile(named: name) != nil else {
+            _ = alert("Pick another name", "\"\(name)\" is empty or already used by a profile or folder.", buttons: ["OK"])
+            return
+        }
+        e.duplicate(src, as: name)
     }
 }
 
@@ -1292,6 +1513,57 @@ if args.count == 2, args[1] == "--check-update" || args[1] == "--update-now" {
     }
     sem.wait()
     exit(code)
+}
+if args.count == 3, args[1] == "--sign-update" {
+    // CI: prints the base64 signature of a release zip; the key comes from MULTICLAUDE_SIGNING_KEY.
+    guard let key = ProcessInfo.processInfo.environment["MULTICLAUDE_SIGNING_KEY"], !key.isEmpty,
+          let data = FileManager.default.contents(atPath: args[2]), let sig = try? UpdateSignature.sign(data, keyBase64: key)
+    else { FileHandle.standardError.write(Data("signing failed\n".utf8)); exit(1) }
+    print(sig)
+    exit(0)
+}
+if args.count == 4, args[1] == "--verify-update" {
+    let data = FileManager.default.contents(atPath: args[2]) ?? Data()
+    let sig = (try? String(contentsOfFile: args[3], encoding: .utf8)) ?? ""
+    let ok = UpdateSignature.verify(data, signatureBase64: sig)
+    print(ok ? "valid" : "INVALID")
+    exit(ok ? 0 : 1)
+}
+if args.count == 2, args[1] == "--selftest-profiles" {
+    var ok = true
+    func check(_ name: String, _ cond: Bool) { print(cond ? "PASS" : "FAIL", name); ok = ok && cond }
+    let target: [String: Any] = ["preferences": ["x": 1], "mcpServers": ["a": ["command": "old"], "keep": ["command": "k"]]]
+    let merged = MCP.merge(target, adding: ["a": ["command": "new"], "b": ["command": "b"]])
+    let m = merged["mcpServers"] as? [String: [String: String]] ?? [:]
+    check("merge replaces same name", m["a"]?["command"] == "new")
+    check("merge adds new server", m["b"] != nil)
+    check("merge keeps other servers", m["keep"] != nil)
+    check("merge keeps other keys", merged["preferences"] != nil)
+    let tmp = FileManager.default.temporaryDirectory.appendingPathComponent("mc-clone-\(UUID().uuidString)")
+    let src = tmp.appendingPathComponent("Claude"), dst = tmp.appendingPathComponent("Claude-Copy")
+    try? FileManager.default.createDirectory(at: src.appendingPathComponent("Local Storage"), withIntermediateDirectories: true)
+    try? Data("chats".utf8).write(to: src.appendingPathComponent("Local Storage/db"))
+    try? FileManager.default.createSymbolicLink(atPath: src.appendingPathComponent("SingletonLock").path, withDestinationPath: "host-123")
+    check("clone succeeds", Duplicate.clone(from: src.path, to: dst.path))
+    check("clone copies data", (try? String(contentsOf: dst.appendingPathComponent("Local Storage/db"), encoding: .utf8)) == "chats")
+    check("clone drops lock", (try? FileManager.default.destinationOfSymbolicLink(atPath: dst.appendingPathComponent("SingletonLock").path)) == nil)
+    check("clone refuses existing destination", !Duplicate.clone(from: src.path, to: dst.path))
+    let pa = Profile(name: "A", dir: tmp.appendingPathComponent("Claude-A").path)
+    let pb = Profile(name: "B", dir: tmp.appendingPathComponent("Claude-B").path)
+    try? FileManager.default.createDirectory(atPath: pa.dir!, withIntermediateDirectories: true)
+    try? FileManager.default.createDirectory(atPath: pb.dir!, withIntermediateDirectories: true)
+    try? Data(#"{"mcpServers":{"fs":{"command":"npx","args":["server-fs","/tmp"]}}}"#.utf8).write(to: MCP.configURL(pa))
+    try? Data(#"{"preferences":{"x":1}}"#.utf8).write(to: MCP.configURL(pb))
+    let copied = (try? MCP.copy(from: pa, to: pb)) ?? -1
+    check("copy reports 1 server", copied == 1)
+    check("copy writes server into target", MCP.servers(pb)["fs"] != nil)
+    check("copy keeps target preferences", ((try? MCP.read(MCP.configURL(pb)))?["preferences"]) != nil)
+    let backups = (try? FileManager.default.contentsOfDirectory(atPath: pb.dir!))?.filter { $0.contains(".bak-") } ?? []
+    check("copy leaves a backup", backups.count == 1)
+    try? Data("not json".utf8).write(to: MCP.configURL(pb))
+    check("copy refuses a broken target file", (try? MCP.copy(from: pa, to: pb)) == nil)
+    try? FileManager.default.removeItem(at: tmp)
+    exit(ok ? 0 : 1)
 }
 if args.count == 2, args[1] == "--selftest-version" {
     let cases = [("1.2", "1.1", true), ("1.10", "1.9", true), ("1.2", "1.2", false), ("1.2", "1.2.1", false), ("2.0", "1.9.9", true)]

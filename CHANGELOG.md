@@ -2,12 +2,19 @@
 
 ## Unreleased
 
+### New
+- **Copy MCP servers between profiles.** Right-click a profile, **Copy MCP Servers From**, pick the source. Servers with the same name are replaced, the target's config is backed up first, and a running target can be reopened in the same step.
+- **Open When MultiClaude Starts**, per profile. A restart after a MultiClaude update doesn't reopen them.
+- **Duplicate as New Profile.** Clones a profile's data folder, sign-in and chats included, into a new profile with APFS clones (instant, no extra space). A running source quits for the copy and reopens after.
+- **Signed updates.** Each release zip is signed with an Ed25519 key held as a repository secret. MultiClaude only installs an update whose signature matches the public key built into the app.
+
 ### Fixed
 - Clicking the default account while another account was open brought that other account forward instead of opening the default one. It now starts its own window.
 - After a Claude update, Claude's relaunch could leave an extra default window open even though the default account wasn't open before. MultiClaude now closes it, and keeps it when the default account was open before the update.
 
 ### Changed
 - Release builds run the built-in tests before publishing.
+- Release builds refuse to publish without the signing key, and publish `MultiClaude-<version>.zip.sig` next to the zip.
 
 ## 1.2 (build 3), 2026-10-09
 

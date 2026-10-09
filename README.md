@@ -67,6 +67,9 @@ MultiClaude is that trick with a proper interface.
 - **Click to open, click again to focus.** No duplicate windows.
 - **Hover to quit** a single account. The header switch opens or quits all of them at once.
 - **New Profile** in one line: type a name, press Return, sign in to the new account in the window that opens.
+- **Copy MCP servers between accounts.** Set your MCP servers up once, then right-click another profile and choose **Copy MCP Servers From**. Its config is backed up first.
+- **Open accounts at startup.** Right-click a profile and tick **Open When MultiClaude Starts**. With Launch at Login on, your accounts are waiting every morning.
+- **Duplicate a profile.** **Duplicate as New Profile** clones a profile's whole data folder, sign-in and chats included, into a new one. Handy for keeping your current history under a name like "Personal" before signing the default app in to another account. On APFS the copy is instant and takes no extra space.
 - **Right-click** a profile to rename it, move it, show its data folder in Finder, copy a shell alias for it, or take it off the list.
 - **Imports your setup.** First launch picks up your default Claude account, any `--user-data-dir` aliases in `~/.zshrc`, and any `Claude-*` folder in Application Support.
 - **Global shortcuts.** ⌃⌥⌘M opens the panel; turn on Profile Shortcuts and ⌃⌥1 to ⌃⌥9 jump straight to each account.
@@ -118,7 +121,7 @@ Your default Claude account is always the first profile. It uses the app's norma
 
 ### Privacy
 
-MultiClaude has **no analytics**. Its only network request is the daily update check: it asks GitHub for this repo's latest release, and downloads it from GitHub when it's newer. Before installing, it checks that the download is MultiClaude at the advertised version with an intact code signature. Turn off **Update MultiClaude Automatically** in Settings to stop it. It never opens Claude's data folders, so it never sees your chats, files or sign-in tokens. It does not modify the Claude app. Removing a profile only takes it off the list: the folder stays on disk until you delete it yourself.
+MultiClaude has **no analytics**. Its only network request is the daily update check: it asks GitHub for this repo's latest release, and downloads it from GitHub when it's newer. Every release is signed with a private key kept outside this repository, and MultiClaude refuses any update whose signature doesn't match the public key built into the app. It also checks the bundle identifier, the version and the code signature before swapping itself. Turn off **Update MultiClaude Automatically** in Settings to stop it. It never opens Claude's data folders, so it never sees your chats, files or sign-in tokens. It does not modify the Claude app. Removing a profile only takes it off the list: the folder stays on disk until you delete it yourself.
 
 ## FAQ
 
@@ -130,6 +133,9 @@ Yes. In the desktop app, each Claude window and the Code tab inside it run with 
 
 **Can I still use my aliases?**
 Yes. MultiClaude reads the same folders, so an account opened from an alias shows as running in the panel. Right-click a profile and choose **Copy Shell Alias** to get one for a new profile.
+
+**I already use the Claude app. How do I keep my chats when adding accounts?**
+Right-click your default profile and choose **Duplicate as New Profile**, named for example `Personal`. The copy keeps your sign-in and history. You can then sign the default app out and in to another account, or simply add new profiles next to it.
 
 **How do I remove an account completely?**
 Right-click it and choose **Show Data Folder in Finder**, quit it, choose **Remove from List**, then trash the folder.
