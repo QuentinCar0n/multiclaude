@@ -1,5 +1,10 @@
 # MultiClaude release notes
 
+## Unreleased
+
+- Open source under the Apache License 2.0.
+- Demo mode for screenshots: `MULTICLAUDE_DEMO=1` shows sample profiles, `MULTICLAUDE_APPEARANCE=light|dark` forces the look.
+
 ## 1.0 (build 1), 2026-10-09
 
 - Menu bar manager for several Claude desktop accounts on one Mac. Each profile is its own `--user-data-dir`, so each one keeps its own sign-in and chats.

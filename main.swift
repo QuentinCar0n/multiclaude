@@ -12,6 +12,7 @@ let supportURL = URL(string: "mailto:quentin@somalabs.me?subject=MultiClaude")!
 let claudeBundleID = "com.anthropic.claudefordesktop"
 let supportDir = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support")
 let isPreview = ProcessInfo.processInfo.environment["MULTICLAUDE_PREVIEW"] != nil
+let isDemo = ProcessInfo.processInfo.environment["MULTICLAUDE_DEMO"] != nil   // sample profiles for README screenshots
 
 extension Color {
     static let claude = Color(red: 0.851, green: 0.467, blue: 0.341)   // #D97757
@@ -105,8 +106,16 @@ final class Engine: ObservableObject {
 
     private let defaults = UserDefaults.standard
     private var pending: [UUID: Date] = [:]   // launched, process not seen yet
+    private var demoRunning: Set<UUID> = []
 
     private init() {
+        if isDemo {
+            profiles = ["Personal", "Work", "Client", "Research"].enumerated().map { i, n in
+                Profile(name: n, dir: i == 0 ? nil : "/tmp/multiclaude-demo/Claude-\(n)")
+            }
+            demoRunning = [profiles[0].id, profiles[1].id]
+            return
+        }
         if let data = defaults.data(forKey: "profiles"), let list = try? JSONDecoder().decode([Profile].self, from: data) {
             profiles = list
         } else {
@@ -155,6 +164,7 @@ final class Engine: ObservableObject {
 
     // Matches each Claude process to a profile through its --user-data-dir argument.
     func refresh() {
+        guard !isDemo else { return }
         var found: [UUID: NSRunningApplication] = [:]
         for app in NSWorkspace.shared.runningApplications where app.bundleIdentifier == claudeBundleID && !app.isTerminated {
             let dir = ProcArgs.of(app.processIdentifier)
@@ -172,9 +182,9 @@ final class Engine: ObservableObject {
         }
     }
 
-    func isRunning(_ p: Profile) -> Bool { running[p.id] != nil }
+    func isRunning(_ p: Profile) -> Bool { running[p.id] != nil || demoRunning.contains(p.id) }
     func isStarting(_ p: Profile) -> Bool { pending[p.id] != nil && running[p.id] == nil }
-    var runningCount: Int { running.count }
+    var runningCount: Int { running.count + demoRunning.count }
 
     // MARK: actions
 
@@ -243,7 +253,7 @@ final class Engine: ObservableObject {
     }
 
     private func save() {
-        if let data = try? JSONEncoder().encode(profiles) { defaults.set(data, forKey: "profiles") }
+        if !isDemo, let data = try? JSONEncoder().encode(profiles) { defaults.set(data, forKey: "profiles") }
         onChange?()
     }
 }
@@ -733,7 +743,7 @@ struct AboutView: View {
         .padding(.bottom, 44)
         .frame(width: 620, height: 330)
         .overlay(alignment: .bottom) {
-            Text("Copyright © 2026 Soma Labs. All rights reserved.")
+            Text("Copyright © 2026 Soma Labs. Licensed under Apache 2.0.")
                 .font(.system(size: 11)).foregroundStyle(.tertiary).padding(.bottom, 22)
         }
     }
@@ -777,6 +787,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
 
     func applicationDidFinishLaunching(_ n: Notification) {
+        switch ProcessInfo.processInfo.environment["MULTICLAUDE_APPEARANCE"] {
+        case "light": NSApp.appearance = NSAppearance(named: .aqua)
+        case "dark": NSApp.appearance = NSAppearance(named: .darkAqua)
+        default: break
+        }
         if let b = item.button {
             b.target = self
             b.action = #selector(clicked)

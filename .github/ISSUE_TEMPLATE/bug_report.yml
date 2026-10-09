@@ -1,0 +1,31 @@
+name: Bug report
+description: Something in MultiClaude does not work as expected
+labels: [bug]
+body:
+  - type: input
+    id: version
+    attributes:
+      label: MultiClaude version
+      description: Shown in About.
+    validations:
+      required: true
+  - type: input
+    id: macos
+    attributes:
+      label: macOS version and Mac
+      placeholder: macOS 26.1, MacBook Pro M4
+    validations:
+      required: true
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you did, what you expected, and what happened instead.
+    validations:
+      required: true
+  - type: textarea
+    id: list
+    attributes:
+      label: Output of MultiClaude --list
+      description: Optional. Run `~/Applications/MultiClaude.app/Contents/MacOS/MultiClaude --list`. Remove folder names you'd rather keep private.
+      render: text

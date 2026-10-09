@@ -1,52 +1,161 @@
+<div align="center">
+
+<img src="preview/icon.png" width="128" alt="MultiClaude icon">
+
 # MultiClaude
 
-A menu bar app for running several Claude desktop accounts on one Mac.
+**Run several Claude accounts side by side on one Mac.**
+Personal, work, client: each one signed in, each one a click away in your menu bar.
 
-Each profile is its own Claude data folder (`--user-data-dir`), so every profile keeps its own sign-in, chats and settings. You can have a personal account, a work account and a client account open side by side.
-
-![MultiClaude panel](preview/settings.png)
-
-## Install
-
-With [Homebrew](https://brew.sh):
+[![Release](https://img.shields.io/github/v/release/QuentinCar0n/multiclaude?color=D97757)](https://github.com/QuentinCar0n/multiclaude/releases/latest)
+[![Homebrew](https://img.shields.io/badge/brew-quentincar0n%2Ftap%2Fmulticlaude-D97757)](https://github.com/QuentinCar0n/homebrew-tap)
+![macOS 15+](https://img.shields.io/badge/macOS-15%2B-555)
+![Apple silicon and Intel](https://img.shields.io/badge/arch-arm64%20%7C%20x86__64-555)
+[![License: Apache 2.0](https://img.shields.io/badge/license-Apache%202.0-555)](LICENSE)
 
 ```bash
 brew install --cask quentincar0n/tap/multiclaude
 ```
 
-Or by hand:
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="preview/panel-dark.png">
+  <img src="preview/panel-light.png" width="360" alt="MultiClaude menu bar panel with four profiles, two of them running">
+</picture>
 
-1. Download `MultiClaude-<version>.zip` from [Releases](https://github.com/QuentinCar0n/multiclaude/releases) and unzip it.
+</div>
+
+## Why
+
+The Claude desktop app signs in to **one account at a time**. Many people have more than one:
+
+- a personal Pro or Max plan, and a Team or Enterprise seat from work,
+- a separate organization per client, so their projects and data never mix,
+- a test account to try a setup before rolling it out to a team.
+
+Switching means signing out, signing back in, waiting for the email code, and losing your place. Running two accounts at once is not possible from the app itself.
+
+### The workaround, and its limits
+
+Claude desktop is an Electron app, so it accepts `--user-data-dir`. Point each copy at its own folder and each one keeps its own sign-in, chats and settings. Power users end up with aliases like these in `~/.zshrc`:
+
+```bash
+alias work='open -n -a "Claude" --args --user-data-dir="$HOME/Library/Application Support/Claude-Work"'
+alias client='open -n -a "Claude" --args --user-data-dir="$HOME/Library/Application Support/Claude-Client"'
+```
+
+It works, but:
+
+| | Shell aliases | MultiClaude |
+| --- | :---: | :---: |
+| Open an account | type its alias in a terminal | one click in the menu bar |
+| See which accounts are open | no | yes, live |
+| Bring an open account forward | re-run the alias and hope | click it again |
+| Quit one account | find the right window, ⌘Q | hover, click ✕ |
+| Add an account | edit `~/.zshrc`, reload the shell | type a name, press Return |
+| Rename, reorder, find its data | by hand | right-click |
+| Keep your existing aliases | | imported on first launch |
+
+MultiClaude is that workaround with a proper interface. It does nothing your shell could not do, it just makes it pleasant.
+
+## Features
+
+- **One profile per account.** Each profile is its own Claude data folder, so sign-ins and chats never leak between accounts.
+- **Live status.** An orange badge marks every account that is running. The menu bar shows how many are open.
+- **Click to open, click again to focus.** No duplicate windows.
+- **Hover to quit** a single account. The header switch opens or quits all of them at once.
+- **New Profile** in one line: type a name, press Return, sign in to the new account in the window that opens.
+- **Right-click** a profile to rename it, move it, show its data folder in Finder, copy a shell alias for it, or take it off the list.
+- **Imports your setup.** First launch picks up your default Claude account, any `--user-data-dir` aliases in `~/.zshrc`, and any `Claude-*` folder in Application Support.
+- **Global shortcut** ⌃⌥⌘M opens the panel from anywhere.
+- **Launch at login**, light and dark mode, colored menu bar icon.
+- **Tiny.** A single Swift file, no dependencies, under 1.5 MB installed.
+
+## Install
+
+### Homebrew
+
+```bash
+brew install --cask quentincar0n/tap/multiclaude
+```
+
+### Manual
+
+1. Download `MultiClaude-<version>.zip` from [Releases](https://github.com/QuentinCar0n/multiclaude/releases/latest) and unzip it.
 2. Move `MultiClaude.app` to Applications.
-3. The app is not notarized, so macOS blocks the first launch. Either right-click the app and choose Open, or run:
+3. MultiClaude is not notarized by Apple yet, so macOS blocks the first launch. Right-click the app and choose **Open**, or run:
 
    ```bash
    xattr -dr com.apple.quarantine /Applications/MultiClaude.app
    ```
 
-Needs macOS 15 or later and the [Claude desktop app](https://claude.ai/download) in `/Applications`. Runs on Apple silicon and Intel.
+Requires macOS 15 or later and the [Claude desktop app](https://claude.ai/download) in `/Applications`.
 
 ## Use
 
-- **Click a profile** to open it. If it already runs, the click brings it forward.
-- **Hover a running profile** and click the ✕ to quit it.
-- **New Profile** creates `~/Library/Application Support/Claude-<Name>`. Open it and sign in to the account you want there.
-- **Right-click a profile** to rename it, reorder it, show its data folder, copy a shell alias for it, or remove it from the list. Removing never deletes the data folder.
-- **Header switch**: on opens every profile, off quits them all.
-- **Settings**: Launch at Login, ⌃⌥⌘M to open the panel, running count in the menu bar, colored menu bar icon, quit all profiles when MultiClaude quits.
+1. Click the ✳ icon in the menu bar.
+2. Click **New Profile**, type a name such as `Work`, press Return.
+3. Click the new profile. A fresh Claude window opens: sign in to your work account there.
+4. From now on, click `Work` to open or focus it, and hover it to quit it.
 
-On first launch MultiClaude imports your default Claude profile, any `open -n -a "Claude" --args --user-data-dir=...` aliases in `~/.zshrc`, and any other `Claude-*` folder in `~/Library/Application Support`.
+Your default Claude account is always the first profile. It uses the app's normal data folder, so nothing changes for it.
 
-`MultiClaude --list` (the binary inside the app) prints each profile and whether it runs.
+## How it works
 
-## Build
+- **Opening** a profile runs `open -n -a Claude --args --user-data-dir=<folder>`, exactly like the alias. The default profile runs `open -a Claude`.
+- **Status** comes from the running Claude processes: MultiClaude reads each one's `--user-data-dir` argument and matches it to a profile.
+- **Profiles** are a small list in MultiClaude's own preferences (`me.somalabs.multiclaude`). Data folders live in `~/Library/Application Support/Claude-<Name>`, next to Claude's own.
+
+### Privacy
+
+MultiClaude makes **no network requests** and has **no analytics**. It never opens Claude's data folders, so it never sees your chats, files or sign-in tokens. It does not modify the Claude app. Removing a profile only takes it off the list: the folder stays on disk until you delete it yourself.
+
+## FAQ
+
+**Is this made by Anthropic?**
+No. MultiClaude is an independent open source tool. It launches the official Claude app and does not change it.
+
+**Does it work with Claude Code in the desktop app?**
+Yes. Each Claude window, and the Code tab inside it, runs with the account of its profile.
+
+**Can I still use my aliases?**
+Yes. MultiClaude reads the same folders, so an account opened from an alias shows as running in the panel. Right-click a profile and choose **Copy Shell Alias** to get one for a new profile.
+
+**How do I remove an account completely?**
+Right-click it and choose **Show Data Folder in Finder**, quit it, choose **Remove from List**, then trash the folder.
+
+**What about Windows and Linux?**
+MultiClaude is a native macOS app. A port is welcome.
+
+## Build from source
 
 ```bash
-./build.sh
+git clone https://github.com/QuentinCar0n/multiclaude.git
+cd multiclaude
+./build.sh              # builds, installs to ~/Applications and launches
+./build.sh --no-install # stops after build/MultiClaude-<version>.zip
 ```
 
-Builds a universal app, signs it ad hoc, zips it to `build/MultiClaude-<version>.zip`, then installs it to `~/Applications` and launches it. Pass `--no-install` to stop after the zip.
+Needs Xcode command line tools with Swift 6. Everything is in [`main.swift`](main.swift): SwiftUI views inside an AppKit menu bar panel.
 
-Single file: `main.swift`, SwiftUI inside an AppKit panel, no dependencies.
+Screenshots for this README come from a demo mode with sample profiles:
 
-Copyright © 2026 Soma Labs.
+```bash
+MULTICLAUDE_DEMO=1 MULTICLAUDE_PREVIEW=panel MULTICLAUDE_APPEARANCE=dark \
+  ~/Applications/MultiClaude.app/Contents/MacOS/MultiClaude
+```
+
+## Releases
+
+Push a `v*` tag and [GitHub Actions](.github/workflows/release.yml) builds a universal app, publishes the release with the matching [CHANGELOG](CHANGELOG.md) section, and bumps the Homebrew cask.
+
+## Contributing
+
+Issues and pull requests are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md). Ideas on the list: notarized builds, per-profile keyboard shortcuts, a profile color, and a Windows port.
+
+## License
+
+[Apache License 2.0](LICENSE). You can use, share and modify MultiClaude freely, including commercially. Contributors grant a patent license with their code, and anyone who sues over a patent in this project loses theirs.
+
+Claude is a trademark of Anthropic, PBC. MultiClaude is not affiliated with or endorsed by Anthropic.
+
+<div align="center"><sub>Made by <a href="https://somalabs.me">Soma Labs</a> in Palo Alto.</sub></div>
