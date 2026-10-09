@@ -1,9 +1,10 @@
 # MultiClaude release notes
 
-## Unreleased
+## 1.1 (build 2), 2026-10-09
 
 - Open source under the Apache License 2.0.
 - Demo mode for screenshots: `MULTICLAUDE_DEMO=1` shows sample profiles, `MULTICLAUDE_APPEARANCE=light|dark` forces the look.
+- About shows the license instead of "All rights reserved".
 
 ## 1.0 (build 1), 2026-10-09
 
