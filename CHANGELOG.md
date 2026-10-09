@@ -1,5 +1,14 @@
 # MultiClaude release notes
 
+## Unreleased
+
+### Fixed
+- Clicking the default account while another account was open brought that other account forward instead of opening the default one. It now starts its own window.
+- After a Claude update, Claude's relaunch could leave an extra default window open even though the default account wasn't open before. MultiClaude now closes it, and keeps it when the default account was open before the update.
+
+### Changed
+- Release builds run the built-in tests before publishing.
+
 ## 1.2 (build 3), 2026-10-09
 
 ### New

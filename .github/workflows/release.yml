@@ -36,6 +36,8 @@ jobs:
           ./build.sh --no-install
           lipo -archs build/MultiClaude.app/Contents/MacOS/MultiClaude
           codesign -v build/MultiClaude.app
+          build/MultiClaude.app/Contents/MacOS/MultiClaude --selftest-update
+          build/MultiClaude.app/Contents/MacOS/MultiClaude --selftest-version
           shasum -a 256 "build/MultiClaude-$VERSION.zip" | tee build/sha256.txt
 
       - uses: actions/upload-artifact@v4

@@ -161,6 +161,8 @@ final class Engine: ObservableObject {
     private var updatedAt: Date?
     private var quitAt: [UUID: Date] = [:]    // profiles that stopped without MultiClaude quitting them
     private var userQuit: Set<UUID> = []
+    private var stopLog: [UUID: Date] = [:]   // last unrequested stop per profile, kept after it relaunches
+    private var strayHandled: Date?           // the update whose stray default window was already closed
 
     private init() {
         if isDemo {
@@ -271,10 +273,14 @@ final class Engine: ObservableObject {
 
         let now = Date()
         for id in running.keys where found[id] == nil {
-            if userQuit.remove(id) == nil { quitAt[id] = now }
+            if userQuit.remove(id) == nil {
+                quitAt[id] = now
+                stopLog[id] = now
+            }
         }
         for id in found.keys { quitAt[id] = nil }
         quitAt = quitAt.filter { now.timeIntervalSince($0.value) < 300 }
+        stopLog = stopLog.filter { now.timeIntervalSince($0.value) < 600 }
         if let v = UpdateWatch.installedVersion(), v != claudeVersion {
             claudeVersion = v
             updatedAt = now
@@ -295,6 +301,7 @@ final class Engine: ObservableObject {
     private func reopenAfterUpdate(now: Date) {
         guard isOn(.reopenAfterUpdate), let updatedAt else { return }
         let relaunched = running.values.contains { ($0.launchDate ?? .distantPast) > updatedAt.addingTimeInterval(-10) }
+        closeStrayDefault(updatedAt: updatedAt)
         let due = UpdateWatch.due(quitAt: quitAt, updatedAt: updatedAt, relaunched: relaunched, now: now)
         let reopen = profiles.filter { due.contains($0.id) && !$0.isDefault }
         guard !reopen.isEmpty else { return }
@@ -318,11 +325,9 @@ final class Engine: ObservableObject {
             app.activate()
             return
         }
-        var args = ["-a", "Claude"]
-        if let dir = p.dir {
-            try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
-            args = ["-n", "-a", "Claude", "--args", "--user-data-dir=\(dir)"]
-        }
+        if let dir = p.dir { try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true) }
+        let anyClaude = NSWorkspace.shared.runningApplications.contains { $0.bundleIdentifier == claudeBundleID && !$0.isTerminated }
+        let args = Launch.openArgs(dir: p.dir, anyClaudeRunning: anyClaude)
         let task = Process()
         task.executableURL = URL(fileURLWithPath: "/usr/bin/open")
         task.arguments = args
@@ -330,6 +335,19 @@ final class Engine: ObservableObject {
         objectWillChange.send()
         pending[p.id] = Date()
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { Engine.shared.refresh() }
+    }
+
+    // Claude's relaunch after an update opens the default account even when it was not open before.
+    // Close that window, but only when the default did not stop around the update itself.
+    private func closeStrayDefault(updatedAt: Date) {
+        guard strayHandled != updatedAt, let d = profiles.first(where: \.isDefault), let app = running[d.id],
+              pending[d.id] == nil else { return }
+        let others = stopLog.filter { $0.key != d.id }.map(\.value)
+        guard UpdateWatch.isStrayDefault(defaultLaunch: app.launchDate, defaultStop: stopLog[d.id],
+                                         profileStops: others, updatedAt: updatedAt) else { return }
+        strayHandled = updatedAt
+        userQuit.insert(d.id)
+        app.terminate()
     }
 
     func quit(_ p: Profile) {
@@ -524,6 +542,15 @@ enum Updater {
     }
 }
 
+enum Launch {
+    // `open -a Claude` brings forward whichever Claude is already running, which may be another account.
+    // With any instance up, the default account needs -n to start its own process.
+    static func openArgs(dir: String?, anyClaudeRunning: Bool) -> [String] {
+        if let dir { return ["-n", "-a", "Claude", "--args", "--user-data-dir=\(dir)"] }
+        return anyClaudeRunning ? ["-n", "-a", "Claude"] : ["-a", "Claude"]
+    }
+}
+
 enum UpdateWatch {
     static func installedVersion() -> String? {
         let app = NSWorkspace.shared.urlForApplication(withBundleIdentifier: claudeBundleID)
@@ -537,6 +564,16 @@ enum UpdateWatch {
     // Profiles to reopen: stopped within 3 minutes of the version change, at least 4 s ago (so the new
     // bundle is in place), and only when Claude relaunched itself. That last check skips the case where
     // an update installs as someone quits Claude on purpose.
+    // The default window is a stray when it started right after other profiles stopped for the update,
+    // and the default itself did not stop around the update (so it was not open before).
+    static func isStrayDefault(defaultLaunch: Date?, defaultStop: Date?, profileStops: [Date], updatedAt: Date) -> Bool {
+        guard let launch = defaultLaunch else { return false }
+        let near = profileStops.filter { abs($0.timeIntervalSince(updatedAt)) < 180 }
+        guard let first = near.min(), let last = near.max() else { return false }
+        if let defaultStop, abs(defaultStop.timeIntervalSince(updatedAt)) < 180 { return false }
+        return launch >= first.addingTimeInterval(-2) && launch <= last.addingTimeInterval(30)
+    }
+
     static func due(quitAt: [UUID: Date], updatedAt: Date, relaunched: Bool, now: Date) -> Set<UUID> {
         guard relaunched else { return [] }
         return Set(quitAt.filter { abs($0.value.timeIntervalSince(updatedAt)) < 180 && now.timeIntervalSince($0.value) >= 4 }.keys)
@@ -1208,6 +1245,29 @@ if args.count == 2, args[1] == "--selftest-update" {
     var ok = true
     for (name, relaunched, now, want) in cases {
         let got = UpdateWatch.due(quitAt: quitAt, updatedAt: t0, relaunched: relaunched, now: now)
+        print(got == want ? "PASS" : "FAIL", name)
+        ok = ok && got == want
+    }
+    let stops = [t0.addingTimeInterval(-3), t0.addingTimeInterval(-1)]
+    let strays: [(String, Date?, Date?, [Date], Bool)] = [
+        ("stray: default starts right after profiles stop", t0.addingTimeInterval(2), nil, stops, true),
+        ("kept: default also stopped for the update", t0.addingTimeInterval(2), t0.addingTimeInterval(-2), stops, false),
+        ("kept: default opened a minute later by hand", t0.addingTimeInterval(60), nil, stops, false),
+        ("kept: default running since before the update", t0.addingTimeInterval(-3600), nil, stops, false),
+        ("kept: no profile stopped around the update", t0.addingTimeInterval(2), nil, [], false),
+    ]
+    for (name, launch, dstop, ps, want) in strays {
+        let got = UpdateWatch.isStrayDefault(defaultLaunch: launch, defaultStop: dstop, profileStops: ps, updatedAt: t0)
+        print(got == want ? "PASS" : "FAIL", name)
+        ok = ok && got == want
+    }
+    let opens: [(String, String?, Bool, [String])] = [
+        ("default, nothing running", nil, false, ["-a", "Claude"]),
+        ("default, another account running", nil, true, ["-n", "-a", "Claude"]),
+        ("profile", "/x/Claude-Work", true, ["-n", "-a", "Claude", "--args", "--user-data-dir=/x/Claude-Work"]),
+    ]
+    for (name, dir, any, want) in opens {
+        let got = Launch.openArgs(dir: dir, anyClaudeRunning: any)
         print(got == want ? "PASS" : "FAIL", name)
         ok = ok && got == want
     }
