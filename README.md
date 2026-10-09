@@ -70,6 +70,7 @@ MultiClaude is that trick with a proper interface.
 - **Right-click** a profile to rename it, move it, show its data folder in Finder, copy a shell alias for it, or take it off the list.
 - **Imports your setup.** First launch picks up your default Claude account, any `--user-data-dir` aliases in `~/.zshrc`, and any `Claude-*` folder in Application Support.
 - **Global shortcuts.** ⌃⌥⌘M opens the panel; turn on Profile Shortcuts and ⌃⌥1 to ⌃⌥9 jump straight to each account.
+- **Updates itself.** Once a day MultiClaude checks for a new release, installs it in the background and restarts while the panel is closed. Your Claude windows stay open.
 - **Launch at login**, light and dark mode, colored menu bar icon.
 - **Tiny.** A single Swift file, no dependencies, under 1.5 MB installed.
 
@@ -117,7 +118,7 @@ Your default Claude account is always the first profile. It uses the app's norma
 
 ### Privacy
 
-MultiClaude makes **no network requests** and has **no analytics**. It never opens Claude's data folders, so it never sees your chats, files or sign-in tokens. It does not modify the Claude app. Removing a profile only takes it off the list: the folder stays on disk until you delete it yourself.
+MultiClaude has **no analytics**. Its only network request is the daily update check: it asks GitHub for this repo's latest release, and downloads it from GitHub when it's newer. Before installing, it checks that the download is MultiClaude at the advertised version with an intact code signature. Turn off **Update MultiClaude Automatically** in Settings to stop it. It never opens Claude's data folders, so it never sees your chats, files or sign-in tokens. It does not modify the Claude app. Removing a profile only takes it off the list: the folder stays on disk until you delete it yourself.
 
 ## FAQ
 

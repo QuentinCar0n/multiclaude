@@ -8,9 +8,11 @@
 - **A color per profile.** Badges, the running label and the menu bar use it. Change it from the right-click menu.
 - **Active account in the menu bar.** While a Claude window is in front, the menu bar shows its account name in the profile's color, and the row says Active.
 - **Profile Shortcuts.** ⌃⌥1 to ⌃⌥9 open or bring forward the profiles in list order. Off by default.
+- **Automatic updates.** MultiClaude checks GitHub for a new release at launch and then once a day, installs it in the background and restarts while the panel is closed. Claude windows stay open. Switch it off with **Update MultiClaude Automatically** in Settings. Updating from 1.1 or earlier still needs one manual install (or `brew upgrade`).
 
 ### Changed
 - `MultiClaude --list` also prints whether each profile is active and its color.
+- `MultiClaude --check-update` prints the installed and latest versions.
 
 ## 1.1 (build 2), 2026-10-09
 

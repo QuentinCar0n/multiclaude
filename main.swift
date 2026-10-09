@@ -97,15 +97,16 @@ enum Seed {
 // MARK: - Settings
 
 enum Setting: String, CaseIterable, Identifiable {
-    case launchAtLogin, reopenAfterUpdate, shortcut, profileShortcuts, showActive, showCount, coloredIcon, quitWithApp
+    case launchAtLogin, autoUpdate, reopenAfterUpdate, shortcut, profileShortcuts, showActive, showCount, coloredIcon, quitWithApp
 
-    static let onByDefault: Set<Setting> = [.reopenAfterUpdate, .showActive, .showCount]
+    static let onByDefault: Set<Setting> = [.autoUpdate, .reopenAfterUpdate, .showActive, .showCount]
 
     var id: String { rawValue }
 
     var title: String {
         switch self {
         case .launchAtLogin: "Launch at Login"
+        case .autoUpdate: "Update MultiClaude Automatically"
         case .reopenAfterUpdate: "Reopen After Claude Updates"
         case .shortcut: "Keyboard Shortcut"
         case .profileShortcuts: "Profile Shortcuts"
@@ -119,6 +120,7 @@ enum Setting: String, CaseIterable, Identifiable {
     var symbol: String {
         switch self {
         case .launchAtLogin: "power"
+        case .autoUpdate: "arrow.down.circle"
         case .reopenAfterUpdate: "arrow.clockwise"
         case .shortcut: "command"
         case .profileShortcuts: "keyboard"
@@ -192,6 +194,11 @@ final class Engine: ObservableObject {
                 MainActor.assumeIsolated { Engine.shared.refresh() }
             }
         }
+        if let to = defaults.string(forKey: "updatedTo") {
+            defaults.removeObject(forKey: "updatedTo")
+            if to == appVersion { notice = "MultiClaude updated to \(to)." }
+        }
+        if !isDemo { Updater.start() }
         // Electron instances launched with `open -n` sometimes skip the launch notification; poll as a backstop.
         Timer.scheduledTimer(withTimeInterval: 3, repeats: true) { _ in
             MainActor.assumeIsolated { Engine.shared.refresh() }
@@ -243,6 +250,7 @@ final class Engine: ObservableObject {
     }
 
     func dismissNotice() { notice = nil }
+    func show(notice text: String) { notice = text }
 
     // MARK: running instances
 
@@ -396,6 +404,123 @@ final class Engine: ObservableObject {
         if !isDemo, let data = try? JSONEncoder().encode(profiles) { defaults.set(data, forKey: "profiles") }
         updateHotKeys()
         onChange?()
+    }
+}
+
+// Self-update from GitHub releases. Checks at launch and then once a day, installs in the background,
+// and relaunches only while the panel is closed. Claude windows are left alone.
+enum UpdateError: Error { case download, invalid, command(String) }
+
+enum Updater {
+    static let latestURL = URL(string: "https://api.github.com/repos/QuentinCar0n/multiclaude/releases/latest")!
+    nonisolated(unsafe) static var relaunching = false
+    nonisolated(unsafe) static var busy = false
+
+    struct Release { let version: String; let zip: URL }
+
+    static var currentVersion: String { ProcessInfo.processInfo.environment["MULTICLAUDE_FAKE_VERSION"] ?? appVersion }
+
+    @MainActor static func start() {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 10) { checkIfDue(force: true) }
+        Timer.scheduledTimer(withTimeInterval: 3600, repeats: true) { _ in
+            MainActor.assumeIsolated { checkIfDue(force: false) }
+        }
+    }
+
+    @MainActor static func checkIfDue(force: Bool) {
+        let d = UserDefaults.standard
+        guard Engine.shared.isOn(.autoUpdate), !busy else { return }
+        if !force, let last = d.object(forKey: "lastUpdateCheck") as? Date, -last.timeIntervalSinceNow < 86_400 { return }
+        d.set(Date(), forKey: "lastUpdateCheck")
+        let target = Bundle.main.bundleURL
+        guard target.pathExtension == "app",
+              FileManager.default.isWritableFile(atPath: target.deletingLastPathComponent().path) else { return }
+        busy = true
+        Task.detached {
+            let installed = try? await updateIfNewer(at: target)
+            await MainActor.run {
+                busy = false
+                if let installed { relaunchWhenIdle(version: installed, app: target) }
+            }
+        }
+    }
+
+    // Returns the version it installed, or nil when the app is already up to date.
+    static func updateIfNewer(at target: URL) async throws -> String? {
+        guard let r = try await latest(), isNewer(r.version, than: currentVersion) else { return nil }
+        try await install(r, at: target)
+        return r.version
+    }
+
+    static func latest() async throws -> Release? {
+        var req = URLRequest(url: latestURL, timeoutInterval: 30)
+        req.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
+        req.setValue("MultiClaude/\(appVersion)", forHTTPHeaderField: "User-Agent")
+        let (data, resp) = try await URLSession.shared.data(for: req)
+        guard (resp as? HTTPURLResponse)?.statusCode == 200,
+              let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let tag = json["tag_name"] as? String,
+              let assets = json["assets"] as? [[String: Any]],
+              let asset = assets.first(where: { ($0["name"] as? String)?.hasSuffix(".zip") == true }),
+              let link = asset["browser_download_url"] as? String, let url = URL(string: link),
+              url.scheme == "https", url.host == "github.com",
+              url.path.hasPrefix("/QuentinCar0n/multiclaude/releases/download/")
+        else { return nil }
+        return Release(version: tag.hasPrefix("v") ? String(tag.dropFirst()) : tag, zip: url)
+    }
+
+    static func isNewer(_ a: String, than b: String) -> Bool {
+        let x = a.split(separator: ".").map { Int($0) ?? 0 }, y = b.split(separator: ".").map { Int($0) ?? 0 }
+        for i in 0..<max(x.count, y.count) {
+            let l = i < x.count ? x[i] : 0, r = i < y.count ? y[i] : 0
+            if l != r { return l > r }
+        }
+        return false
+    }
+
+    // Downloads the release zip, checks that it holds MultiClaude at the advertised version with an intact
+    // signature, then swaps it in place of the running bundle.
+    static func install(_ r: Release, at target: URL) async throws {
+        let fm = FileManager.default
+        let work = fm.temporaryDirectory.appendingPathComponent("MultiClaude-update-\(UUID().uuidString)")
+        try fm.createDirectory(at: work, withIntermediateDirectories: true)
+        defer { try? fm.removeItem(at: work) }
+        let (tmp, resp) = try await URLSession.shared.download(from: r.zip)
+        guard (resp as? HTTPURLResponse)?.statusCode == 200 else { throw UpdateError.download }
+        let zip = work.appendingPathComponent("update.zip")
+        try fm.moveItem(at: tmp, to: zip)
+        try run("/usr/bin/ditto", ["-x", "-k", zip.path, work.path])
+        let app = work.appendingPathComponent("MultiClaude.app")
+        let info = NSDictionary(contentsOf: app.appendingPathComponent("Contents/Info.plist"))
+        guard info?["CFBundleIdentifier"] as? String == "me.somalabs.multiclaude",
+              info?["CFBundleShortVersionString"] as? String == r.version else { throw UpdateError.invalid }
+        try run("/usr/bin/codesign", ["--verify", "--deep", "--strict", app.path])
+        _ = try fm.replaceItemAt(target, withItemAt: app)
+    }
+
+    static func run(_ tool: String, _ args: [String]) throws {
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: tool)
+        p.arguments = args
+        p.standardOutput = FileHandle.nullDevice
+        p.standardError = FileHandle.nullDevice
+        try p.run()
+        p.waitUntilExit()
+        if p.terminationStatus != 0 { throw UpdateError.command(tool) }
+    }
+
+    @MainActor static func relaunchWhenIdle(version: String, app: URL) {
+        guard !PanelController.shared.isOpen else {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 30) { relaunchWhenIdle(version: version, app: app) }
+            return
+        }
+        UserDefaults.standard.set(version, forKey: "updatedTo")
+        let sh = Process()
+        sh.executableURL = URL(fileURLWithPath: "/bin/sh")
+        sh.arguments = ["-c", "sleep 1; /usr/bin/open \"$0\"", app.path]
+        try? sh.run()
+        relaunching = true
+        NSApp.terminate(nil)
     }
 }
 
@@ -765,7 +890,8 @@ struct MenuView: View {
 
             if let notice = engine.notice {
                 HStack(alignment: .top, spacing: 8) {
-                    Image(systemName: "arrow.clockwise").foregroundStyle(Color.claude)
+                    Image(systemName: notice.hasPrefix("MultiClaude") ? "arrow.down.circle" : "arrow.clockwise")
+                        .foregroundStyle(Color.claude)
                     Text(notice).fixedSize(horizontal: false, vertical: true)
                     Spacer(minLength: 4)
                     Image(systemName: "xmark").foregroundStyle(.secondary).onTapGesture { engine.dismissNotice() }
@@ -1022,7 +1148,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationWillTerminate(_ n: Notification) {
-        if Engine.shared.isOn(.quitWithApp) { Engine.shared.quitAll() }
+        if Engine.shared.isOn(.quitWithApp) && !Updater.relaunching { Engine.shared.quitAll() }
     }
 
     @objc private func clicked() {
@@ -1083,6 +1209,36 @@ if args.count == 2, args[1] == "--selftest-update" {
     for (name, relaunched, now, want) in cases {
         let got = UpdateWatch.due(quitAt: quitAt, updatedAt: t0, relaunched: relaunched, now: now)
         print(got == want ? "PASS" : "FAIL", name)
+        ok = ok && got == want
+    }
+    exit(ok ? 0 : 1)
+}
+if args.count == 2, args[1] == "--check-update" || args[1] == "--update-now" {
+    // --check-update prints the latest release; --update-now also installs it over this app bundle.
+    let install = args[1] == "--update-now"
+    let sem = DispatchSemaphore(value: 0)
+    var code: Int32 = 0
+    Task.detached {
+        do {
+            guard let r = try await Updater.latest() else { print("no release found"); code = 1; sem.signal(); return }
+            let newer = Updater.isNewer(r.version, than: Updater.currentVersion)
+            print("installed \(Updater.currentVersion), latest \(r.version)\(newer ? ", update available" : ", up to date")")
+            if install && newer {
+                try await Updater.install(r, at: Bundle.main.bundleURL)
+                print("installed \(r.version) at \(Bundle.main.bundleURL.path)")
+            }
+        } catch { print("failed: \(error)"); code = 1 }
+        sem.signal()
+    }
+    sem.wait()
+    exit(code)
+}
+if args.count == 2, args[1] == "--selftest-version" {
+    let cases = [("1.2", "1.1", true), ("1.10", "1.9", true), ("1.2", "1.2", false), ("1.2", "1.2.1", false), ("2.0", "1.9.9", true)]
+    var ok = true
+    for (a, b, want) in cases {
+        let got = Updater.isNewer(a, than: b)
+        print(got == want ? "PASS" : "FAIL", a, ">", b, got)
         ok = ok && got == want
     }
     exit(ok ? 0 : 1)
