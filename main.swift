@@ -1,0 +1,858 @@
+// MultiClaude: menu bar manager for several Claude desktop instances, one per profile.
+// Each profile is a separate --user-data-dir, so each one keeps its own account and chats.
+// Same panel as Cocaine (header switch, collapsible sections, round icons), in Claude orange.
+import AppKit
+import SwiftUI
+import ServiceManagement
+import Carbon.HIToolbox
+
+let appVersion = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "1.0"
+let websiteURL = URL(string: "https://somalabs.me")!
+let supportURL = URL(string: "mailto:quentin@somalabs.me?subject=MultiClaude")!
+let claudeBundleID = "com.anthropic.claudefordesktop"
+let supportDir = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support")
+let isPreview = ProcessInfo.processInfo.environment["MULTICLAUDE_PREVIEW"] != nil
+
+extension Color {
+    static let claude = Color(red: 0.851, green: 0.467, blue: 0.341)   // #D97757
+}
+
+extension NSColor {
+    static let claude = NSColor(srgbRed: 0.851, green: 0.467, blue: 0.341, alpha: 1)
+}
+
+// MARK: - Profiles
+
+struct Profile: Codable, Identifiable, Hashable {
+    var id = UUID()
+    var name: String
+    var dir: String?   // nil = the default Claude profile, launched without --user-data-dir
+
+    var isDefault: Bool { dir == nil }
+    var initial: String { String(name.prefix(1)).uppercased() }
+    var folderURL: URL { dir.map { URL(fileURLWithPath: $0) } ?? supportDir.appendingPathComponent("Claude") }
+
+    var shellAlias: String {
+        let key = name.lowercased().filter { $0.isLetter || $0.isNumber }
+        guard let dir else { return "alias \(key)='open -a \"Claude\"'" }
+        return "alias \(key)='open -n -a \"Claude\" --args --user-data-dir=\"\(dir)\"'"
+    }
+}
+
+enum Seed {
+    // First run: the default profile, the Claude aliases in ~/.zshrc, then any other Claude-* folder.
+    static func profiles() -> [Profile] {
+        var list = [Profile(name: "Claude", dir: nil)]
+        var seen = Set<String>()
+        let home = FileManager.default.homeDirectoryForCurrentUser.path
+        let rc = (try? String(contentsOfFile: home + "/.zshrc", encoding: .utf8)) ?? ""
+        let re = try! NSRegularExpression(pattern: #"alias\s+(\w+)=['"]open -n -a "?Claude"? --args --user-data-dir="?([^"']+)"?['"]"#)
+        for m in re.matches(in: rc, range: NSRange(rc.startIndex..., in: rc)) {
+            guard let n = Range(m.range(at: 1), in: rc), let d = Range(m.range(at: 2), in: rc) else { continue }
+            let dir = String(rc[d]).replacingOccurrences(of: "$HOME", with: home)
+            list.append(Profile(name: String(rc[n]).capitalized, dir: dir))
+            seen.insert(dir)
+        }
+        let names = (try? FileManager.default.contentsOfDirectory(atPath: supportDir.path)) ?? []
+        for n in names.sorted() where n.hasPrefix("Claude-") && n != "Claude-3p" {
+            let dir = supportDir.appendingPathComponent(n).path
+            if !seen.contains(dir) { list.append(Profile(name: String(n.dropFirst(7)), dir: dir)) }
+        }
+        return list
+    }
+}
+
+// MARK: - Settings
+
+enum Setting: String, CaseIterable, Identifiable {
+    case launchAtLogin, shortcut, showCount, coloredIcon, quitWithApp
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .launchAtLogin: "Launch at Login"
+        case .shortcut: "Keyboard Shortcut"
+        case .showCount: "Show Count in Menu Bar"
+        case .coloredIcon: "Colored Menu Bar Icon"
+        case .quitWithApp: "Quit Profiles with MultiClaude"
+        }
+    }
+
+    var symbol: String {
+        switch self {
+        case .launchAtLogin: "power"
+        case .shortcut: "command"
+        case .showCount: "number"
+        case .coloredIcon: "paintpalette"
+        case .quitWithApp: "xmark.circle"
+        }
+    }
+
+    var hint: String? { self == .shortcut ? "⌃⌥⌘M" : nil }
+}
+
+// MARK: - Engine
+
+@MainActor
+final class Engine: ObservableObject {
+    static let shared = Engine()
+
+    @Published private(set) var profiles: [Profile]
+    @Published private(set) var running: [UUID: NSRunningApplication] = [:]
+
+    var onChange: (() -> Void)?
+
+    private let defaults = UserDefaults.standard
+    private var pending: [UUID: Date] = [:]   // launched, process not seen yet
+
+    private init() {
+        if let data = defaults.data(forKey: "profiles"), let list = try? JSONDecoder().decode([Profile].self, from: data) {
+            profiles = list
+        } else {
+            profiles = Seed.profiles()
+        }
+    }
+
+    func boot() {
+        save()
+        HotKey.set(isOn(.shortcut))
+        let nc = NSWorkspace.shared.notificationCenter
+        for name in [NSWorkspace.didLaunchApplicationNotification, NSWorkspace.didTerminateApplicationNotification] {
+            nc.addObserver(forName: name, object: nil, queue: .main) { _ in
+                MainActor.assumeIsolated { Engine.shared.refresh() }
+            }
+        }
+        // Electron instances launched with `open -n` sometimes skip the launch notification; poll as a backstop.
+        Timer.scheduledTimer(withTimeInterval: 3, repeats: true) { _ in
+            MainActor.assumeIsolated { Engine.shared.refresh() }
+        }
+        refresh()
+    }
+
+    // MARK: settings
+
+    func isOn(_ s: Setting) -> Bool {
+        if s == .launchAtLogin { return SMAppService.mainApp.status == .enabled }
+        if s == .showCount && defaults.object(forKey: s.rawValue) == nil { return true }
+        return defaults.bool(forKey: s.rawValue)
+    }
+
+    func toggle(_ s: Setting) {
+        let on = !isOn(s)
+        objectWillChange.send()
+        if s == .launchAtLogin {
+            do { on ? try SMAppService.mainApp.register() : try SMAppService.mainApp.unregister() }
+            catch { NSSound.beep() }
+            return
+        }
+        defaults.set(on, forKey: s.rawValue)
+        if s == .shortcut { HotKey.set(on) }
+        onChange?()
+    }
+
+    // MARK: running instances
+
+    // Matches each Claude process to a profile through its --user-data-dir argument.
+    func refresh() {
+        var found: [UUID: NSRunningApplication] = [:]
+        for app in NSWorkspace.shared.runningApplications where app.bundleIdentifier == claudeBundleID && !app.isTerminated {
+            let dir = ProcArgs.of(app.processIdentifier)
+                .first { $0.hasPrefix("--user-data-dir=") }
+                .map { URL(fileURLWithPath: String($0.dropFirst(16))).standardizedFileURL.path }
+            if let p = profiles.first(where: { $0.dir.map { URL(fileURLWithPath: $0).standardizedFileURL.path } == dir }) {
+                found[p.id] = app
+            }
+        }
+        for id in found.keys { pending[id] = nil }
+        pending = pending.filter { $0.value.timeIntervalSinceNow > -15 }
+        if found.keys.sorted(by: { $0.uuidString < $1.uuidString }) != running.keys.sorted(by: { $0.uuidString < $1.uuidString }) {
+            running = found
+            onChange?()
+        }
+    }
+
+    func isRunning(_ p: Profile) -> Bool { running[p.id] != nil }
+    func isStarting(_ p: Profile) -> Bool { pending[p.id] != nil && running[p.id] == nil }
+    var runningCount: Int { running.count }
+
+    // MARK: actions
+
+    func open(_ p: Profile) {
+        if let app = running[p.id] {
+            app.unhide()
+            app.activate()
+            return
+        }
+        var args = ["-a", "Claude"]
+        if let dir = p.dir {
+            try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+            args = ["-n", "-a", "Claude", "--args", "--user-data-dir=\(dir)"]
+        }
+        let task = Process()
+        task.executableURL = URL(fileURLWithPath: "/usr/bin/open")
+        task.arguments = args
+        do { try task.run() } catch { NSSound.beep(); return }
+        objectWillChange.send()
+        pending[p.id] = Date()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { Engine.shared.refresh() }
+    }
+
+    func quit(_ p: Profile) {
+        running[p.id]?.terminate()
+    }
+
+    func openAll() { profiles.filter { !isRunning($0) }.forEach(open) }
+    func quitAll() { profiles.forEach(quit) }
+
+    // MARK: editing
+
+    @discardableResult
+    func add(name raw: String) -> Bool {
+        let name = raw.trimmingCharacters(in: .whitespaces)
+        let slug = name.filter { $0.isLetter || $0.isNumber || $0 == "-" || $0 == "_" }
+        guard !slug.isEmpty, !profiles.contains(where: { $0.name.caseInsensitiveCompare(name) == .orderedSame }) else {
+            NSSound.beep(); return false
+        }
+        let dir = supportDir.appendingPathComponent("Claude-\(slug)").path
+        profiles.append(Profile(name: name, dir: dir))
+        save()
+        return true
+    }
+
+    func rename(_ p: Profile, to raw: String) {
+        let name = raw.trimmingCharacters(in: .whitespaces)
+        guard !name.isEmpty, let i = profiles.firstIndex(of: p) else { return }
+        profiles[i].name = name   // the data folder keeps its path, so sign-ins survive a rename
+        save()
+    }
+
+    // Takes the profile off the list. Its data folder stays on disk.
+    func remove(_ p: Profile) {
+        guard !p.isDefault else { return }
+        profiles.removeAll { $0.id == p.id }
+        save()
+    }
+
+    func move(_ p: Profile, by delta: Int) {
+        guard let i = profiles.firstIndex(of: p) else { return }
+        let j = i + delta
+        guard profiles.indices.contains(j) else { return }
+        profiles.swapAt(i, j)
+        save()
+    }
+
+    private func save() {
+        if let data = try? JSONEncoder().encode(profiles) { defaults.set(data, forKey: "profiles") }
+        onChange?()
+    }
+}
+
+// Reads a process's argv through sysctl, so no `ps` has to run.
+enum ProcArgs {
+    static func of(_ pid: pid_t) -> [String] {
+        var mib = [CTL_KERN, KERN_PROCARGS2, pid]
+        var size = 0
+        guard sysctl(&mib, 3, nil, &size, nil, 0) == 0, size > 4 else { return [] }
+        var buf = [UInt8](repeating: 0, count: size)
+        guard sysctl(&mib, 3, &buf, &size, nil, 0) == 0 else { return [] }
+        let argc = buf.withUnsafeBytes { $0.load(as: Int32.self) }
+        var i = 4
+        while i < size && buf[i] != 0 { i += 1 }   // executable path
+        while i < size && buf[i] == 0 { i += 1 }   // padding
+        var args: [String] = []
+        while args.count < argc && i < size {
+            let start = i
+            while i < size && buf[i] != 0 { i += 1 }
+            args.append(String(decoding: buf[start..<i], as: UTF8.self))
+            i += 1
+        }
+        return args
+    }
+}
+
+// Global ⌃⌥⌘M through Carbon, which needs no Accessibility permission. Opens the panel.
+@MainActor
+enum HotKey {
+    static var ref: EventHotKeyRef?
+    static var installed = false
+    static var action: (() -> Void)?
+
+    static func set(_ on: Bool) {
+        if let ref { UnregisterEventHotKey(ref) }
+        ref = nil
+        guard on else { return }
+        if !installed {
+            var spec = EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: UInt32(kEventHotKeyPressed))
+            InstallEventHandler(GetApplicationEventTarget(), { _, _, _ in
+                MainActor.assumeIsolated { HotKey.action?() }
+                return noErr
+            }, 1, &spec, nil, nil)
+            installed = true
+        }
+        let id = EventHotKeyID(signature: OSType(0x4D43_4C44), id: 1)
+        RegisterEventHotKey(UInt32(kVK_ANSI_M), UInt32(cmdKey | optionKey | controlKey), id,
+                            GetApplicationEventTarget(), 0, &ref)
+    }
+}
+
+// MARK: - App icon (drawn, so the bundle needs no image files)
+
+enum AppIcon {
+    static func image(_ side: CGFloat) -> NSImage {
+        NSImage(size: NSSize(width: side, height: side), flipped: false) { r in
+            let inset = r.width * 0.1
+            let tile = r.insetBy(dx: inset, dy: inset)
+            let path = NSBezierPath(roundedRect: tile, xRadius: tile.width * 0.225, yRadius: tile.width * 0.225)
+            NSGraphicsContext.saveGraphicsState()
+            let shadow = NSShadow()
+            shadow.shadowColor = .black.withAlphaComponent(0.3)
+            shadow.shadowBlurRadius = r.width * 0.025
+            shadow.shadowOffset = NSSize(width: 0, height: -r.width * 0.01)
+            shadow.set()
+            NSColor.claude.setFill()
+            path.fill()
+            NSGraphicsContext.restoreGraphicsState()
+            NSGradient(colors: [NSColor(srgbRed: 0.93, green: 0.58, blue: 0.45, alpha: 1),
+                                NSColor(srgbRed: 0.78, green: 0.38, blue: 0.26, alpha: 1)])?.draw(in: path, angle: -90)
+            let cfg = NSImage.SymbolConfiguration(pointSize: tile.width * 0.5, weight: .semibold)
+                .applying(.init(paletteColors: [.white]))
+            if let sym = NSImage(systemSymbolName: "asterisk", accessibilityDescription: nil)?.withSymbolConfiguration(cfg) {
+                let s = sym.size
+                sym.draw(in: NSRect(x: tile.midX - s.width / 2, y: tile.midY - s.height / 2, width: s.width, height: s.height))
+            }
+            return true
+        }
+    }
+
+    // build.sh calls `MultiClaude --export-iconset <dir>` to make the .icns.
+    static func exportIconset(to dir: String) {
+        try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+        for base in [16, 32, 128, 256, 512] {
+            for scale in [1, 2] {
+                let px = CGFloat(base * scale)
+                let rep = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: Int(px), pixelsHigh: Int(px),
+                                           bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false,
+                                           colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0)!
+                NSGraphicsContext.saveGraphicsState()
+                NSGraphicsContext.current = NSGraphicsContext(bitmapImageRep: rep)
+                image(px).draw(in: NSRect(x: 0, y: 0, width: px, height: px))
+                NSGraphicsContext.restoreGraphicsState()
+                let name = scale == 1 ? "icon_\(base)x\(base).png" : "icon_\(base)x\(base)@2x.png"
+                try? rep.representation(using: .png, properties: [:])?.write(to: URL(fileURLWithPath: dir + "/" + name))
+            }
+        }
+    }
+}
+
+// MARK: - Panel views
+
+struct HoverBackground: ViewModifier {
+    @State private var hover = false
+    var radius: CGFloat = 10
+    func body(content: Content) -> some View {
+        content
+            .background(RoundedRectangle(cornerRadius: radius, style: .continuous)
+                .fill(Color.primary.opacity(hover ? 0.1 : 0)))
+            .contentShape(Rectangle())
+            .onHover { hover = $0 }
+    }
+}
+
+struct SectionHeader: View {
+    let title: String
+    var trailing: String?
+    @Binding var open: Bool
+
+    var body: some View {
+        HStack {
+            Text(title).font(.system(size: 13, weight: .semibold)).foregroundStyle(.secondary)
+            Spacer()
+            if let trailing {
+                Text(trailing).font(.system(size: 11, weight: .medium)).monospacedDigit().foregroundStyle(.secondary)
+            }
+            Image(systemName: "chevron.right")
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundStyle(.secondary)
+                .rotationEffect(.degrees(open ? 90 : 0))
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 7)
+        .contentShape(Rectangle())
+        .onTapGesture { withAnimation(.easeOut(duration: 0.18)) { open.toggle() } }
+    }
+}
+
+// Round 24 pt badge, filled orange when on, like Cocaine's chips.
+struct Badge<Label: View>: View {
+    let on: Bool
+    @ViewBuilder let label: Label
+    var body: some View {
+        label
+            .foregroundStyle(on ? Color.white : Color.primary)
+            .frame(width: 24, height: 24)
+            .background(Circle().fill(on ? Color.claude : Color.primary.opacity(0.12)))
+    }
+}
+
+struct NameField: View {
+    @State var text: String
+    let placeholder: String
+    let onCommit: (String) -> Void
+    let onCancel: () -> Void
+    @FocusState private var focused: Bool
+
+    var body: some View {
+        TextField(placeholder, text: $text)
+            .textFieldStyle(.plain)
+            .font(.system(size: 13))
+            .focused($focused)
+            .onSubmit { onCommit(text) }
+            .onExitCommand(perform: onCancel)
+            .onAppear {
+                NSApp.activate()
+                DispatchQueue.main.async { focused = true }
+            }
+    }
+}
+
+struct ProfileRow: View {
+    let profile: Profile
+    @ObservedObject var engine = Engine.shared
+    @Binding var editing: UUID?
+    @State private var hover = false
+
+    var body: some View {
+        let on = engine.isRunning(profile)
+        HStack(spacing: 9) {
+            Badge(on: on) {
+                if engine.isStarting(profile) {
+                    ProgressView().controlSize(.mini)
+                } else {
+                    Text(profile.initial).font(.system(size: 12, weight: .bold))
+                }
+            }
+            if editing == profile.id {
+                NameField(text: profile.name, placeholder: "Profile name",
+                          onCommit: { engine.rename(profile, to: $0); editing = nil },
+                          onCancel: { editing = nil })
+            } else {
+                Text(profile.name).font(.system(size: 13)).foregroundStyle(.primary.opacity(on ? 1 : 0.75))
+                if profile.isDefault {
+                    Text("Default").font(.system(size: 10)).foregroundStyle(.tertiary)
+                }
+            }
+            Spacer(minLength: 4)
+            if on && hover {
+                Image(systemName: "xmark.circle.fill")
+                    .font(.system(size: 14))
+                    .foregroundStyle(.secondary)
+                    .contentShape(Circle())
+                    .onTapGesture { engine.quit(profile) }
+                    .help("Quit \(profile.name)")
+            } else if on {
+                Text("Running").font(.system(size: 10)).foregroundStyle(Color.claude)
+            }
+        }
+        .padding(.horizontal, 8)
+        .padding(.vertical, 5)
+        .modifier(HoverBackground(radius: 8))
+        .onHover { hover = $0 }
+        .onTapGesture {
+            guard editing != profile.id else { return }
+            engine.open(profile)
+            if !on { PanelController.shared.close() }
+        }
+        .contextMenu {
+            Button(on ? "Show \(profile.name)" : "Open \(profile.name)") { engine.open(profile) }
+            if on { Button("Quit \(profile.name)") { engine.quit(profile) } }
+            Divider()
+            Button("Rename…") { editing = profile.id }
+            Button("Move Up") { engine.move(profile, by: -1) }
+            Button("Move Down") { engine.move(profile, by: 1) }
+            Divider()
+            Button("Show Data Folder in Finder") { NSWorkspace.shared.activateFileViewerSelecting([profile.folderURL]) }
+            Button("Copy Shell Alias") {
+                NSPasteboard.general.clearContents()
+                NSPasteboard.general.setString(profile.shellAlias, forType: .string)
+            }
+            if !profile.isDefault {
+                Divider()
+                Button("Remove from List") { engine.remove(profile) }
+            }
+        }
+    }
+}
+
+struct NewProfileRow: View {
+    @ObservedObject var engine = Engine.shared
+    @State private var adding = false
+
+    var body: some View {
+        HStack(spacing: 9) {
+            Badge(on: false) { Image(systemName: "plus").font(.system(size: 12, weight: .semibold)) }
+            if adding {
+                NameField(text: "", placeholder: "Profile name, then Return",
+                          onCommit: { if engine.add(name: $0) { adding = false } },
+                          onCancel: { adding = false })
+            } else {
+                Text("New Profile").font(.system(size: 13)).foregroundStyle(.primary.opacity(0.75))
+            }
+            Spacer(minLength: 4)
+        }
+        .padding(.horizontal, 8)
+        .padding(.vertical, 5)
+        .modifier(HoverBackground(radius: 8))
+        .onTapGesture { adding = true }
+    }
+}
+
+struct SettingRow: View {
+    let setting: Setting
+    @ObservedObject var engine = Engine.shared
+
+    var body: some View {
+        let on = engine.isOn(setting)
+        HStack(spacing: 9) {
+            Badge(on: on) { Image(systemName: setting.symbol).font(.system(size: 12, weight: .medium)) }
+            Text(setting.title).font(.system(size: 13)).foregroundStyle(.primary.opacity(on ? 1 : 0.75))
+            Spacer(minLength: 4)
+            if let hint = setting.hint {
+                Text(hint).font(.system(size: 10)).foregroundStyle(.tertiary)
+            }
+        }
+        .padding(.horizontal, 8)
+        .padding(.vertical, 5)
+        .modifier(HoverBackground(radius: 8))
+        .onTapGesture { engine.toggle(setting) }
+    }
+}
+
+struct PlainRow: View {
+    let title: String
+    let action: () -> Void
+    var body: some View {
+        HStack { Text(title).font(.system(size: 13)); Spacer() }
+            .padding(.horizontal, 8)
+            .padding(.vertical, 3)
+            .modifier(HoverBackground(radius: 6))
+            .onTapGesture(perform: action)
+    }
+}
+
+struct MenuView: View {
+    @ObservedObject var engine = Engine.shared
+    @AppStorage("profilesOpen") private var profilesOpen = true
+    @AppStorage("settingsOpen") private var settingsOpen = false
+    @State private var editing: UUID?
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            // The switch reads "any profile running": on opens every profile, off quits them all.
+            HStack {
+                Text("MultiClaude").font(.system(size: 13, weight: .bold))
+                Spacer()
+                Toggle("", isOn: Binding(get: { engine.runningCount > 0 },
+                                         set: { $0 ? engine.openAll() : engine.quitAll() }))
+                    .toggleStyle(.switch).controlSize(.regular).labelsHidden().tint(.claude)
+                    .help("On opens every profile, off quits them all")
+            }
+            .padding(.horizontal, 14)
+            .padding(.top, 10)
+            .padding(.bottom, 8)
+
+            Divider().padding(.horizontal, 14)
+            SectionHeader(title: "Profiles (\(engine.profiles.count))",
+                          trailing: engine.runningCount > 0 ? "\(engine.runningCount) running" : "None running",
+                          open: $profilesOpen)
+            if profilesOpen {
+                VStack(spacing: 0) {
+                    ForEach(engine.profiles) { ProfileRow(profile: $0, editing: $editing) }
+                    NewProfileRow()
+                }
+                .padding(.horizontal, 6)
+                .padding(.bottom, 5)
+            }
+
+            Divider().padding(.horizontal, 14)
+            SectionHeader(title: "Settings", open: $settingsOpen)
+            if settingsOpen {
+                VStack(spacing: 0) {
+                    ForEach(Setting.allCases) { SettingRow(setting: $0) }
+                }
+                .padding(.horizontal, 6)
+                .padding(.bottom, 5)
+            }
+
+            Divider().padding(.horizontal, 14)
+            VStack(spacing: 0) {
+                PlainRow(title: "About") { PanelController.shared.close(); AboutWindow.show() }
+                PlainRow(title: "Quit") { NSApp.terminate(nil) }
+            }
+            .padding(.horizontal, 6)
+            .padding(.vertical, 5)
+        }
+        .frame(width: 300)
+        .fixedSize(horizontal: false, vertical: true)
+        .onGeometryChange(for: CGSize.self, of: { $0.size }) { size in
+            DispatchQueue.main.async { PanelController.shared.resize(to: size) }
+        }
+        .frame(maxHeight: .infinity, alignment: .top)
+    }
+}
+
+// MARK: - Panel window
+
+final class KeyPanel: NSPanel {
+    override var canBecomeKey: Bool { true }
+}
+
+@MainActor
+final class PanelController {
+    static let shared = PanelController()
+
+    private var panel: KeyPanel?
+    private var host: NSHostingView<MenuView>?
+    private var monitor: Any?
+    private var anchor = NSPoint.zero   // top-left corner in screen coordinates
+
+    var isOpen: Bool { panel?.isVisible ?? false }
+
+    func toggle(below button: NSStatusBarButton) { isOpen ? close() : open(below: button) }
+
+    func open(below button: NSStatusBarButton) {
+        let p = panel ?? makePanel()
+        panel = p
+        guard let win = button.window, let screen = win.screen else { return }
+        let b = win.convertToScreen(button.convert(button.bounds, to: nil))
+        let width: CGFloat = 300
+        let x = min(max(b.minX - 12, screen.visibleFrame.minX + 6), screen.visibleFrame.maxX - width - 6)
+        anchor = NSPoint(x: x, y: b.minY - 6)
+        resize(to: host?.fittingSize ?? NSSize(width: width, height: 300))
+        Engine.shared.refresh()
+        p.makeKeyAndOrderFront(nil)
+        monitor = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown]) { _ in
+            MainActor.assumeIsolated { PanelController.shared.close() }
+        }
+    }
+
+    func close() {
+        // Preview runs keep the panel up for screenshots while someone uses the Mac.
+        if isPreview && panel?.isVisible == true { return }
+        panel?.orderOut(nil)
+        if let monitor { NSEvent.removeMonitor(monitor) }
+        monitor = nil
+    }
+
+    func resize(to size: CGSize) {
+        guard let panel, size.height > 0 else { return }
+        panel.setFrame(NSRect(x: anchor.x, y: anchor.y - size.height, width: size.width, height: size.height), display: true)
+    }
+
+    private func makePanel() -> KeyPanel {
+        let p = KeyPanel(contentRect: .zero, styleMask: [.nonactivatingPanel, .borderless, .fullSizeContentView],
+                         backing: .buffered, defer: true)
+        p.isFloatingPanel = true
+        p.level = .popUpMenu
+        p.backgroundColor = .clear
+        p.isOpaque = false
+        p.hasShadow = true
+        p.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .transient]
+
+        let fx = NSVisualEffectView()
+        fx.material = .menu
+        fx.blendingMode = .behindWindow
+        fx.state = .active
+        fx.wantsLayer = true
+        fx.layer?.cornerRadius = 12
+        fx.layer?.cornerCurve = .continuous
+        fx.layer?.masksToBounds = true
+        fx.layer?.borderWidth = 0.5
+        fx.layer?.borderColor = NSColor.white.withAlphaComponent(0.18).cgColor
+
+        // Host fills the panel and never sizes it; MenuView reports its height and resize(to:) moves the frame.
+        let host = NSHostingView(rootView: MenuView())
+        host.sizingOptions = []
+        host.frame = fx.bounds
+        host.autoresizingMask = [.width, .height]
+        fx.addSubview(host)
+        self.host = host
+        p.contentView = fx
+        NotificationCenter.default.addObserver(forName: NSWindow.didResignKeyNotification, object: p, queue: .main) { _ in
+            // A context menu takes key for a moment; only close once the menu is gone.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+                MainActor.assumeIsolated {
+                    if NSApp.keyWindow == nil || NSApp.keyWindow is AboutWindowType { PanelController.shared.close() }
+                }
+            }
+        }
+        return p
+    }
+}
+
+// MARK: - About window
+
+final class AboutWindowType: NSWindow {}
+
+struct PillButtonStyle: ButtonStyle {
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .font(.system(size: 16, weight: .medium))
+            .foregroundStyle(.white)
+            .frame(width: 150, height: 42)
+            .background(Capsule().fill(LinearGradient(colors: [Color(red: 0.93, green: 0.55, blue: 0.42), Color(red: 0.80, green: 0.40, blue: 0.28)],
+                                                      startPoint: .top, endPoint: .bottom)))
+            .overlay(Capsule().strokeBorder(.white.opacity(0.25), lineWidth: 0.5))
+            .opacity(configuration.isPressed ? 0.8 : 1)
+    }
+}
+
+struct AboutView: View {
+    var body: some View {
+        HStack(spacing: 34) {
+            Image(nsImage: AppIcon.image(512)).resizable().frame(width: 170, height: 170)
+            VStack(alignment: .leading, spacing: 4) {
+                Text("MultiClaude").font(.system(size: 32, weight: .semibold))
+                Text("Version \(appVersion)").font(.system(size: 13))
+                Text("MultiClaude is made with care by Soma Labs, a small health tech studio based in Palo Alto, California.")
+                    .font(.system(size: 14))
+                    .lineSpacing(3)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .padding(.top, 14)
+                HStack(spacing: 18) {
+                    Button("Support") { NSWorkspace.shared.open(supportURL) }
+                    Button("Website") { NSWorkspace.shared.open(websiteURL) }
+                }
+                .buttonStyle(PillButtonStyle())
+                .padding(.top, 18)
+            }
+            .frame(width: 330, alignment: .leading)
+        }
+        .padding(.horizontal, 40)
+        .padding(.top, 30)
+        .padding(.bottom, 44)
+        .frame(width: 620, height: 330)
+        .overlay(alignment: .bottom) {
+            Text("Copyright © 2026 Soma Labs. All rights reserved.")
+                .font(.system(size: 11)).foregroundStyle(.tertiary).padding(.bottom, 22)
+        }
+    }
+}
+
+@MainActor
+enum AboutWindow {
+    static var window: NSWindow?
+
+    static func show() {
+        if window == nil {
+            let w = AboutWindowType(contentRect: NSRect(x: 0, y: 0, width: 620, height: 330),
+                                    styleMask: [.titled, .closable, .miniaturizable, .fullSizeContentView],
+                                    backing: .buffered, defer: false)
+            w.titlebarAppearsTransparent = true
+            w.titleVisibility = .hidden
+            w.isMovableByWindowBackground = true
+            w.isReleasedWhenClosed = false
+            w.standardWindowButton(.zoomButton)?.isEnabled = false
+            let fx = NSVisualEffectView()
+            fx.material = .hudWindow
+            fx.blendingMode = .behindWindow
+            fx.state = .active
+            let host = NSHostingView(rootView: AboutView())
+            host.frame = fx.bounds
+            host.autoresizingMask = [.width, .height]
+            fx.addSubview(host)
+            w.contentView = fx
+            w.center()
+            window = w
+        }
+        NSApp.activate()
+        window?.makeKeyAndOrderFront(nil)
+    }
+}
+
+// MARK: - App
+
+@MainActor
+final class AppDelegate: NSObject, NSApplicationDelegate {
+    private let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+
+    func applicationDidFinishLaunching(_ n: Notification) {
+        if let b = item.button {
+            b.target = self
+            b.action = #selector(clicked)
+            b.sendAction(on: [.leftMouseUp, .rightMouseUp])
+            b.imagePosition = .imageLeading
+        }
+        let engine = Engine.shared
+        engine.onChange = { [weak self] in self?.refreshIcon() }
+        HotKey.action = { [weak self] in
+            if let b = self?.item.button { PanelController.shared.toggle(below: b) }
+        }
+        engine.boot()
+        refreshIcon()
+        // Preview hook for screenshots: MULTICLAUDE_PREVIEW=panel|settings|about
+        switch ProcessInfo.processInfo.environment["MULTICLAUDE_PREVIEW"] {
+        case "panel", "settings":
+            UserDefaults.standard.set(ProcessInfo.processInfo.environment["MULTICLAUDE_PREVIEW"] == "settings", forKey: "settingsOpen")
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+                if let b = self?.item.button { PanelController.shared.open(below: b) }
+            }
+        case "about": AboutWindow.show()
+        default: break
+        }
+    }
+
+    func applicationWillTerminate(_ n: Notification) {
+        if Engine.shared.isOn(.quitWithApp) { Engine.shared.quitAll() }
+    }
+
+    @objc private func clicked() {
+        guard let button = item.button else { return }
+        PanelController.shared.toggle(below: button)
+    }
+
+    private func refreshIcon() {
+        guard let b = item.button else { return }
+        let engine = Engine.shared
+        let count = engine.runningCount
+        let img = NSImage(systemSymbolName: "asterisk", accessibilityDescription: "MultiClaude")
+        if count > 0 && engine.isOn(.coloredIcon) {
+            b.image = img?.withSymbolConfiguration(.init(paletteColors: [.claude]))
+            b.image?.isTemplate = false
+        } else {
+            b.image = img
+            b.image?.isTemplate = true
+        }
+        b.title = count > 0 && engine.isOn(.showCount) ? " \(count)" : ""
+        b.font = .monospacedDigitSystemFont(ofSize: 12, weight: .medium)
+    }
+}
+
+let args = CommandLine.arguments
+if args.count == 2, args[1] == "--list" {
+    // Prints each profile and whether it runs, for a quick check from the terminal.
+    MainActor.assumeIsolated {
+        let e = Engine.shared
+        e.refresh()
+        for p in e.profiles {
+            print("\(e.isRunning(p) ? "●" : "○") \(p.name)\t\(p.dir ?? "(default)")")
+        }
+    }
+    exit(0)
+}
+if args.count == 2, args[1] == "--unregister-login" {
+    try? SMAppService.mainApp.unregister()
+    exit(0)
+}
+if args.count == 3, args[1] == "--export-iconset" {
+    MainActor.assumeIsolated { AppIcon.exportIconset(to: args[2]) }
+    exit(0)
+}
+
+MainActor.assumeIsolated {
+    let app = NSApplication.shared
+    let delegate = AppDelegate()
+    app.delegate = delegate
+    app.setActivationPolicy(.accessory)
+    app.run()
+}
