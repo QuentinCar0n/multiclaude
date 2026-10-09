@@ -31,7 +31,7 @@ cat > $APP/Contents/Info.plist <<PLIST
 </dict></plist>
 PLIST
 codesign --force --sign - $APP
-(cd build && ditto -c -k --keepParent MultiClaude.app MultiClaude-$VERSION.zip)
+(cd build && ditto -c -k --norsrc --noextattr --noqtn --keepParent MultiClaude.app MultiClaude-$VERSION.zip)
 [[ "$1" == "--no-install" ]] && { echo "Built build/MultiClaude-$VERSION.zip"; exit 0; }
 mkdir -p ~/Applications
 pkill -x MultiClaude || true
