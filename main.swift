@@ -1613,6 +1613,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
                 if let b = self?.item.button { PanelController.shared.open(below: b) }
             }
+        case "signin":   // MULTICLAUDE_SIGNIN_TARGET=<profile name> starts Sign In for that profile, for live tests
+            let name = ProcessInfo.processInfo.environment["MULTICLAUDE_SIGNIN_TARGET"] ?? ""
+            DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
+                if let p = Engine.shared.profiles.first(where: { $0.name == name }) { Engine.shared.beginSignIn(p) }
+            }
         case "about": AboutWindow.show()
         default: break
         }

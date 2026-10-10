@@ -1,6 +1,6 @@
 # MultiClaude release notes
 
-## Unreleased
+## 1.3.1 (build 5), 2026-10-10
 
 ### New
 - **Sign In to a profile.** Claude's Google and SSO sign-in comes back from the browser through a `claude://` link, and macOS delivers it to whichever Claude window is open first, so a second account could never finish signing in. Right-click a profile and choose **Sign In to…**: MultiClaude closes your other accounts, opens this one, notices when the sign-in lands and reopens the others. **Done** in the panel reopens them by hand.
