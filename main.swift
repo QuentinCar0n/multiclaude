@@ -268,7 +268,62 @@ final class Engine: ObservableObject {
         return "⌃⌥\(i + 1)"
     }
 
-    func dismissNotice() { notice = nil }
+    func dismissNotice() {
+        if signIn != nil { finishSignIn(cancelled: true) }
+        notice = nil
+    }
+
+    // MARK: sign-in
+
+    // Claude's Google and SSO sign-in leaves through the browser and comes back as a claude:// link,
+    // which macOS hands to the first Claude window it finds. With only the target open, it lands there.
+    struct SignIn { let target: UUID; let reopen: [UUID]; var logOffset: UInt64; var sawBrowser = false }
+    @Published private(set) var signIn: SignIn?
+    private var signInTimer: Timer?
+
+    func beginSignIn(_ p: Profile) {
+        guard signIn == nil else { return }
+        let others = profiles.filter { $0.id != p.id && isRunning($0) }
+        signIn = SignIn(target: p.id, reopen: others.map(\.id), logOffset: SignInLog.size())
+        let names = ListFormatter.localizedString(byJoining: others.map(\.name))
+        notice = others.isEmpty ? "Sign in to \(p.name) in its window."
+            : "Sign in to \(p.name) in its window. \(names) reopen\(others.count == 1 ? "s" : "") once you're signed in."
+        func next(_ rest: [Profile]) {
+            guard let first = rest.first else {
+                Engine.shared.open(p)
+                return
+            }
+            Engine.shared.quitAndWait(first) { next(Array(rest.dropFirst())) }
+        }
+        next(others)
+        signInTimer?.invalidate()
+        signInTimer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { _ in
+            MainActor.assumeIsolated { Engine.shared.checkSignIn() }
+        }
+    }
+
+    private func checkSignIn() {
+        guard var s = signIn else { return }
+        let (lines, offset) = SignInLog.read(from: s.logOffset)
+        s.logOffset = offset
+        let (sawBrowser, done) = SignInLog.scan(lines, sawBrowser: s.sawBrowser)
+        s.sawBrowser = sawBrowser
+        signIn = s
+        if done { finishSignIn(cancelled: false) }
+    }
+
+    func finishSignIn(cancelled: Bool) {
+        guard let s = signIn else { return }
+        signInTimer?.invalidate()
+        signInTimer = nil
+        signIn = nil
+        let reopen = profiles.filter { s.reopen.contains($0.id) && !isRunning($0) }
+        reopen.forEach(open)
+        let target = profiles.first { $0.id == s.target }?.name ?? "the account"
+        if cancelled { return }
+        notice = "Signed in to \(target)."
+            + (reopen.isEmpty ? "" : " Reopened " + ListFormatter.localizedString(byJoining: reopen.map(\.name)) + ".")
+    }
     func show(notice text: String) { notice = text }
 
     // MARK: running instances
@@ -504,7 +559,7 @@ final class Engine: ObservableObject {
     // Renames each closed profile's folder to Claude-<name>. A symlink stays at the old path because
     // Claude writes absolute paths into its data (agent sessions, git config), and old aliases keep working.
     func alignFolders() {
-        guard !isDemo, !isCLI else { return }
+        guard !isDemo, !isCLI, signIn == nil else { return }
         // Read the live processes here rather than trusting `running`, which may not be filled in yet.
         let live = Set(NSWorkspace.shared.runningApplications
             .filter { $0.bundleIdentifier == claudeBundleID && !$0.isTerminated }
@@ -674,6 +729,38 @@ enum Updater {
         try? sh.run()
         relaunching = true
         NSApp.terminate(nil)
+    }
+}
+
+// Every Claude instance writes to the same main.log, so new lines since the sign-in started tell when it lands.
+enum SignInLog {
+    static let url = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Logs/Claude/main.log")
+
+    static func size() -> UInt64 {
+        ((try? FileManager.default.attributesOfItem(atPath: url.path))?[.size] as? NSNumber)?.uint64Value ?? 0
+    }
+
+    static func read(from offset: UInt64) -> ([String], UInt64) {
+        guard let h = try? FileHandle(forReadingFrom: url) else { return ([], offset) }
+        defer { try? h.close() }
+        let end = (try? h.seekToEnd()) ?? offset
+        let start = end < offset ? 0 : offset   // the log rotated
+        try? h.seek(toOffset: start)
+        let data = (try? h.readToEnd()) ?? Data()
+        return (String(decoding: data, as: UTF8.self).split(separator: "\n").map(String.init), end)
+    }
+
+    // Done once the browser sign-in has come back: the claude:// login link was handled, or the
+    // account reports logged in after the browser step (a plain "logged in" at launch is not enough,
+    // Claude logs it right before bouncing a stale session to /logout).
+    static func scan(_ lines: [String], sawBrowser: Bool) -> (sawBrowser: Bool, done: Bool) {
+        var saw = sawBrowser
+        for l in lines {
+            if l.contains("[Auth] Using system browser") { saw = true }
+            if l.contains("claudeURLHandler: login") { return (true, true) }
+            if saw && l.contains("account active and logged in") { return (saw, true) }
+        }
+        return (saw, false)
     }
 }
 
@@ -1078,6 +1165,7 @@ struct ProfileRow: View {
         .contextMenu {
             Button(on ? "Show \(profile.name)" : "Open \(profile.name)") { engine.open(profile) }
             if on { Button("Quit \(profile.name)") { engine.quit(profile) } }
+            Button("Sign In to \(profile.name)…") { Dialogs.signIn(profile) }
             Button("Open Claude Code in Terminal") { engine.openClaudeCode(profile) }
             Toggle("Open When MultiClaude Starts", isOn: Binding(get: { profile.openAtLaunch == true },
                                                                  set: { engine.setOpenAtLaunch(profile, $0) }))
@@ -1152,6 +1240,19 @@ enum Dialogs {
                                 buttons: buttons)
         if choice == buttons.count - 1 { return }
         e.copyMCPServers(from: src, to: dst, restart: running && choice == 0)
+    }
+
+    static func signIn(_ p: Profile) {
+        let e = Engine.shared
+        let others = e.profiles.filter { $0.id != p.id && e.isRunning($0) }
+        guard !others.isEmpty else { e.beginSignIn(p); return }
+        let names = ListFormatter.localizedString(byJoining: others.map(\.name))
+        let (choice, _) = alert("Sign in to \(p.name)",
+            "Claude's Google and SSO sign-in comes back through your browser to whichever Claude window is open first. "
+            + "MultiClaude closes \(names) while you sign in, then reopens \(others.count == 1 ? "it" : "them"). "
+            + "Anything you haven't sent in \(others.count == 1 ? "that window" : "those windows") is lost.",
+            buttons: ["Close \(others.count == 1 ? names : "Others") and Sign In", "Cancel"])
+        if choice == 0 { e.beginSignIn(p) }
     }
 
     static func duplicate(_ src: Profile) {
@@ -1251,11 +1352,19 @@ struct MenuView: View {
 
             if let notice = engine.notice {
                 HStack(alignment: .top, spacing: 8) {
-                    Image(systemName: notice.hasPrefix("MultiClaude") ? "arrow.down.circle" : "arrow.clockwise")
+                    Image(systemName: engine.signIn != nil ? "person.badge.key" : notice.hasPrefix("MultiClaude") ? "arrow.down.circle" : "arrow.clockwise")
                         .foregroundStyle(Color.claude)
                     Text(notice).fixedSize(horizontal: false, vertical: true)
                     Spacer(minLength: 4)
-                    Image(systemName: "xmark").foregroundStyle(.secondary).onTapGesture { engine.dismissNotice() }
+                    if engine.signIn != nil {
+                        Text("Done").font(.system(size: 11, weight: .semibold)).foregroundStyle(.white)
+                            .padding(.horizontal, 9).padding(.vertical, 3)
+                            .background(Capsule().fill(Color.claude))
+                            .onTapGesture { engine.finishSignIn(cancelled: false) }
+                            .help("Reopen the other accounts now")
+                    } else {
+                        Image(systemName: "xmark").foregroundStyle(.secondary).onTapGesture { engine.dismissNotice() }
+                    }
                 }
                 .font(.system(size: 12))
                 .padding(.horizontal, 14)
@@ -1681,6 +1790,27 @@ if args.count == 2, args[1] == "--selftest-profiles" {
     check("canonical resolves the old path", Folders.canonical(sup + "/Claude-Work") == Folders.canonical(sup + "/Claude-Augura"))
     check("no target onto a leftover symlink", Folders.target(for: "Work", current: sup + "/Claude-Augura", in: sup) == nil)
     try? FileManager.default.removeItem(at: tmp)
+    exit(ok ? 0 : 1)
+}
+if args.count == 2, args[1] == "--selftest-signin" {
+    // Lines taken from Claude's main.log on 2026-10-10.
+    let launchBounce = ["[info] claude.ai account active and logged in", "[info] [account] Navigated to /logout, synthesizing logged-out"]
+    let browser = ["[info] [Auth] Using system browser for: /login/app-google-auth"]
+    let back = ["[info] claudeURLHandler: login loadURL superseded (teardown race)"]
+    let loggedIn = ["[info] claude.ai account active and logged in"]
+    let cases: [(String, [String], Bool, Bool)] = [
+        ("launch 'logged in' before /logout is not done", launchBounce, false, false),
+        ("browser step alone is not done", browser, false, false),
+        ("login link handled is done", back, false, true),
+        ("logged in after browser step is done", browser + loggedIn, false, true),
+        ("browser seen in an earlier read, logged in now", loggedIn, true, true),
+    ]
+    var ok = true
+    for (name, lines, saw, want) in cases {
+        let got = SignInLog.scan(lines, sawBrowser: saw).done
+        print(got == want ? "PASS" : "FAIL", name)
+        ok = ok && got == want
+    }
     exit(ok ? 0 : 1)
 }
 if args.count == 2, args[1] == "--selftest-version" {

@@ -39,6 +39,7 @@ jobs:
           build/MultiClaude.app/Contents/MacOS/MultiClaude --selftest-update
           build/MultiClaude.app/Contents/MacOS/MultiClaude --selftest-version
           build/MultiClaude.app/Contents/MacOS/MultiClaude --selftest-profiles
+          build/MultiClaude.app/Contents/MacOS/MultiClaude --selftest-signin
           shasum -a 256 "build/MultiClaude-$VERSION.zip" | tee build/sha256.txt
 
       # Installed copies only accept an update whose zip carries this signature.
