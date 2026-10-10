@@ -1,8 +1,11 @@
 # Builds MultiClaude on every v* tag and publishes the zip as a GitHub release.
 # The tag sets the version: v1.1 builds MultiClaude-1.1.zip with CFBundleShortVersionString 1.1.
+# A tag with a suffix (v1.4-rc1) publishes a pre-release, which installed copies and the cask ignore.
 # Release notes come from the matching "## <version>" section of CHANGELOG.md.
+# The signing key (UPDATE_SIGNING_KEY) lives in the "release" environment, which only v* tags can use,
+# so the build job never sees it. Actions are pinned to commits so an upstream change can't reach the key.
 # With a HOMEBREW_TAP_TOKEN secret (fine-grained PAT, contents write on QuentinCar0n/homebrew-tap),
-# the job also bumps the cask. Run by hand (workflow_dispatch) to build without releasing.
+# the release job also bumps the cask. Run by hand (workflow_dispatch) to build without releasing.
 name: Release
 
 on:
@@ -11,23 +14,22 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
-  release:
+  build:
     runs-on: macos-15
-    env:
-      TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+    outputs:
+      version: ${{ steps.version.outputs.version }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Version
+        id: version
         run: |
-          if [[ "$GITHUB_REF_TYPE" == "tag" ]]; then
-            echo "VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"
-          else
-            echo "VERSION=0.0.0-ci" >> "$GITHUB_ENV"
-          fi
+          if [[ "$GITHUB_REF_TYPE" == "tag" ]]; then v="${GITHUB_REF_NAME#v}"; else v="0.0.0-ci"; fi
+          echo "VERSION=$v" >> "$GITHUB_ENV"
+          echo "version=$v" >> "$GITHUB_OUTPUT"
           echo "BUILD=${{ github.run_number }}" >> "$GITHUB_ENV"
 
       - name: Build
@@ -40,25 +42,43 @@ jobs:
           build/MultiClaude.app/Contents/MacOS/MultiClaude --selftest-version
           build/MultiClaude.app/Contents/MacOS/MultiClaude --selftest-profiles
           build/MultiClaude.app/Contents/MacOS/MultiClaude --selftest-signin
-          shasum -a 256 "build/MultiClaude-$VERSION.zip" | tee build/sha256.txt
 
-      # Installed copies only accept an update whose zip carries this signature.
-      - name: Sign
-        if: github.ref_type == 'tag'
-        env:
-          MULTICLAUDE_SIGNING_KEY: ${{ secrets.UPDATE_SIGNING_KEY }}
-        run: |
-          test -n "$MULTICLAUDE_SIGNING_KEY" || { echo "UPDATE_SIGNING_KEY secret is missing"; exit 1; }
-          build/MultiClaude.app/Contents/MacOS/MultiClaude --sign-update "build/MultiClaude-$VERSION.zip" > "build/MultiClaude-$VERSION.zip.sig"
-          build/MultiClaude.app/Contents/MacOS/MultiClaude --verify-update "build/MultiClaude-$VERSION.zip" "build/MultiClaude-$VERSION.zip.sig"
-
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: MultiClaude-${{ env.VERSION }}
           path: build/MultiClaude-${{ env.VERSION }}.zip
 
+  release:
+    needs: build
+    if: github.ref_type == 'tag'
+    runs-on: macos-15
+    environment: release
+    permissions:
+      contents: write
+    env:
+      VERSION: ${{ needs.build.outputs.version }}
+      TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: MultiClaude-${{ env.VERSION }}
+          path: build
+
+      # Installed copies only accept an update whose zip carries this signature.
+      - name: Sign
+        env:
+          MULTICLAUDE_SIGNING_KEY: ${{ secrets.UPDATE_SIGNING_KEY }}
+        run: |
+          test -n "$MULTICLAUDE_SIGNING_KEY" || { echo "UPDATE_SIGNING_KEY secret is missing"; exit 1; }
+          ditto -x -k "build/MultiClaude-$VERSION.zip" build/app
+          bin=build/app/MultiClaude.app/Contents/MacOS/MultiClaude
+          $bin --sign-update "build/MultiClaude-$VERSION.zip" > "build/MultiClaude-$VERSION.zip.sig"
+          $bin --verify-update "build/MultiClaude-$VERSION.zip" "build/MultiClaude-$VERSION.zip.sig"
+          shasum -a 256 "build/MultiClaude-$VERSION.zip" | tee build/sha256.txt
+
       - name: Release
-        if: github.ref_type == 'tag'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -69,11 +89,12 @@ jobs:
 
           **Install:** `brew install --cask quentincar0n/tap/multiclaude`, or unzip and move MultiClaude.app to Applications. The app is not notarized, so right-click it and choose Open the first time.
           NOTES
+          pre=(); [[ "$VERSION" == *-* ]] && pre=(--prerelease)
           gh release create "$GITHUB_REF_NAME" "build/MultiClaude-$VERSION.zip" "build/MultiClaude-$VERSION.zip.sig" \
-            --title "MultiClaude $VERSION" --notes-file build/notes.md
+            --title "MultiClaude $VERSION" --notes-file build/notes.md "${pre[@]}"
 
       - name: Bump Homebrew cask
-        if: github.ref_type == 'tag' && env.TAP_TOKEN != ''
+        if: env.TAP_TOKEN != '' && !contains(env.VERSION, '-')
         run: |
           SHA=$(cut -d' ' -f1 build/sha256.txt)
           git clone "https://x-access-token:${TAP_TOKEN}@github.com/QuentinCar0n/homebrew-tap.git" tap
