@@ -1,5 +1,14 @@
 # MultiClaude release notes
 
+## 1.4 (build 8), 2026-10-10
+
+### New
+- **An app for each profile.** Turn on **App for Each Profile** in Settings and MultiClaude makes a small app per profile in `~/Applications/MultiClaude Launchers`, named "Claude <Profile>" with Claude's own icon recolored in the profile's color. Spotlight and Launchpad find them, and right-click **Add to Dock** pins one. **Rename App…** gives it another name. The apps are rewritten when a profile is renamed or recolored, pinned Dock tiles pick up the new icon in place, and an app goes away with its profile (and its Dock tile with it). Opening one asks MultiClaude to open or bring forward that account, starting MultiClaude if needed; without MultiClaude it opens Claude directly. Asked for in #1.
+- **Open accounts wear their profile icon.** With profile apps on, each account runs from its own copy of Claude: an APFS clone (no extra disk space) with the profile icon as its Finder icon, so the Dock, ⌘-Tab and Mission Control show which account is which. The copy's signed contents are untouched, so Gatekeeper, the Keychain and Claude's own folders behave as with Claude.app. Copies follow Claude updates while their account is closed. A copy restarted by Claude's updater without its account folder is closed and reopened on its account. The running window keeps the name Claude: renaming it would break the signature.
+
+### Changed
+- MultiClaude finds Claude by its bundle id (`open -b`) rather than its name, so nothing called "Claude" can be opened in its place.
+
 ## 1.3.3 (build 7), 2026-10-10
 
 ### Fixed
