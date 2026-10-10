@@ -139,7 +139,7 @@ Yes. MultiClaude reads the same folders, so an account opened from an alias show
 Right-click your default profile and choose **Duplicate as New Profile**, named for example `Personal`. The copy keeps your sign-in and history. You can then sign the default app out and in to another account, or simply add new profiles next to it.
 
 **An account keeps logging out, or its sign-in never finishes.**
-Claude asks every account to sign in again from time to time. Google and SSO sign-in returns from the browser through a `claude://` link that macOS gives to the first Claude window it finds, so with several accounts open it often lands in the wrong one. Right-click the account and choose **Sign In to…**: MultiClaude closes the others for the minute it takes, then reopens them.
+Claude asks every account to sign in again from time to time. Google and SSO sign-in returns from the browser through a `claude://` link that macOS gives to the first Claude window it finds, so with several accounts open it often lands in the wrong one. Right-click the account and choose **Sign In to…**, then sign in as usual: for that minute MultiClaude catches the link coming back from the browser and hands it to the right window. Your other accounts stay open.
 
 **How do I remove an account completely?**
 Right-click it and choose **Show Data Folder in Finder**, quit it, choose **Remove from List**, then trash the folder.

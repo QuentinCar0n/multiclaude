@@ -1,5 +1,10 @@
 # MultiClaude release notes
 
+## 1.3.2 (build 6), 2026-10-10
+
+### Changed
+- **Sign In no longer closes your other accounts.** For the minute of a sign-in, MultiClaude takes over `claude://` links and hands the one coming back from the browser straight to the account that asked, by process. Your other Claude windows stay open. Links go back to Claude as soon as the sign-in lands, after 10 minutes at most, when MultiClaude quits, and at its next launch after a crash. If macOS refuses the handover, MultiClaude falls back to closing the others as in 1.3.1.
+
 ## 1.3.1 (build 5), 2026-10-10
 
 ### New

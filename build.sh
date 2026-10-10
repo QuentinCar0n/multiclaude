@@ -1,8 +1,8 @@
 #!/bin/zsh
 # Build MultiClaude.app and install it to ~/Applications.
 set -e
-VERSION=${VERSION:-1.3.1}   # bump with a CHANGELOG.md entry; CI sets it from the tag
-BUILD=${BUILD:-5}
+VERSION=${VERSION:-1.3.2}   # bump with a CHANGELOG.md entry; CI sets it from the tag
+BUILD=${BUILD:-6}
 cd "${0:A:h}"
 APP=build/MultiClaude.app
 rm -rf build && mkdir -p $APP/Contents/MacOS
@@ -28,6 +28,12 @@ cat > $APP/Contents/Info.plist <<PLIST
   <key>LSMinimumSystemVersion</key><string>15.0</string>
   <key>CFBundleIconFile</key><string>MultiClaude</string>
   <key>LSUIElement</key><true/>
+  <key>CFBundleURLTypes</key><array><dict>
+    <key>CFBundleURLName</key><string>Claude sign-in relay</string>
+    <key>CFBundleURLSchemes</key><array><string>claude</string></array>
+    <key>LSHandlerRank</key><string>None</string>
+  </dict></array>
+  <key>NSAppleEventsUsageDescription</key><string>MultiClaude passes Claude's sign-in link to the account window that asked for it.</string>
 </dict></plist>
 PLIST
 codesign --force --sign - $APP

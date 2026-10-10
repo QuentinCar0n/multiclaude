@@ -275,35 +275,95 @@ final class Engine: ObservableObject {
 
     // MARK: sign-in
 
-    // Claude's Google and SSO sign-in leaves through the browser and comes back as a claude:// link,
-    // which macOS hands to the first Claude window it finds. With only the target open, it lands there.
-    struct SignIn { let target: UUID; let reopen: [UUID]; var logOffset: UInt64; var sawBrowser = false }
+    // Claude's Google and SSO sign-in leaves through the browser and comes back as a claude:// link, which
+    // macOS hands to the first Claude window it finds. During a sign-in MultiClaude takes over claude:// links
+    // and passes them to the one process that asked, then gives the links back to Claude.
+    // If MultiClaude can't take the links, it falls back to closing the other accounts for the duration.
+    struct SignIn {
+        let target: UUID
+        var reopen: [UUID] = []
+        var logOffset: UInt64
+        var sawBrowser = false
+        var routing = false
+        let started = Date()
+    }
     @Published private(set) var signIn: SignIn?
     private var signInTimer: Timer?
 
     func beginSignIn(_ p: Profile) {
         guard signIn == nil else { return }
+        signIn = SignIn(target: p.id, logOffset: SignInLog.size())
+        notice = "Getting \(p.name) ready to sign in…"
+        if !isRunning(p) { open(p) }
+        signInTimer?.invalidate()
+        signInTimer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { _ in
+            MainActor.assumeIsolated { Engine.shared.checkSignIn() }
+        }
+        // Claude makes itself the claude:// handler as it starts, so take over only once the target is up.
+        func waitForTarget(_ n: Int) {
+            let e = Engine.shared
+            guard e.signIn?.target == p.id else { return }
+            e.refresh()
+            if e.isRunning(p) || n > 40 {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 3) { Engine.shared.takeOverLinks(for: p) }
+                return
+            }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { waitForTarget(n + 1) }
+        }
+        waitForTarget(0)
+    }
+
+    private func takeOverLinks(for p: Profile) {
+        guard signIn?.target == p.id else { return }
+        LinkRelay.take { ok in
+            DispatchQueue.main.async {
+                MainActor.assumeIsolated {
+                    let e = Engine.shared
+                    guard e.signIn?.target == p.id else { LinkRelay.giveBack(); return }
+                    if ok {
+                        e.signIn?.routing = true
+                        e.notice = "Sign in to \(p.name) now. MultiClaude sends the sign-in back to its window."
+                        if let app = e.running[p.id] { app.unhide(); app.activate() }
+                    } else {
+                        e.closeOthersForSignIn(p)
+                    }
+                }
+            }
+        }
+    }
+
+    // Fallback: with only the target open, the link can only land there.
+    private func closeOthersForSignIn(_ p: Profile) {
         let others = profiles.filter { $0.id != p.id && isRunning($0) }
-        signIn = SignIn(target: p.id, reopen: others.map(\.id), logOffset: SignInLog.size())
+        signIn?.reopen = others.map(\.id)
         let names = ListFormatter.localizedString(byJoining: others.map(\.name))
         notice = others.isEmpty ? "Sign in to \(p.name) in its window."
             : "Sign in to \(p.name) in its window. \(names) reopen\(others.count == 1 ? "s" : "") once you're signed in."
         func next(_ rest: [Profile]) {
-            guard let first = rest.first else {
-                Engine.shared.open(p)
-                return
-            }
+            guard let first = rest.first else { Engine.shared.open(p); return }
             Engine.shared.quitAndWait(first) { next(Array(rest.dropFirst())) }
         }
         next(others)
-        signInTimer?.invalidate()
-        signInTimer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { _ in
-            MainActor.assumeIsolated { Engine.shared.checkSignIn() }
+    }
+
+    // A claude:// link that reached MultiClaude: during a sign-in it goes to the target process,
+    // otherwise to Claude as usual.
+    func relay(_ link: String) {
+        if let s = signIn, s.routing, let app = running[s.target], LinkRelay.send(link, to: app.processIdentifier) {
+            signIn?.sawBrowser = true
+            app.unhide()
+            app.activate()
+            return
+        }
+        LinkRelay.giveBack()
+        if let url = URL(string: link) {
+            NSWorkspace.shared.open([url], withApplicationAt: LinkRelay.claudeApp, configuration: NSWorkspace.OpenConfiguration())
         }
     }
 
     private func checkSignIn() {
         guard var s = signIn else { return }
+        if -s.started.timeIntervalSinceNow > 600 { finishSignIn(cancelled: true); return }
         let (lines, offset) = SignInLog.read(from: s.logOffset)
         s.logOffset = offset
         let (sawBrowser, done) = SignInLog.scan(lines, sawBrowser: s.sawBrowser)
@@ -317,10 +377,11 @@ final class Engine: ObservableObject {
         signInTimer?.invalidate()
         signInTimer = nil
         signIn = nil
+        LinkRelay.giveBack()
         let reopen = profiles.filter { s.reopen.contains($0.id) && !isRunning($0) }
         reopen.forEach(open)
         let target = profiles.first { $0.id == s.target }?.name ?? "the account"
-        if cancelled { return }
+        if cancelled { notice = nil; return }
         notice = "Signed in to \(target)."
             + (reopen.isEmpty ? "" : " Reopened " + ListFormatter.localizedString(byJoining: reopen.map(\.name)) + ".")
     }
@@ -733,6 +794,41 @@ enum Updater {
 }
 
 // Every Claude instance writes to the same main.log, so new lines since the sign-in started tell when it lands.
+// Takes over claude:// links for the length of a sign-in and forwards them to one Claude process.
+enum LinkRelay {
+    static var claudeApp: URL {
+        NSWorkspace.shared.urlForApplication(withBundleIdentifier: claudeBundleID) ?? URL(fileURLWithPath: "/Applications/Claude.app")
+    }
+
+    static func handler() -> URL? {
+        NSWorkspace.shared.urlForApplication(toOpen: URL(string: "claude://claude.ai")!)
+    }
+
+    static func isOurs() -> Bool {
+        handler()?.standardizedFileURL.path == Bundle.main.bundleURL.standardizedFileURL.path
+    }
+
+    static func take(_ done: @escaping @Sendable (Bool) -> Void) {
+        NSWorkspace.shared.setDefaultApplication(at: Bundle.main.bundleURL, toOpenURLsWithScheme: "claude") { err in
+            done(err == nil && isOurs())
+        }
+    }
+
+    static func giveBack() {
+        guard isOurs() else { return }
+        NSWorkspace.shared.setDefaultApplication(at: claudeApp, toOpenURLsWithScheme: "claude") { _ in }
+    }
+
+    // The same "open URL" Apple Event macOS would send, aimed at one process instead of the first one found.
+    static func send(_ link: String, to pid: pid_t) -> Bool {
+        let ev = NSAppleEventDescriptor(eventClass: AEEventClass(kInternetEventClass), eventID: AEEventID(kAEGetURL),
+                                        targetDescriptor: NSAppleEventDescriptor(processIdentifier: pid),
+                                        returnID: AEReturnID(kAutoGenerateReturnID), transactionID: AETransactionID(kAnyTransactionID))
+        ev.setParam(NSAppleEventDescriptor(string: link), forKeyword: keyDirectObject)
+        return (try? ev.sendEvent(options: [.noReply], timeout: 5)) != nil
+    }
+}
+
 enum SignInLog {
     static let url = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Logs/Claude/main.log")
 
@@ -1243,16 +1339,7 @@ enum Dialogs {
     }
 
     static func signIn(_ p: Profile) {
-        let e = Engine.shared
-        let others = e.profiles.filter { $0.id != p.id && e.isRunning($0) }
-        guard !others.isEmpty else { e.beginSignIn(p); return }
-        let names = ListFormatter.localizedString(byJoining: others.map(\.name))
-        let (choice, _) = alert("Sign in to \(p.name)",
-            "Claude's Google and SSO sign-in comes back through your browser to whichever Claude window is open first. "
-            + "MultiClaude closes \(names) while you sign in, then reopens \(others.count == 1 ? "it" : "them"). "
-            + "Anything you haven't sent in \(others.count == 1 ? "that window" : "those windows") is lost.",
-            buttons: ["Close \(others.count == 1 ? names : "Others") and Sign In", "Cancel"])
-        if choice == 0 { e.beginSignIn(p) }
+        Engine.shared.beginSignIn(p)
     }
 
     static func duplicate(_ src: Profile) {
@@ -1587,7 +1674,19 @@ enum AboutWindow {
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
 
+    func applicationWillFinishLaunching(_ n: Notification) {
+        NSAppleEventManager.shared().setEventHandler(self, andSelector: #selector(handleLink(_:reply:)),
+                                                     forEventClass: AEEventClass(kInternetEventClass), andEventID: AEEventID(kAEGetURL))
+    }
+
+    @objc func handleLink(_ event: NSAppleEventDescriptor, reply: NSAppleEventDescriptor) {
+        guard let link = event.paramDescriptor(forKeyword: keyDirectObject)?.stringValue else { return }
+        Engine.shared.relay(link)
+    }
+
     func applicationDidFinishLaunching(_ n: Notification) {
+        // A crash during a sign-in would leave MultiClaude as the claude:// handler; hand the links back.
+        LinkRelay.giveBack()
         switch ProcessInfo.processInfo.environment["MULTICLAUDE_APPEARANCE"] {
         case "light": NSApp.appearance = NSAppearance(named: .aqua)
         case "dark": NSApp.appearance = NSAppearance(named: .darkAqua)
@@ -1624,6 +1723,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationWillTerminate(_ n: Notification) {
+        LinkRelay.giveBack()
         if Engine.shared.isOn(.quitWithApp) && !Updater.relaunching { Engine.shared.quitAll() }
     }
 
