@@ -53,13 +53,14 @@ MultiClaude is that trick with a proper interface.
 | Add an account | edit `~/.zshrc`, reload the shell | type a name, press Return |
 | Rename, reorder, find its data | by hand | right-click |
 | Keep your existing aliases | | imported on first launch |
-| Tell accounts apart | every window has the same icon | a color per account, active one named in the menu bar |
+| Tell accounts apart | every window has the same icon | a color per account, active one named in the menu bar, a named and colored app per account for the Dock and Spotlight |
 | After Claude updates itself | windows come back on the default account | profiles reopen on their own accounts |
 
 ## Features
 
 - **One profile per account.** Each profile is its own Claude data folder, so sign-ins and chats never leak between accounts.
 - **A color per account.** Each profile gets its own color, so you can tell Personal from Work at a glance. Right-click to change it.
+- **An app and an icon for each account.** Turn on **App for Each Profile** and MultiClaude makes a small app per profile in `~/Applications/MultiClaude Launchers`, named "Claude Work", "Claude Client" and so on, with Claude's own icon recolored in the profile's color. Find them in Spotlight and Launchpad, or right-click a profile and choose **Add to Dock**. Rename one with **Rename App…**. Each account's window then runs with that icon too, in the Dock, ⌘-Tab and Mission Control, so you can tell them apart while they're open. The apps follow renames and color changes, and go away with their profile.
 - **Know which account is in front.** While a Claude window is active, the menu bar shows its account name in that account's color.
 - **Live status.** A filled badge marks every account that is running. The menu bar shows how many are open.
 - **Survives Claude updates.** When Claude updates itself it relaunches on the default account, which breaks every `--user-data-dir` setup. MultiClaude notices and reopens each profile on its own account.
@@ -117,7 +118,9 @@ Your default Claude account is always the first profile. It uses the app's norma
 
 ## How it works
 
-- **Opening** a profile runs `open -n -a Claude --args --user-data-dir=<folder>`, exactly like the alias. The default profile runs `open -a Claude`.
+- **Opening** a profile runs `open -n -b com.anthropic.claudefordesktop --args --user-data-dir=<folder>`, the alias with Claude found by its bundle id. The default profile runs `open -b com.anthropic.claudefordesktop`.
+- **Profile apps** are tiny bundles whose executable is a shell script: it sends `multiclaude://open?profile=<id>` to MultiClaude, which opens or brings forward that account, and opens Claude directly if MultiClaude is gone.
+- **Profile icons on open windows.** With profile apps on, each account runs from its own copy of Claude.app in `~/Library/Application Support/MultiClaude/Runtimes.noindex`. The copy is an APFS clone, so it takes no extra disk space, and it wears the profile icon as a Finder icon, outside the signed part of the bundle. Nothing inside the bundle changes: its signature stays Anthropic's, Gatekeeper accepts it, and Claude keeps its Keychain access and its own folders. A copy is refreshed from Claude.app after Claude updates, while that account is closed. If Claude's updater restarts a copy without its account folder, MultiClaude closes it and reopens the account. Claude.app itself is never touched.
 - **Status** comes from the running Claude processes: MultiClaude reads each one's `--user-data-dir` argument and matches it to a profile.
 - **Profiles** are a small list in MultiClaude's own preferences (`me.somalabs.multiclaude`). Data folders live in `~/Library/Application Support/Claude-<Name>`, next to Claude's own. MultiClaude never moves the folder of an account that is open. **Remove from List** keeps the folder and stops MultiClaude from adding it back.
 
@@ -141,6 +144,9 @@ Right-click your default profile and choose **Duplicate as New Profile**, named 
 
 **An account keeps logging out, or its sign-in never finishes.**
 Claude asks every account to sign in again from time to time. Google and SSO sign-in returns from the browser through a `claude://` link that macOS gives to the first Claude window it finds, so with several accounts open it often lands in the wrong one. With **Sign In in Each Account's Window** on (the default), MultiClaude keeps the `claude://` links, and Claude then signs in through Apple's sign-in sheet inside the window that asked. Just click **Continue with Google** in the account that needs it; your other accounts stay open.
+
+**Does an open account's window show its own name and icon?**
+The icon, yes: with **App for Each Profile** on, each open account shows its profile icon in the Dock, ⌘-Tab and Mission Control. The name, no. A running app takes its name from inside its signed bundle, and renaming it there breaks the signature: Gatekeeper then reports the app as damaged. So an open window is still called Claude. The profile apps carry the name in Spotlight, Launchpad and on a pinned Dock tile, and the menu bar names the account in front.
 
 **How do I remove an account completely?**
 Right-click it and choose **Show Data Folder in Finder**, quit it, choose **Remove from List**, then trash the folder.

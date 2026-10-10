@@ -11,6 +11,15 @@ let appVersion = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionS
 let websiteURL = URL(string: "https://somalabs.me")!
 let supportURL = URL(string: "mailto:quentin@somalabs.me?subject=MultiClaude")!
 let claudeBundleID = "com.anthropic.claudefordesktop"
+
+// Claude.app itself. MultiClaude's per-profile copies share its bundle id, so never look it up by id alone.
+func realClaudeApp() -> URL {
+    let standard = URL(fileURLWithPath: "/Applications/Claude.app")
+    if FileManager.default.fileExists(atPath: standard.path) { return standard }
+    let ours = Runtimes.folder.standardizedFileURL.path
+    return NSWorkspace.shared.urlsForApplications(withBundleIdentifier: claudeBundleID)
+        .first { !$0.standardizedFileURL.path.hasPrefix(ours) } ?? standard
+}
 let supportDir = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support")
 let isPreview = ProcessInfo.processInfo.environment["MULTICLAUDE_PREVIEW"] != nil
 // Releases are signed in CI with the matching private key (repo secret UPDATE_SIGNING_KEY).
@@ -36,9 +45,17 @@ struct Profile: Codable, Identifiable, Hashable {
     var color: Int?    // index into Palette.colors; nil until the first load assigns one
     var openAtLaunch: Bool?
     var codeDir: String?   // pinned Claude Code folder, kept when the data folder is renamed
+    var appName: String?   // name of this profile's Dock app; nil = "Claude <name>"
 
     var isDefault: Bool { dir == nil }
     var initial: String { String(name.prefix(1)).uppercased() }
+    var dockAppName: String {
+        // Never plain "Claude": an app of that name could be taken for Claude itself.
+        let custom = appName?.trimmingCharacters(in: .whitespaces) ?? ""
+        if !custom.isEmpty, custom.lowercased() != "claude" { return custom }
+        if name.lowercased() == "claude" { return isDefault ? "Claude Default" : "Claude Profile" }
+        return name.lowercased().hasPrefix("claude") ? name : "Claude \(name)"
+    }
     var folderURL: URL { dir.map { URL(fileURLWithPath: $0) } ?? supportDir.appendingPathComponent("Claude") }
     var tint: Color { Color(nsColor: nsTint) }
     var nsTint: NSColor { Palette.colors[(color ?? 0) % Palette.colors.count].color }
@@ -105,7 +122,7 @@ enum Seed {
 // MARK: - Settings
 
 enum Setting: String, CaseIterable, Identifiable {
-    case launchAtLogin, autoUpdate, routeSignIn, reopenAfterUpdate, shortcut, profileShortcuts, showActive, showCount, coloredIcon, quitWithApp
+    case launchAtLogin, autoUpdate, routeSignIn, reopenAfterUpdate, shortcut, profileShortcuts, showActive, showCount, coloredIcon, dockApps, quitWithApp
 
     static let onByDefault: Set<Setting> = [.autoUpdate, .routeSignIn, .reopenAfterUpdate, .showActive, .showCount]
 
@@ -122,6 +139,7 @@ enum Setting: String, CaseIterable, Identifiable {
         case .showActive: "Show Active Account in Menu Bar"
         case .showCount: "Show Count in Menu Bar"
         case .coloredIcon: "Colored Menu Bar Icon"
+        case .dockApps: "App for Each Profile"
         case .quitWithApp: "Quit Profiles with MultiClaude"
         }
     }
@@ -137,6 +155,7 @@ enum Setting: String, CaseIterable, Identifiable {
         case .showActive: "menubar.rectangle"
         case .showCount: "number"
         case .coloredIcon: "paintpalette"
+        case .dockApps: "dock.rectangle"
         case .quitWithApp: "xmark.circle"
         }
     }
@@ -173,6 +192,7 @@ final class Engine: ObservableObject {
     private var userQuit: Set<UUID> = []
     private var stopLog: [UUID: Date] = [:]   // last unrequested stop per profile, kept after it relaunches
     private var strayHandled: Date?           // the update whose stray default window was already closed
+    private var bareHandled: [UUID: Date] = [:]   // profile copies last reopened after a bare start
 
     private init() {
         if isDemo {
@@ -204,9 +224,14 @@ final class Engine: ObservableObject {
         for name in [NSWorkspace.didLaunchApplicationNotification, NSWorkspace.didTerminateApplicationNotification,
                      NSWorkspace.didActivateApplicationNotification] {
             nc.addObserver(forName: name, object: nil, queue: .main) { note in
-                let launchedClaude = name == NSWorkspace.didLaunchApplicationNotification
-                    && (note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication)?.bundleIdentifier == claudeBundleID
+                let launched = note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication
+                let launchedClaude = name == NSWorkspace.didLaunchApplicationNotification && launched?.bundleIdentifier == claudeBundleID
                 MainActor.assumeIsolated {
+                    // A bare copy can hand off to the default window and quit before refresh() looks.
+                    if launchedClaude, let app = launched, let owner = Engine.shared.runtimeOwner(app), !owner.isDefault,
+                       !ProcArgs.of(app.processIdentifier).contains(where: { $0.hasPrefix("--user-data-dir=") }) {
+                        Engine.shared.reopenBareCopy(app, of: owner)
+                    }
                     Engine.shared.refresh()
                     // Claude makes itself the claude:// handler as it starts; take the links back once it's up.
                     if launchedClaude {
@@ -255,6 +280,7 @@ final class Engine: ObservableObject {
         defaults.set(on, forKey: s.rawValue)
         if s == .shortcut || s == .profileShortcuts { updateHotKeys() }
         if s == .routeSignIn { on ? holdLinks() : LinkRelay.giveBack() }
+        if s == .dockApps { syncLaunchers() }
         onChange?()
     }
 
@@ -426,6 +452,10 @@ final class Engine: ObservableObject {
             let dir = ProcArgs.of(app.processIdentifier)
                 .first { $0.hasPrefix("--user-data-dir=") }
                 .map { Folders.canonical(String($0.dropFirst(16))) }
+            if dir == nil, let owner = runtimeOwner(app), !owner.isDefault {
+                reopenBareCopy(app, of: owner)
+                continue
+            }
             if let p = profiles.first(where: { $0.dir.map(Folders.canonical) == dir }) {
                 found[p.id] = app
             }
@@ -460,6 +490,27 @@ final class Engine: ObservableObject {
         alignFolders()   // after `running` is current, so an open profile is never moved
     }
 
+    // The profile whose own copy of Claude (see Runtimes) this process runs from, if any.
+    func runtimeOwner(_ app: NSRunningApplication) -> Profile? {
+        guard let url = app.bundleURL, let id = Runtimes.owner(of: url) else { return nil }
+        return profiles.first { $0.id == id }
+    }
+
+    // A profile's copy started without --user-data-dir: Claude's updater relaunching it, or a Dock tile
+    // kept from a running copy. It would show the default account in that profile's icon, so close it and
+    // open the profile on its own account. Our own launches are pending and skipped.
+    func reopenBareCopy(_ app: NSRunningApplication?, of p: Profile) {
+        if pending[p.id] != nil { return }
+        if let t = bareHandled[p.id], Date().timeIntervalSince(t) < 20 { return }
+        bareHandled[p.id] = Date()
+        Log.write("\(p.name)'s copy of Claude started without its folder; reopening it on its own account")
+        app?.terminate()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
+            let e = Engine.shared
+            if !e.isRunning(p) { e.open(p) }
+        }
+    }
+
     // Claude relaunches itself without --user-data-dir when it installs an update, so profile windows
     // come back on the default account. Reopen each profile that stopped around the update.
     private func reopenAfterUpdate(now: Date) {
@@ -490,7 +541,9 @@ final class Engine: ObservableObject {
         }
         if let dir = p.dir { try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true) }
         let anyClaude = NSWorkspace.shared.runningApplications.contains { $0.bundleIdentifier == claudeBundleID && !$0.isTerminated }
-        let args = Launch.openArgs(dir: p.dir, anyClaudeRunning: anyClaude)
+        // With profile apps on, the profile runs in its own named copy of Claude (see Runtimes).
+        let app = (isOn(.dockApps) && !isDemo ? Runtimes.ensure(p, from: realClaudeApp()) : nil) ?? realClaudeApp()
+        let args = Launch.openArgs(app: app.path, dir: p.dir, anyClaudeRunning: anyClaude)
         let task = Process()
         task.executableURL = URL(fileURLWithPath: "/usr/bin/open")
         task.arguments = args
@@ -679,6 +732,57 @@ final class Engine: ObservableObject {
         save()
     }
 
+    // MARK: profile apps
+
+    // Keeps ~/Applications/MultiClaude Launchers in step with the list: one app per profile while the
+    // setting is on, none while it's off. Apps that move or go away are moved or taken off the Dock too.
+    func syncLaunchers() {
+        guard !isDemo, !isCLI else { return }
+        let result = Launchers.sync(isOn(.dockApps) ? profiles : [], in: Launchers.folder)
+        Runtimes.prune(keeping: isOn(.dockApps) ? Set(profiles.map(\.id)) : [])
+        // Restyle each profile's own Claude now rather than at its next launch (only the icon if it's open).
+        if isOn(.dockApps) {
+            let claude = realClaudeApp()
+            for p in profiles where Runtimes.exists(p.id) { _ = Runtimes.ensure(p, from: claude) }
+        }
+        if !result.moved.isEmpty || !result.removed.isEmpty || !result.rewritten.isEmpty {
+            Dock.update(moved: result.moved, removed: result.removed, refresh: result.rewritten)
+        }
+        if !result.failed.isEmpty { notice = "Couldn't write the app for \(result.failed.joined(separator: ", "))." }
+    }
+
+    func launcherURL(_ p: Profile) -> URL? {
+        guard isOn(.dockApps) else { return nil }
+        return Launchers.installed(in: Launchers.folder)[p.id]
+    }
+
+    func renameApp(_ p: Profile, to raw: String) {
+        guard let i = profiles.firstIndex(of: p) else { return }
+        let name = raw.trimmingCharacters(in: .whitespaces)
+        profiles[i].appName = name.isEmpty || name == Profile(name: p.name, dir: p.dir).dockAppName ? nil : name
+        save()
+    }
+
+    func addToDock(_ p: Profile) {
+        if !isOn(.dockApps) { toggle(.dockApps) }
+        guard let url = launcherURL(p) else { NSSound.beep(); return }
+        if !Dock.add(url) { notice = "Couldn't add \(p.dockAppName) to the Dock. Drag it there from Finder instead." }
+    }
+
+    func removeFromDock(_ p: Profile) {
+        guard let url = launcherURL(p) else { return }
+        Dock.update(moved: [], removed: [url])
+    }
+
+    // multiclaude://open?profile=<id>, sent by a profile's app. Opens or brings forward that profile.
+    func handleOwnLink(_ link: String) {
+        guard let c = URLComponents(string: link), c.host == "open",
+              let id = c.queryItems?.first(where: { $0.name == "profile" })?.value.flatMap(UUID.init(uuidString:)),
+              let p = profiles.first(where: { $0.id == id }) else { NSSound.beep(); return }
+        refresh()   // MultiClaude may have just been launched by this link
+        open(p)
+    }
+
     func move(_ p: Profile, by delta: Int) {
         guard let i = profiles.firstIndex(of: p) else { return }
         let j = i + delta
@@ -689,6 +793,7 @@ final class Engine: ObservableObject {
 
     private func save() {
         if !isDemo, !isCLI, let data = try? JSONEncoder().encode(profiles) { defaults.set(data, forKey: "profiles") }
+        syncLaunchers()
         updateHotKeys()
         onChange?()
     }
@@ -845,9 +950,7 @@ enum Log {
 }
 
 enum LinkRelay {
-    static var claudeApp: URL {
-        NSWorkspace.shared.urlForApplication(withBundleIdentifier: claudeBundleID) ?? URL(fileURLWithPath: "/Applications/Claude.app")
-    }
+    static var claudeApp: URL { realClaudeApp() }
 
     static func handler() -> URL? {
         NSWorkspace.shared.urlForApplication(toOpen: URL(string: "claude://claude.ai")!)
@@ -1044,18 +1147,19 @@ enum UpdateSignature {
 }
 
 enum Launch {
-    // `open -a Claude` brings forward whichever Claude is already running, which may be another account.
+    // `open -a` brings forward whichever Claude is already running, which may be another account.
     // With any instance up, the default account needs -n to start its own process.
-    static func openArgs(dir: String?, anyClaudeRunning: Bool) -> [String] {
-        if let dir { return ["-n", "-a", "Claude", "--args", "--user-data-dir=\(dir)"] }
-        return anyClaudeRunning ? ["-n", "-a", "Claude"] : ["-a", "Claude"]
+    // `app` is a full path (Claude.app or the profile's own copy), so a profile app named like Claude
+    // can never be opened in its place.
+    static func openArgs(app: String, dir: String?, anyClaudeRunning: Bool) -> [String] {
+        if let dir { return ["-n", "-a", app, "--args", "--user-data-dir=\(dir)"] }
+        return anyClaudeRunning ? ["-n", "-a", app] : ["-a", app]
     }
 }
 
 enum UpdateWatch {
     static func installedVersion() -> String? {
-        let app = NSWorkspace.shared.urlForApplication(withBundleIdentifier: claudeBundleID)
-            ?? URL(fileURLWithPath: "/Applications/Claude.app")
+        let app = realClaudeApp()
         // Read the plist directly: Bundle caches its info dictionary and would miss the update.
         let info = NSDictionary(contentsOf: app.appendingPathComponent("Contents/Info.plist"))
         guard let short = info?["CFBundleShortVersionString"] as? String else { return nil }
@@ -1148,7 +1252,12 @@ enum HotKey {
 // MARK: - App icon (drawn, so the bundle needs no image files)
 
 enum AppIcon {
-    static func image(_ side: CGFloat) -> NSImage {
+    // MultiClaude's own icon: the Claude asterisk on an orange tile.
+    static func image(_ side: CGFloat) -> NSImage { tile(side, color: .claude, letter: nil) }
+
+    // A tile in `color` with the white asterisk, or with `letter` and a small asterisk in the corner
+    // (the icon of a profile's app).
+    static func tile(_ side: CGFloat, color: NSColor, letter: String?) -> NSImage {
         NSImage(size: NSSize(width: side, height: side), flipped: false) { r in
             let inset = r.width * 0.1
             let tile = r.insetBy(dx: inset, dy: inset)
@@ -1159,19 +1268,81 @@ enum AppIcon {
             shadow.shadowBlurRadius = r.width * 0.025
             shadow.shadowOffset = NSSize(width: 0, height: -r.width * 0.01)
             shadow.set()
-            NSColor.claude.setFill()
+            color.setFill()
             path.fill()
             NSGraphicsContext.restoreGraphicsState()
-            NSGradient(colors: [NSColor(srgbRed: 0.93, green: 0.58, blue: 0.45, alpha: 1),
-                                NSColor(srgbRed: 0.78, green: 0.38, blue: 0.26, alpha: 1)])?.draw(in: path, angle: -90)
-            let cfg = NSImage.SymbolConfiguration(pointSize: tile.width * 0.5, weight: .semibold)
-                .applying(.init(paletteColors: [.white]))
-            if let sym = NSImage(systemSymbolName: "asterisk", accessibilityDescription: nil)?.withSymbolConfiguration(cfg) {
+            let base = color.usingColorSpace(.sRGB) ?? color
+            NSGradient(colors: [base.blended(withFraction: 0.18, of: .white) ?? base,
+                                base.blended(withFraction: 0.12, of: .black) ?? base])?.draw(in: path, angle: -90)
+            func asterisk(size: CGFloat, center: NSPoint) {
+                let cfg = NSImage.SymbolConfiguration(pointSize: size, weight: .semibold)
+                    .applying(.init(paletteColors: [.white]))
+                guard let sym = NSImage(systemSymbolName: "asterisk", accessibilityDescription: nil)?.withSymbolConfiguration(cfg) else { return }
                 let s = sym.size
-                sym.draw(in: NSRect(x: tile.midX - s.width / 2, y: tile.midY - s.height / 2, width: s.width, height: s.height))
+                sym.draw(in: NSRect(x: center.x - s.width / 2, y: center.y - s.height / 2, width: s.width, height: s.height))
             }
+            guard let letter, !letter.isEmpty else {
+                asterisk(size: tile.width * 0.5, center: NSPoint(x: tile.midX, y: tile.midY))
+                return true
+            }
+            let font = NSFont.systemFont(ofSize: tile.width * 0.56, weight: .bold)
+            let rounded = font.fontDescriptor.withDesign(.rounded).flatMap { NSFont(descriptor: $0, size: font.pointSize) } ?? font
+            let text = NSAttributedString(string: letter, attributes: [.font: rounded, .foregroundColor: NSColor.white])
+            let ts = text.size()
+            text.draw(at: NSPoint(x: tile.midX - ts.width / 2, y: tile.midY - ts.height / 2 - tile.height * 0.03))
+            asterisk(size: tile.width * 0.15, center: NSPoint(x: tile.maxX - tile.width * 0.2, y: tile.maxY - tile.height * 0.2))
             return true
         }
+    }
+
+    // A profile's icon: Claude's own icon, read from Claude.app, with its orange turned to the profile's
+    // color. The dark tile stays as it is. Falls back to a letter tile when Claude.app can't be read.
+    static func profile(_ side: CGFloat, color: NSColor, letter: String) -> NSImage {
+        claudeTinted(side, color: color) ?? tile(side, color: color, letter: letter)
+    }
+
+    static func claudeTinted(_ side: CGFloat, color: NSColor) -> NSImage? {
+        let src = NSWorkspace.shared.icon(forFile: realClaudeApp().path)
+        var rect = NSRect(x: 0, y: 0, width: side, height: side)
+        guard let cg = src.cgImage(forProposedRect: &rect, context: nil, hints: nil) else { return nil }
+        let orange = NSColor.claude.usingColorSpace(.sRGB)!, target = color.usingColorSpace(.sRGB) ?? color
+        var image = CIImage(cgImage: cg)
+        // Rotate the hue from Claude orange to the target; a grey target drains the color instead.
+        let hue = CIFilter(name: "CIHueAdjust")!
+        hue.setValue(image, forKey: kCIInputImageKey)
+        hue.setValue((target.hueComponent - orange.hueComponent) * 2 * .pi, forKey: kCIInputAngleKey)
+        image = hue.outputImage ?? image
+        let controls = CIFilter(name: "CIColorControls")!
+        controls.setValue(image, forKey: kCIInputImageKey)
+        controls.setValue(min(1.2, target.saturationComponent / max(orange.saturationComponent, 0.01)), forKey: kCIInputSaturationKey)
+        image = controls.outputImage ?? image
+        guard let out = CIContext().createCGImage(image, from: image.extent) else { return nil }
+        return NSImage(cgImage: out, size: NSSize(width: side, height: side))
+    }
+
+    static func png(_ image: NSImage, pixels px: Int) -> Data? {
+        let rep = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: px, pixelsHigh: px,
+                                   bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false,
+                                   colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0)!
+        NSGraphicsContext.saveGraphicsState()
+        NSGraphicsContext.current = NSGraphicsContext(bitmapImageRep: rep)
+        image.draw(in: NSRect(x: 0, y: 0, width: px, height: px))
+        NSGraphicsContext.restoreGraphicsState()
+        return rep.representation(using: .png, properties: [:])
+    }
+
+    // An .icns file with every size, written with ImageIO so no command-line tool is needed.
+    static func icns(_ draw: (CGFloat) -> NSImage) -> Data? {
+        let sizes = [16, 32, 64, 128, 256, 512, 1024]
+        let out = NSMutableData()
+        guard let dest = CGImageDestinationCreateWithData(out, "com.apple.icns" as CFString, sizes.count, nil) else { return nil }
+        for px in sizes {
+            guard let data = png(draw(CGFloat(px)), pixels: px),
+                  let src = CGImageSourceCreateWithData(data as CFData, nil),
+                  let img = CGImageSourceCreateImageAtIndex(src, 0, nil) else { return nil }
+            CGImageDestinationAddImage(dest, img, nil)
+        }
+        return CGImageDestinationFinalize(dest) ? out as Data : nil
     }
 
     // build.sh calls `MultiClaude --export-iconset <dir>` to make the .icns.
@@ -1179,18 +1350,330 @@ enum AppIcon {
         try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
         for base in [16, 32, 128, 256, 512] {
             for scale in [1, 2] {
-                let px = CGFloat(base * scale)
-                let rep = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: Int(px), pixelsHigh: Int(px),
-                                           bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false,
-                                           colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0)!
-                NSGraphicsContext.saveGraphicsState()
-                NSGraphicsContext.current = NSGraphicsContext(bitmapImageRep: rep)
-                image(px).draw(in: NSRect(x: 0, y: 0, width: px, height: px))
-                NSGraphicsContext.restoreGraphicsState()
+                let px = base * scale
                 let name = scale == 1 ? "icon_\(base)x\(base).png" : "icon_\(base)x\(base)@2x.png"
-                try? rep.representation(using: .png, properties: [:])?.write(to: URL(fileURLWithPath: dir + "/" + name))
+                try? png(image(CGFloat(px)), pixels: px)?.write(to: URL(fileURLWithPath: dir + "/" + name))
             }
         }
+    }
+}
+
+// MARK: - Profile apps
+
+// The Claude that runs for a profile while profile apps are on: an APFS clone of Claude.app (clonefile,
+// instant and free on disk) in a .noindex folder, so Spotlight lists only the launcher. The clone wears the
+// profile's icon as a Finder custom icon (outside the signed Contents folder), which macOS shows for the
+// running window in the Dock, ⌘-Tab and Mission Control. Nothing inside the bundle changes, so the
+// signature stays valid: Gatekeeper accepts it, the Keychain still hands it "Claude Safe Storage", and
+// Claude still names its own folders "Claude". Tested 2026-10-10: adding an InfoPlist.strings to rename the
+// running app breaks the resource seal and Gatekeeper then calls the copy damaged at every launch, so the
+// running window keeps the name Claude. A clone is refreshed from Claude.app when Claude updates, only
+// while that profile is closed; one that Claude's updater moved ahead is restyled in place.
+enum Runtimes {
+    static let folder = supportDir.appendingPathComponent("MultiClaude/Runtimes.noindex")
+    static let format = 3   // a stamp from another format means the copy is rebuilt from scratch
+
+    // folder/<profile id>/<app name>.app: macOS names the running app after the bundle's file name.
+    static func dir(_ id: UUID) -> URL { folder.appendingPathComponent(id.uuidString) }
+    static func stampURL(_ id: UUID) -> URL { dir(id).appendingPathComponent("stamp") }
+    static func target(_ p: Profile) -> URL { dir(p.id).appendingPathComponent(Launchers.fileName(p.dockAppName)) }
+    static func current(_ id: UUID) -> URL? {
+        ((try? FileManager.default.contentsOfDirectory(at: dir(id), includingPropertiesForKeys: nil)) ?? [])
+            .first { $0.pathExtension == "app" }
+    }
+    static func exists(_ id: UUID) -> Bool { current(id) != nil }
+
+    // The profile id of a copy's bundle URL, or nil for any other Claude.
+    static func owner(of app: URL) -> UUID? {
+        let parent = app.standardizedFileURL.deletingLastPathComponent()
+        guard parent.deletingLastPathComponent().standardizedFileURL.path == folder.standardizedFileURL.path else { return nil }
+        return UUID(uuidString: parent.lastPathComponent)
+    }
+
+    static func version(_ app: URL) -> String? {
+        NSDictionary(contentsOf: app.appendingPathComponent("Contents/Info.plist"))?["CFBundleShortVersionString"] as? String
+    }
+
+    static func stamp(_ p: Profile, version: String) -> String {
+        "\(format)|\(version)|\(p.dockAppName)|\(p.initial)|\(p.color ?? 0)"
+    }
+
+    static func isRunning(_ app: URL) -> Bool {
+        let path = app.standardizedFileURL.path
+        return NSWorkspace.shared.runningApplications.contains {
+            !$0.isTerminated && $0.bundleURL?.standardizedFileURL.path == path
+        }
+    }
+
+    // The profile's own Claude, made or refreshed as needed, or nil when it can't be (not APFS, no Claude).
+    // Never touches a copy that is running.
+    static func ensure(_ p: Profile, from claude: URL, running: (URL) -> Bool = isRunning) -> URL? {
+        let fm = FileManager.default
+        let want = target(p)
+        guard let source = version(claude) else { return current(p.id) }
+        if var rt = current(p.id) {
+            if running(rt) {
+                // Only the icon can change under a running copy: it sits outside the bundle's code.
+                let stamped = (try? String(contentsOf: stampURL(p.id), encoding: .utf8)) ?? ""
+                let current = version(rt) ?? ""
+                if stamped.hasPrefix("\(format)|"), stamped != stamp(p, version: current) {
+                    applyLook(p, to: rt, version: current, register: false)
+                }
+                return rt
+            }
+            if rt.lastPathComponent != want.lastPathComponent, (try? fm.moveItem(at: rt, to: want)) != nil { rt = want }
+            let current = version(rt) ?? ""
+            let stamped = (try? String(contentsOf: stampURL(p.id), encoding: .utf8)) ?? ""
+            if stamped.hasPrefix("\(format)|"), current == source || Updater.isNewer(current, than: source) {
+                if stamped == stamp(p, version: current) && hasLook(rt) { return rt }
+                applyLook(p, to: rt, version: current)
+                return rt
+            }
+            try? fm.removeItem(at: rt)
+        }
+        try? fm.createDirectory(at: dir(p.id), withIntermediateDirectories: true)
+        // clonefile copies the whole bundle as one APFS clone; it fails rather than copy on other volumes.
+        guard clonefile(claude.path, want.path, 0) == 0 else { return nil }
+        applyLook(p, to: want, version: source)
+        return want
+    }
+
+    // A folder's custom icon lives in an "Icon\r" file at its root, outside the sealed Contents.
+    static func hasLook(_ app: URL) -> Bool {
+        FileManager.default.fileExists(atPath: app.appendingPathComponent("Icon\r").path)
+    }
+
+    static func applyLook(_ p: Profile, to app: URL, version: String, register: Bool = true) {
+        let fm = FileManager.default
+        let ok = NSWorkspace.shared.setIcon(AppIcon.profile(1024, color: p.nsTint, letter: p.initial), forFile: app.path, options: [])
+        Log.write("profile copy \(app.lastPathComponent): icon \(ok ? "set" : "FAILED"), Claude \(version)")
+        try? fm.setAttributes([.modificationDate: Date()], ofItemAtPath: app.path)
+        if register { LSRegisterURL(app as CFURL, true) }
+        try? Data(stamp(p, version: version).utf8).write(to: stampURL(p.id))
+    }
+
+    // Deletes the copies of profiles that are gone (or of all, with profile apps off), unless running.
+    static func prune(keeping ids: Set<UUID>) {
+        let fm = FileManager.default
+        for name in (try? fm.contentsOfDirectory(atPath: folder.path)) ?? [] {
+            guard let id = UUID(uuidString: name), !ids.contains(id) else { continue }
+            if let rt = current(id), isRunning(rt) { continue }
+            try? fm.removeItem(at: dir(id))
+        }
+    }
+}
+
+
+// One small app per profile in ~/Applications/MultiClaude Launchers, named and colored after the profile,
+// so the Dock, Spotlight and Launchpad can tell accounts apart. Its executable is a shell script that asks
+// MultiClaude to open the profile (multiclaude://open?profile=<id>) and opens Claude directly when
+// MultiClaude is gone. Claude's own window keeps Claude's name and icon: editing Claude.app's Info.plist
+// breaks its signature and macOS kills it at launch, and a copy of the bundle keeps Claude's icon (tested
+// 2026-10-10 on Claude 1.x, macOS 27).
+enum Launchers {
+    static let folder = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Applications/MultiClaude Launchers")
+    static let idPrefix = "me.somalabs.multiclaude.launcher."
+    static let format = 3   // bump when the bundle layout, the script or the icon changes, so every app is rewritten
+
+    struct SyncResult {
+        var moved: [(from: URL, to: URL)] = []
+        var removed: [URL] = []
+        var rewritten: [URL] = []   // existing apps whose name, color or folder changed
+        var failed: [String] = []
+    }
+
+    // "Claude Work" -> "Claude Work.app", with the characters Finder can't show in a name replaced.
+    static func fileName(_ name: String) -> String {
+        let clean = name.replacingOccurrences(of: "/", with: "-").replacingOccurrences(of: ":", with: "-")
+            .trimmingCharacters(in: .whitespacesAndNewlines.union(CharacterSet(charactersIn: ".")))
+        return (clean.isEmpty ? "Claude" : clean) + ".app"
+    }
+
+    static func script(for p: Profile) -> String {
+        let rt = shellQuote(Runtimes.dir(p.id).path), real = shellQuote(realClaudeApp().path)
+        let fallback = "app=$(ls -d \(rt)/*.app 2>/dev/null | head -n 1); [ -d \"$app\" ] || app=\(real)\n"
+            + (p.dir.map { "exec /usr/bin/open -n -a \"$app\" --args \(shellQuote("--user-data-dir=" + $0))" } ?? "exec /usr/bin/open -a \"$app\"")
+        return """
+        #!/bin/sh
+        # Made by MultiClaude for the profile \(shellQuote(p.name)). MultiClaude rewrites this app; edits are lost.
+        /usr/bin/open -g "multiclaude://open?profile=\(p.id.uuidString)" 2>/dev/null && exit 0
+        \(fallback)
+
+        """
+    }
+
+    // Everything that shows in the app; a change in any of it rewrites the app.
+    static func stamp(for p: Profile, name: String) -> String {
+        "\(format)|\(name)|\(p.initial)|\(p.color ?? 0)|\(p.dir ?? "")|\(p.name)"
+    }
+
+    static func info(for p: Profile, name: String) -> [String: Any] {
+        [
+            "CFBundleName": name,
+            "CFBundleDisplayName": name,
+            "CFBundleIdentifier": idPrefix + p.id.uuidString.lowercased(),
+            "CFBundleExecutable": "launch",
+            "CFBundleIconFile": "icon",
+            "CFBundlePackageType": "APPL",
+            "CFBundleShortVersionString": "1.0",
+            "CFBundleVersion": "\(format)",
+            "LSUIElement": true,   // the script quits at once; no Dock bounce of its own
+            "MCProfileID": p.id.uuidString,
+            "MCStamp": stamp(for: p, name: name),
+        ]
+    }
+
+    static func readInfo(_ app: URL) -> [String: Any]? {
+        guard let data = try? Data(contentsOf: app.appendingPathComponent("Contents/Info.plist")) else { return nil }
+        return (try? PropertyListSerialization.propertyList(from: data, format: nil)) as? [String: Any]
+    }
+
+    // The profile apps in `folder`, by profile. Other apps a user puts there are left alone.
+    static func installed(in folder: URL) -> [UUID: URL] {
+        let items = (try? FileManager.default.contentsOfDirectory(at: folder, includingPropertiesForKeys: nil)) ?? []
+        var out: [UUID: URL] = [:]
+        for app in items where app.pathExtension == "app" {
+            guard let info = readInfo(app), (info["CFBundleIdentifier"] as? String)?.hasPrefix(idPrefix) == true,
+                  let id = (info["MCProfileID"] as? String).flatMap(UUID.init(uuidString:)) else { continue }
+            out[id] = app
+        }
+        return out
+    }
+
+    // Builds the app next to its destination, then swaps it in, so a half-written app never shows up.
+    static func write(_ p: Profile, name: String, to dest: URL) throws {
+        let fm = FileManager.default
+        let tmp = dest.deletingLastPathComponent().appendingPathComponent(".\(p.id.uuidString).tmp.app")
+        try? fm.removeItem(at: tmp)
+        let contents = tmp.appendingPathComponent("Contents")
+        try fm.createDirectory(at: contents.appendingPathComponent("MacOS"), withIntermediateDirectories: true)
+        try fm.createDirectory(at: contents.appendingPathComponent("Resources"), withIntermediateDirectories: true)
+        let plist = try PropertyListSerialization.data(fromPropertyList: info(for: p, name: name), format: .xml, options: 0)
+        try plist.write(to: contents.appendingPathComponent("Info.plist"))
+        try Data("APPL????".utf8).write(to: contents.appendingPathComponent("PkgInfo"))
+        let exe = contents.appendingPathComponent("MacOS/launch")
+        try Data(script(for: p).utf8).write(to: exe)
+        try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: exe.path)
+        guard let icon = AppIcon.icns({ AppIcon.profile($0, color: p.nsTint, letter: p.initial) }) else { throw CocoaError(.fileWriteUnknown) }
+        try icon.write(to: contents.appendingPathComponent("Resources/icon.icns"))
+        if fm.fileExists(atPath: dest.path) {
+            _ = try fm.replaceItemAt(dest, withItemAt: tmp)
+        } else {
+            try fm.moveItem(at: tmp, to: dest)
+        }
+        // New modification date + re-registration, so Finder, the Dock and Spotlight drop the old icon and name.
+        try? fm.setAttributes([.modificationDate: Date()], ofItemAtPath: dest.path)
+        LSRegisterURL(dest as CFURL, true)
+    }
+
+    // Makes `folder` hold exactly one up-to-date app per profile in `profiles`.
+    static func sync(_ profiles: [Profile], in folder: URL) -> SyncResult {
+        let fm = FileManager.default
+        var result = SyncResult()
+        var have = installed(in: folder)
+        for (id, url) in have where !profiles.contains(where: { $0.id == id }) {
+            if (try? fm.removeItem(at: url)) != nil { result.removed.append(url) }
+            have[id] = nil
+        }
+        guard !profiles.isEmpty else { return result }
+        try? fm.createDirectory(at: folder, withIntermediateDirectories: true)
+        var taken: Set<String> = ["claude.app"]   // never shadow Claude itself
+        for p in profiles {
+            // Two profiles can't share a file name; the later one gets a number.
+            var name = p.dockAppName, n = 2
+            while taken.contains(fileName(name).lowercased()) { name = "\(p.dockAppName) \(n)"; n += 1 }
+            taken.insert(fileName(name).lowercased())
+            let dest = folder.appendingPathComponent(fileName(name))
+            if let current = have[p.id] {
+                let same = current.standardizedFileURL == dest.standardizedFileURL
+                if same, readInfo(current)?["MCStamp"] as? String == stamp(for: p, name: name) { continue }
+                if !same {
+                    // Free the new name first if another profile's old app still sits there.
+                    if fm.fileExists(atPath: dest.path) && current.lastPathComponent.lowercased() != dest.lastPathComponent.lowercased() {
+                        result.failed.append(p.name); continue
+                    }
+                    do { try fm.moveItem(at: current, to: dest); result.moved.append((current, dest)) }
+                    catch { result.failed.append(p.name); continue }
+                }
+            } else if fm.fileExists(atPath: dest.path) {
+                result.failed.append(p.name); continue   // a file MultiClaude didn't make; leave it
+            }
+            do {
+                try write(p, name: name, to: dest)
+                if have[p.id] != nil { result.rewritten.append(dest) }
+            } catch { result.failed.append(p.name) }
+        }
+        return result
+    }
+}
+
+// The Dock's pinned apps live in com.apple.dock's persistent-apps. MultiClaude only touches entries
+// for its own profile apps, and only when the user pins one or one of them moves or goes away.
+enum Dock {
+    static let domain = "com.apple.dock" as CFString
+
+    static func entries() -> [[String: Any]] {
+        CFPreferencesCopyAppValue("persistent-apps" as CFString, domain) as? [[String: Any]] ?? []
+    }
+
+    static func path(of entry: [String: Any]) -> String? {
+        guard let tile = entry["tile-data"] as? [String: Any], let file = tile["file-data"] as? [String: Any],
+              let s = file["_CFURLString"] as? String else { return nil }
+        return (URL(string: s)?.path ?? s).replacingOccurrences(of: "/$", with: "", options: .regularExpression)
+    }
+
+    static func entry(for app: URL) -> [String: Any] {
+        ["tile-type": "file-tile",
+         "tile-data": ["file-label": app.deletingPathExtension().lastPathComponent,
+                       "file-data": ["_CFURLString": app.absoluteString, "_CFURLStringType": 15]]]
+    }
+
+    static func contains(_ app: URL) -> Bool {
+        entries().contains { path(of: $0) == app.standardizedFileURL.path }
+    }
+
+    private static func write(_ list: [[String: Any]]) {
+        CFPreferencesSetAppValue("persistent-apps" as CFString, list as CFArray, domain)
+        CFPreferencesAppSynchronize(domain)
+        // The Dock reads its tiles at start only.
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/usr/bin/killall")
+        p.arguments = ["Dock"]
+        try? p.run()
+    }
+
+    @discardableResult
+    static func add(_ app: URL) -> Bool {
+        if contains(app) { return true }
+        var list = entries()
+        list.append(entry(for: app))
+        write(list)
+        return true
+    }
+
+    // Points moved apps' tiles at their new path and drops the tiles of removed apps.
+    // The Dock keeps a pinned app's old icon even across restarts, so a tile in `refresh` is taken off
+    // the Dock and put back in the same place a moment later, which makes the Dock read the new icon.
+    static func update(moved: [(from: URL, to: URL)], removed: [URL], refresh: [URL] = []) {
+        let gone = Set(removed.map(\.standardizedFileURL.path))
+        let moves = Dictionary(moved.map { ($0.from.standardizedFileURL.path, $0.to) }, uniquingKeysWith: { a, _ in a })
+        let redo = Set(refresh.map(\.standardizedFileURL.path))
+        var changed = false, refreshing = false
+        var list: [[String: Any]] = [], without: [[String: Any]] = []
+        for e in entries() {
+            guard let p = path(of: e) else { list.append(e); without.append(e); continue }
+            if gone.contains(p) { changed = true; continue }
+            let to = moves[p]
+            let path = to?.standardizedFileURL.path ?? p
+            // A fresh entry, without the Dock's GUID, so it doesn't reuse the cached icon.
+            let final = to != nil || redo.contains(path) ? entry(for: URL(fileURLWithPath: path)) : e
+            if to != nil { changed = true }
+            list.append(final)
+            if redo.contains(path) { refreshing = true } else { without.append(final) }
+        }
+        guard refreshing else { if changed { write(list) }; return }
+        write(without)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 3) { write(list) }   // once the Dock is back up
     }
 }
 
@@ -1336,6 +1819,17 @@ struct ProfileRow: View {
             Button("Move Down") { engine.move(profile, by: 1) }
             Divider()
             Button("Show Data Folder in Finder") { NSWorkspace.shared.activateFileViewerSelecting([profile.folderURL]) }
+            if let app = engine.launcherURL(profile) {
+                if Dock.contains(app) {
+                    Button("Remove \(profile.dockAppName) from Dock") { engine.removeFromDock(profile) }
+                } else {
+                    Button("Add \(profile.dockAppName) to Dock") { engine.addToDock(profile) }
+                }
+                Button("Rename App…") { Dialogs.renameApp(profile) }
+                Button("Show App in Finder") { NSWorkspace.shared.activateFileViewerSelecting([app]) }
+            } else {
+                Button("Add \(profile.dockAppName) to Dock") { engine.addToDock(profile) }
+            }
             Button("Copy Shell Alias") {
                 NSPasteboard.general.clearContents()
                 NSPasteboard.general.setString(profile.shellAlias, forType: .string)
@@ -1395,6 +1889,14 @@ enum Dialogs {
                                 buttons: buttons)
         if choice == buttons.count - 1 { return }
         e.copyMCPServers(from: src, to: dst, restart: running && choice == 0)
+    }
+
+    static func renameApp(_ p: Profile) {
+        let (choice, name) = alert("Rename \(p.dockAppName)",
+                                   "This name shows in the Dock, Spotlight and Launchpad. Leave it empty to go back to \"\(Profile(name: p.name, dir: p.dir).dockAppName)\". The Claude window itself keeps the name Claude.",
+                                   buttons: ["Rename", "Cancel"], field: p.dockAppName)
+        guard choice == 0 else { return }
+        Engine.shared.renameApp(p, to: name)
     }
 
     static func signIn(_ p: Profile) {
@@ -1740,6 +2242,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc func handleLink(_ event: NSAppleEventDescriptor, reply: NSAppleEventDescriptor) {
         guard let link = event.paramDescriptor(forKeyword: keyDirectObject)?.stringValue else { return }
+        if link.lowercased().hasPrefix("multiclaude:") { Engine.shared.handleOwnLink(link); return }
         Engine.shared.relay(link)
     }
 
@@ -1860,12 +2363,12 @@ if args.count == 2, args[1] == "--selftest-update" {
         ok = ok && got == want
     }
     let opens: [(String, String?, Bool, [String])] = [
-        ("default, nothing running", nil, false, ["-a", "Claude"]),
-        ("default, another account running", nil, true, ["-n", "-a", "Claude"]),
-        ("profile", "/x/Claude-Work", true, ["-n", "-a", "Claude", "--args", "--user-data-dir=/x/Claude-Work"]),
+        ("default, nothing running", nil, false, ["-a", "/A/Claude.app"]),
+        ("default, another account running", nil, true, ["-n", "-a", "/A/Claude.app"]),
+        ("profile", "/x/Claude-Work", true, ["-n", "-a", "/A/Claude.app", "--args", "--user-data-dir=/x/Claude-Work"]),
     ]
     for (name, dir, any, want) in opens {
-        let got = Launch.openArgs(dir: dir, anyClaudeRunning: any)
+        let got = Launch.openArgs(app: "/A/Claude.app", dir: dir, anyClaudeRunning: any)
         print(got == want ? "PASS" : "FAIL", name)
         ok = ok && got == want
     }
@@ -1981,6 +2484,113 @@ if args.count == 2, args[1] == "--selftest-signin" {
         ok = ok && got == want
     }
     exit(ok ? 0 : 1)
+}
+if args.count == 2, args[1] == "--selftest-launchers" {
+    var ok = true
+    func check(_ name: String, _ cond: Bool) { print(cond ? "PASS" : "FAIL", name); ok = ok && cond }
+    let fm = FileManager.default
+    let tmp = fm.temporaryDirectory.appendingPathComponent("mc-launchers-\(UUID().uuidString)")
+    var work = Profile(name: "Work", dir: "/tmp/it's/Claude-Work", color: 1)
+    let home = Profile(name: "Claude", dir: nil, color: 0)
+    check("default app name", work.dockAppName == "Claude Work" && home.dockAppName == "Claude Default")
+    var plain = work; plain.appName = " claude "
+    check("an app is never named plain Claude", plain.dockAppName == "Claude Work")
+    check("file name drops slashes", Launchers.fileName("A/B: C.") == "A-B- C.app")
+    check("script asks MultiClaude first", Launchers.script(for: work).contains("multiclaude://open?profile=\(work.id.uuidString)"))
+    check("script falls back with the quoted folder", Launchers.script(for: work).contains("'--user-data-dir=/tmp/it'\\''s/Claude-Work'"))
+    check("default profile falls back without -n", Launchers.script(for: home).contains("exec /usr/bin/open -a \"$app\"\n"))
+    check("fallback prefers the profile's own Claude", Launchers.script(for: work).contains(Runtimes.dir(work.id).path))
+    var r = MainActor.assumeIsolated { Launchers.sync([work, home], in: tmp) }
+    let apps = Launchers.installed(in: tmp)
+    check("one app per profile", apps.count == 2 && r.failed.isEmpty)
+    let workApp = tmp.appendingPathComponent("Claude Work.app")
+    check("app named after the profile", apps[work.id]?.lastPathComponent == "Claude Work.app")
+    check("script is executable", fm.isExecutableFile(atPath: workApp.path + "/Contents/MacOS/launch"))
+    check("icon written", ((try? Data(contentsOf: workApp.appendingPathComponent("Contents/Resources/icon.icns")))?.count ?? 0) > 10_000)
+    let before = (try? fm.attributesOfItem(atPath: workApp.path + "/Contents/Info.plist")[.modificationDate]) as? Date
+    r = MainActor.assumeIsolated { Launchers.sync([work, home], in: tmp) }
+    let after = (try? fm.attributesOfItem(atPath: workApp.path + "/Contents/Info.plist")[.modificationDate]) as? Date
+    check("unchanged profile is not rewritten", before == after && r.moved.isEmpty)
+    work.appName = "Claude Client"
+    r = MainActor.assumeIsolated { Launchers.sync([work, home], in: tmp) }
+    check("rename moves the app", r.moved.count == 1 && Launchers.installed(in: tmp)[work.id]?.lastPathComponent == "Claude Client.app")
+    check("rename rewrites the app", r.rewritten.count == 1)
+    work.color = 4
+    r = MainActor.assumeIsolated { Launchers.sync([work, home], in: tmp) }
+    check("recolor rewrites only that app", r.rewritten.map(\.lastPathComponent) == ["Claude Client.app"] && r.moved.isEmpty)
+    check("renamed app carries the new name", Launchers.readInfo(tmp.appendingPathComponent("Claude Client.app"))?["CFBundleName"] as? String == "Claude Client")
+    var twin = Profile(name: "Twin", dir: "/tmp/Claude-Twin", color: 2)
+    twin.appName = "Claude Client"
+    r = MainActor.assumeIsolated { Launchers.sync([work, home, twin], in: tmp) }
+    var dot = work; dot.appName = "Claude."
+    check("a name that becomes Claude.app gets a number", Launchers.fileName(dot.dockAppName) == "Claude.app"
+          && MainActor.assumeIsolated { Launchers.sync([dot], in: tmp.appendingPathComponent("dot")) }.failed.isEmpty
+          && Launchers.installed(in: tmp.appendingPathComponent("dot"))[dot.id]?.lastPathComponent == "Claude. 2.app")
+    check("clashing names get a number", Launchers.installed(in: tmp)[twin.id]?.lastPathComponent == "Claude Client 2.app")
+    try? fm.createDirectory(at: tmp.appendingPathComponent("Other.app"), withIntermediateDirectories: true)
+    r = MainActor.assumeIsolated { Launchers.sync([home], in: tmp) }
+    check("removed profiles lose their app", r.removed.count == 2 && Launchers.installed(in: tmp).count == 1)
+    check("other apps in the folder stay", fm.fileExists(atPath: tmp.appendingPathComponent("Other.app").path))
+    r = MainActor.assumeIsolated { Launchers.sync([], in: tmp) }
+    check("turning the setting off removes every app", Launchers.installed(in: tmp).isEmpty && r.removed.count == 1)
+    // Runtimes, against a fake Claude.app (the real folder isn't touched: these use explicit paths).
+    func fakeClaude(_ v: String) -> URL {
+        let c = tmp.appendingPathComponent("src-\(v)/Claude.app")
+        try? fm.createDirectory(at: c.appendingPathComponent("Contents/Resources/fr.lproj"), withIntermediateDirectories: true)
+        let info: [String: Any] = ["CFBundleShortVersionString": v, "CFBundleIdentifier": claudeBundleID]
+        try? PropertyListSerialization.data(fromPropertyList: info, format: .xml, options: 0).write(to: c.appendingPathComponent("Contents/Info.plist"))
+        return c
+    }
+    let rp = Profile(name: "Runtime Test \(UUID().uuidString.prefix(6))", dir: "/tmp/x", color: 3)
+    defer { try? fm.removeItem(at: Runtimes.dir(rp.id)) }
+    let v1 = fakeClaude("1.0"), v2 = fakeClaude("2.0")
+    let rt = Runtimes.ensure(rp, from: v1, running: { _ in false })
+    check("runtime is cloned", rt != nil && Runtimes.version(rt!) == "1.0")
+    check("runtime is named after the profile and wears its icon", Runtimes.current(rp.id)!.lastPathComponent == Launchers.fileName(rp.dockAppName)
+          && Runtimes.hasLook(Runtimes.current(rp.id)!))
+    check("runtime contents untouched", !fm.fileExists(atPath: Runtimes.current(rp.id)!.path + "/Contents/Resources/fr.lproj/InfoPlist.strings"))
+    check("runtime Info.plist untouched", (try? Data(contentsOf: Runtimes.current(rp.id)!.appendingPathComponent("Contents/Info.plist")))
+          == (try? Data(contentsOf: v1.appendingPathComponent("Contents/Info.plist"))))
+    _ = Runtimes.ensure(rp, from: v2, running: { _ in true })
+    check("running runtime is left alone", Runtimes.version(Runtimes.current(rp.id)!) == "1.0")
+    var recolored = rp; recolored.color = 5
+    let nameBefore = Runtimes.current(rp.id)!.lastPathComponent
+    _ = Runtimes.ensure(recolored, from: v1, running: { _ in true })
+    check("running runtime gets the new icon in place", ((try? String(contentsOf: Runtimes.stampURL(rp.id), encoding: .utf8)) ?? "").hasSuffix("|5")
+          && Runtimes.current(rp.id)!.lastPathComponent == nameBefore)
+    _ = Runtimes.ensure(rp, from: v2, running: { _ in false })
+    check("closed runtime follows a Claude update", Runtimes.version(Runtimes.current(rp.id)!) == "2.0")
+    _ = Runtimes.ensure(rp, from: v1, running: { _ in false })
+    check("runtime ahead of Claude is kept", Runtimes.version(Runtimes.current(rp.id)!) == "2.0")
+    var renamed = rp; renamed.appName = "Claude \"Quoted\""
+    _ = Runtimes.ensure(renamed, from: v2, running: { _ in false })
+    check("rename renames the bundle", Runtimes.current(rp.id)!.lastPathComponent == "Claude \"Quoted\".app")
+    try? Data("1|2.0|old".utf8).write(to: Runtimes.stampURL(rp.id))
+    _ = Runtimes.ensure(renamed, from: v1, running: { _ in false })
+    check("a copy from an older format is rebuilt", Runtimes.version(Runtimes.current(rp.id)!) == "1.0")
+    let others = ((try? fm.contentsOfDirectory(atPath: Runtimes.folder.path)) ?? [])
+        .compactMap { UUID(uuidString: $0) }.filter { $0 != rp.id }
+    Runtimes.prune(keeping: Set(others))   // only the test copy goes
+    check("prune removes a closed runtime", !Runtimes.exists(rp.id))
+    let ownerURL = Runtimes.dir(rp.id).appendingPathComponent("Claude X.app")
+    check("a copy's bundle names its profile", Runtimes.owner(of: ownerURL) == rp.id
+          && Runtimes.owner(of: URL(fileURLWithPath: "/Applications/Claude.app")) == nil)
+    let entry = Dock.entry(for: URL(fileURLWithPath: "/Users/x/Applications/MultiClaude Launchers/Claude Work.app"))
+    check("dock entry round-trips its path", Dock.path(of: entry) == "/Users/x/Applications/MultiClaude Launchers/Claude Work.app")
+    try? fm.removeItem(at: tmp)
+    exit(ok ? 0 : 1)
+}
+if args.count == 3, args[1] == "--export-profile-icon" {   // --export-profile-icon <out.png>, for README art
+    MainActor.assumeIsolated {
+        let tiles = Palette.colors.map { AppIcon.profile(256, color: $0.color, letter: "X") }
+        let strip = NSImage(size: NSSize(width: 256 * tiles.count, height: 256), flipped: false) { _ in
+            for (i, t) in tiles.enumerated() { t.draw(in: NSRect(x: i * 256, y: 0, width: 256, height: 256)) }
+            return true
+        }
+        let rep = NSBitmapImageRep(data: strip.tiffRepresentation!)!
+        try? rep.representation(using: .png, properties: [:])?.write(to: URL(fileURLWithPath: args[2]))
+    }
+    exit(0)
 }
 if args.count == 2, args[1] == "--selftest-version" {
     let cases = [("1.2", "1.1", true), ("1.10", "1.9", true), ("1.2", "1.2", false), ("1.2", "1.2.1", false), ("2.0", "1.9.9", true)]
