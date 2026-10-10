@@ -1,5 +1,15 @@
 # MultiClaude release notes
 
+## 1.3.3 (build 7), 2026-10-10
+
+### Fixed
+- **Every account signs in in its own window, with nothing to click first.** Claude only sends its Google and SSO sign-in through the browser (and back through a `claude://` link that macOS gives to the first Claude window) when it is the `claude://` handler. When it isn't, it signs in with Apple's in-window sheet instead (Claude logs "Not the claude:// handler; keeping ASWebAuth"). MultiClaude now keeps the `claude://` links, takes them back a few seconds after any Claude window starts, and passes other `claude://` links to the Claude window in front or the one used last. Setting: **Sign In in Each Account's Window**, on by default; links go back to Claude when it's off or MultiClaude quits.
+- Sign In to… recognises the in-window sheet finishing, so it no longer waits for its 10-minute limit.
+- Bringing a window forward after a link works on macOS 14 and later.
+
+### Changed
+- MultiClaude writes link relays and sign-ins to `~/Library/Logs/MultiClaude.log`, without the links' parameters.
+
 ## 1.3.2 (build 6), 2026-10-10
 
 ### Changed

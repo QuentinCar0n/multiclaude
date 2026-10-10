@@ -105,9 +105,9 @@ enum Seed {
 // MARK: - Settings
 
 enum Setting: String, CaseIterable, Identifiable {
-    case launchAtLogin, autoUpdate, reopenAfterUpdate, shortcut, profileShortcuts, showActive, showCount, coloredIcon, quitWithApp
+    case launchAtLogin, autoUpdate, routeSignIn, reopenAfterUpdate, shortcut, profileShortcuts, showActive, showCount, coloredIcon, quitWithApp
 
-    static let onByDefault: Set<Setting> = [.autoUpdate, .reopenAfterUpdate, .showActive, .showCount]
+    static let onByDefault: Set<Setting> = [.autoUpdate, .routeSignIn, .reopenAfterUpdate, .showActive, .showCount]
 
     var id: String { rawValue }
 
@@ -115,6 +115,7 @@ enum Setting: String, CaseIterable, Identifiable {
         switch self {
         case .launchAtLogin: "Launch at Login"
         case .autoUpdate: "Update MultiClaude Automatically"
+        case .routeSignIn: "Sign In in Each Account's Window"
         case .reopenAfterUpdate: "Reopen After Claude Updates"
         case .shortcut: "Keyboard Shortcut"
         case .profileShortcuts: "Profile Shortcuts"
@@ -129,6 +130,7 @@ enum Setting: String, CaseIterable, Identifiable {
         switch self {
         case .launchAtLogin: "power"
         case .autoUpdate: "arrow.down.circle"
+        case .routeSignIn: "person.badge.key"
         case .reopenAfterUpdate: "arrow.clockwise"
         case .shortcut: "command"
         case .profileShortcuts: "keyboard"
@@ -201,10 +203,19 @@ final class Engine: ObservableObject {
         let nc = NSWorkspace.shared.notificationCenter
         for name in [NSWorkspace.didLaunchApplicationNotification, NSWorkspace.didTerminateApplicationNotification,
                      NSWorkspace.didActivateApplicationNotification] {
-            nc.addObserver(forName: name, object: nil, queue: .main) { _ in
-                MainActor.assumeIsolated { Engine.shared.refresh() }
+            nc.addObserver(forName: name, object: nil, queue: .main) { note in
+                let launchedClaude = name == NSWorkspace.didLaunchApplicationNotification
+                    && (note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication)?.bundleIdentifier == claudeBundleID
+                MainActor.assumeIsolated {
+                    Engine.shared.refresh()
+                    // Claude makes itself the claude:// handler as it starts; take the links back once it's up.
+                    if launchedClaude {
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 6) { Engine.shared.holdLinks() }
+                    }
+                }
             }
         }
+        if !isDemo { DispatchQueue.main.asyncAfter(deadline: .now() + 2) { Engine.shared.holdLinks() } }
         let afterSelfUpdate = defaults.string(forKey: "updatedTo") != nil
         if let to = defaults.string(forKey: "updatedTo") {
             defaults.removeObject(forKey: "updatedTo")
@@ -243,6 +254,7 @@ final class Engine: ObservableObject {
         }
         defaults.set(on, forKey: s.rawValue)
         if s == .shortcut || s == .profileShortcuts { updateHotKeys() }
+        if s == .routeSignIn { on ? holdLinks() : LinkRelay.giveBack() }
         onChange?()
     }
 
@@ -289,6 +301,15 @@ final class Engine: ObservableObject {
     }
     @Published private(set) var signIn: SignIn?
     private var signInTimer: Timer?
+    private var lastClaudePid: pid_t?   // the Claude window used last, for claude:// links outside a sign-in
+
+    // While MultiClaude, not Claude, handles claude:// links, Claude signs in through an in-window
+    // ASWebAuthenticationSession instead of the browser, so every account signs in in its own window.
+    // (Claude: "[Auth] Not the claude:// handler; keeping ASWebAuth".)
+    func holdLinks() {
+        guard !isDemo, !isCLI, isOn(.routeSignIn) || signIn != nil, !LinkRelay.isOurs() else { return }
+        LinkRelay.take { _ in }
+    }
 
     func beginSignIn(_ p: Profile) {
         guard signIn == nil else { return }
@@ -349,13 +370,21 @@ final class Engine: ObservableObject {
     // A claude:// link that reached MultiClaude: during a sign-in it goes to the target process,
     // otherwise to Claude as usual.
     func relay(_ link: String) {
+        Log.write("link in: \(Log.redact(link)) front=\(NSWorkspace.shared.frontmostApplication?.bundleIdentifier ?? "-") last=\(lastClaudePid.map(String.init) ?? "-")")
         if let s = signIn, s.routing, let app = running[s.target], LinkRelay.send(link, to: app.processIdentifier) {
             signIn?.sawBrowser = true
-            app.unhide()
-            app.activate()
+            LinkRelay.bringForward(app)
             return
         }
-        LinkRelay.giveBack()
+        // Otherwise the Claude window in front, or the one used last.
+        let front = NSWorkspace.shared.frontmostApplication
+        let pid = front?.bundleIdentifier == claudeBundleID ? front?.processIdentifier : lastClaudePid
+        if let pid, let app = NSRunningApplication(processIdentifier: pid), !app.isTerminated, LinkRelay.send(link, to: pid) {
+            Log.write("link sent to pid \(pid)")
+            LinkRelay.bringForward(app)
+            return
+        }
+        if !isOn(.routeSignIn) { LinkRelay.giveBack() }
         if let url = URL(string: link) {
             NSWorkspace.shared.open([url], withApplicationAt: LinkRelay.claudeApp, configuration: NSWorkspace.OpenConfiguration())
         }
@@ -377,7 +406,7 @@ final class Engine: ObservableObject {
         signInTimer?.invalidate()
         signInTimer = nil
         signIn = nil
-        LinkRelay.giveBack()
+        if !isOn(.routeSignIn) { LinkRelay.giveBack() }
         let reopen = profiles.filter { s.reopen.contains($0.id) && !isRunning($0) }
         reopen.forEach(open)
         let target = profiles.first { $0.id == s.target }?.name ?? "the account"
@@ -420,6 +449,7 @@ final class Engine: ObservableObject {
         }
 
         let front = NSWorkspace.shared.frontmostApplication?.processIdentifier
+        if let front, found.values.contains(where: { $0.processIdentifier == front }) { lastClaudePid = front }
         let newFront = found.first { $0.value.processIdentifier == front }?.key
         if Set(found.keys) != Set(running.keys) || newFront != frontID {
             running = found
@@ -455,8 +485,7 @@ final class Engine: ObservableObject {
 
     func open(_ p: Profile) {
         if let app = running[p.id] {
-            app.unhide()
-            app.activate()
+            LinkRelay.bringForward(app)
             return
         }
         if let dir = p.dir { try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true) }
@@ -795,6 +824,26 @@ enum Updater {
 
 // Every Claude instance writes to the same main.log, so new lines since the sign-in started tell when it lands.
 // Takes over claude:// links for the length of a sign-in and forwards them to one Claude process.
+// ~/Library/Logs/MultiClaude.log: link relays and sign-ins, for support. Links are logged without their query.
+enum Log {
+    static let url = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Logs/MultiClaude.log")
+    static func write(_ line: String) {
+        guard !isCLI else { return }
+        let text = ISO8601DateFormatter().string(from: Date()) + " " + line + "\n"
+        if let h = try? FileHandle(forWritingTo: url) {
+            _ = try? h.seekToEnd(); try? h.write(contentsOf: Data(text.utf8)); try? h.close()
+        } else {
+            try? Data(text.utf8).write(to: url)
+        }
+    }
+    static func redact(_ link: String) -> String {
+        guard var c = URLComponents(string: link) else { return "<unparseable>" }
+        if c.query != nil { c.query = "…" }
+        c.fragment = nil
+        return c.string ?? "<unparseable>"
+    }
+}
+
 enum LinkRelay {
     static var claudeApp: URL {
         NSWorkspace.shared.urlForApplication(withBundleIdentifier: claudeBundleID) ?? URL(fileURLWithPath: "/Applications/Claude.app")
@@ -809,6 +858,7 @@ enum LinkRelay {
     }
 
     static func take(_ done: @escaping @Sendable (Bool) -> Void) {
+        Log.write("taking claude:// links")
         NSWorkspace.shared.setDefaultApplication(at: Bundle.main.bundleURL, toOpenURLsWithScheme: "claude") { err in
             done(err == nil && isOurs())
         }
@@ -816,7 +866,15 @@ enum LinkRelay {
 
     static func giveBack() {
         guard isOurs() else { return }
+        Log.write("giving claude:// links back to Claude")
         NSWorkspace.shared.setDefaultApplication(at: claudeApp, toOpenURLsWithScheme: "claude") { _ in }
+    }
+
+    // macOS 14+ only lets the active app hand focus over explicitly; MultiClaude is active while it takes a link.
+    @MainActor static func bringForward(_ app: NSRunningApplication) {
+        app.unhide()
+        NSApp.yieldActivation(to: app)
+        app.activate(from: NSRunningApplication.current, options: [])
     }
 
     // The same "open URL" Apple Event macOS would send, aimed at one process instead of the first one found.
@@ -852,7 +910,8 @@ enum SignInLog {
     static func scan(_ lines: [String], sawBrowser: Bool) -> (sawBrowser: Bool, done: Bool) {
         var saw = sawBrowser
         for l in lines {
-            if l.contains("[Auth] Using system browser") { saw = true }
+            if l.contains("[Auth] Using system browser") || l.contains("[Auth] Starting ASWebAuth") { saw = true }
+            if l.contains("[Auth] ASWebAuth completed") { return (true, true) }
             if l.contains("claudeURLHandler: login") { return (true, true) }
             if saw && l.contains("account active and logged in") { return (saw, true) }
         }
@@ -1903,12 +1962,17 @@ if args.count == 2, args[1] == "--selftest-signin" {
     let browser = ["[info] [Auth] Using system browser for: /login/app-google-auth"]
     let back = ["[info] claudeURLHandler: login loadURL superseded (teardown race)"]
     let loggedIn = ["[info] claude.ai account active and logged in"]
+    let sheet = ["[info] [Auth] Not the claude:// handler; keeping ASWebAuth",
+                 "[info] [Auth] Starting ASWebAuth for: /login/app-google-auth (default browser: safari)"]
+    let sheetDone = ["[info] [Auth] ASWebAuth completed: {"]
     let cases: [(String, [String], Bool, Bool)] = [
         ("launch 'logged in' before /logout is not done", launchBounce, false, false),
         ("browser step alone is not done", browser, false, false),
         ("login link handled is done", back, false, true),
         ("logged in after browser step is done", browser + loggedIn, false, true),
         ("browser seen in an earlier read, logged in now", loggedIn, true, true),
+        ("in-window sheet started is not done", sheet, false, false),
+        ("in-window sheet completed is done", sheet + sheetDone, false, true),
     ]
     var ok = true
     for (name, lines, saw, want) in cases {

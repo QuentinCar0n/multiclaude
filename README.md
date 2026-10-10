@@ -73,6 +73,7 @@ MultiClaude is that trick with a proper interface.
 - **Right-click** a profile to rename it, move it, show its data folder in Finder, copy a shell alias for it, or take it off the list.
 - **Imports your setup.** First launch picks up your default Claude account, any `--user-data-dir` aliases in `~/.zshrc`, and any `Claude-*` folder in Application Support. A `Claude-*` folder created later, by an alias for example, joins the list on its own.
 - **Folders follow names.** Rename a profile and its folder becomes `Claude-<Name>` the next time that account is closed. A link stays at the old path, so old aliases and Claude's own saved paths keep working.
+- **Sign-in that lands in the right window.** Claude's Google and SSO sign-in normally comes back to whichever Claude window opened first. MultiClaude makes each account sign in inside its own window, with nothing to click first.
 - **Global shortcuts.** ⌃⌥⌘M opens the panel; turn on Profile Shortcuts and ⌃⌥1 to ⌃⌥9 jump straight to each account.
 - **Updates itself.** Once a day MultiClaude checks for a new release, installs it in the background and restarts while the panel is closed. Your Claude windows stay open.
 - **Launch at login**, light and dark mode, colored menu bar icon.
@@ -139,7 +140,7 @@ Yes. MultiClaude reads the same folders, so an account opened from an alias show
 Right-click your default profile and choose **Duplicate as New Profile**, named for example `Personal`. The copy keeps your sign-in and history. You can then sign the default app out and in to another account, or simply add new profiles next to it.
 
 **An account keeps logging out, or its sign-in never finishes.**
-Claude asks every account to sign in again from time to time. Google and SSO sign-in returns from the browser through a `claude://` link that macOS gives to the first Claude window it finds, so with several accounts open it often lands in the wrong one. Right-click the account and choose **Sign In to…**, then sign in as usual: for that minute MultiClaude catches the link coming back from the browser and hands it to the right window. Your other accounts stay open.
+Claude asks every account to sign in again from time to time. Google and SSO sign-in returns from the browser through a `claude://` link that macOS gives to the first Claude window it finds, so with several accounts open it often lands in the wrong one. With **Sign In in Each Account's Window** on (the default), MultiClaude keeps the `claude://` links, and Claude then signs in through Apple's sign-in sheet inside the window that asked. Just click **Continue with Google** in the account that needs it; your other accounts stay open.
 
 **How do I remove an account completely?**
 Right-click it and choose **Show Data Folder in Finder**, quit it, choose **Remove from List**, then trash the folder.

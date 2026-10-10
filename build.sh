@@ -1,8 +1,8 @@
 #!/bin/zsh
 # Build MultiClaude.app and install it to ~/Applications.
 set -e
-VERSION=${VERSION:-1.3.2}   # bump with a CHANGELOG.md entry; CI sets it from the tag
-BUILD=${BUILD:-6}
+VERSION=${VERSION:-1.3.3}   # bump with a CHANGELOG.md entry; CI sets it from the tag
+BUILD=${BUILD:-7}
 cd "${0:A:h}"
 APP=build/MultiClaude.app
 rm -rf build && mkdir -p $APP/Contents/MacOS
