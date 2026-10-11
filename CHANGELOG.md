@@ -1,5 +1,28 @@
 # MultiClaude release notes
 
+## 1.4.1 (build 9), 2026-10-11
+
+A robustness release: no new features, many ways things could quietly go wrong now can't, or say so.
+
+### Fixed
+- **No more crash reports from profile icons.** Setting a profile copy's icon made macOS log an IconServices fault (and write an `ExcUserFault_MultiClaude` report) every time. Icons are now handed over at every standard size, which macOS takes without complaint.
+- **A transient read of a Claude process no longer closes it.** When macOS couldn't read a Claude process's arguments for a moment, MultiClaude took it for a profile copy started without its folder and closed it. Now it waits for a clean read, and folder renames wait too.
+- **Your profiles survive a saved list that can't be read.** A list from another version now loads field by field, and a list that still can't be read is kept aside (`profiles-unreadable-<date>` in MultiClaude's preferences) with a note in the panel, instead of being replaced.
+- **Duplicate never copies an account that is still open.** If the account doesn't quit (a quit dialog, a hang), nothing is copied. The copy is made under a hidden name and only takes its real name once complete, so a copy cut short is never picked up as a profile, and duplicating a renamed profile copies its folder, not the link left at the old name.
+- **Open tells you when Claude doesn't start**, for example when Claude.app is missing, instead of showing "starting" and then nothing. Pressing a profile again while it starts no longer starts a second copy, and opening the default account right after another one now works.
+- **Folder renames that fail are logged and retried at the next launch**, not every 3 seconds, and a folder moved without its link back is followed to where it is. A `SingletonLock` left by a crash no longer blocks renames forever, and folder names are compared without regard to case.
+- **Profile apps can swap names.** Two profiles with the same app name that swap places in the list used to fail to rewrite their apps on every save. Very long or multi-line names make valid app names, and half-written apps left by an interrupted run are cleaned up.
+- **The Dock is safer to edit.** MultiClaude never writes the Dock's app list when it can't read it, keeps changes you make while it refreshes a tile, and puts a tile it took off back before quitting. **Add to Dock** reports a failure instead of claiming success.
+- **Copy MCP Servers From** refuses a source whose config isn't valid JSON (it used to report "Copied 0" and rewrite the target), leaves the target untouched when there's nothing to copy, and no longer fails when run twice in the same second.
+- **Updates** give up on a stalled download instead of blocking later checks, retry within the hour after a failure (logged), unpack exactly the bytes whose signature was checked, never replace a test build (1.5-rc1) with an older release, and don't restart MultiClaude during a sign-in. If the relaunch can't start, MultiClaude stays open.
+- `claude://` links only go to Claude processes, and other kinds of links are ignored.
+- Aliases copied from a profile work for folder names with quotes or `$`, and a profile whose name has no letters still gets one.
+- The panel forgets a half-typed rename when it closes, Esc closes it, and the account name in the menu bar is shortened past 18 characters. MultiClaude keeps tracking Claude windows while an alert is open.
+
+### Changed
+- `~/Library/Logs/MultiClaude.log` is readable only by you, starts over past 1 MB (the previous one is kept as `MultiClaude.log.1`), and logs only the first part of a link's path. Failures that used to be silent (folder renames, profile copies, profile apps, the Dock, updates, links) now leave a line there.
+- Release builds check the tag's version format, give the Homebrew token only to the step that uses it, and don't mark a fix for an older line as the latest release.
+
 ## 1.4 (build 8), 2026-10-10
 
 ### New

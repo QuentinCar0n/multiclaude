@@ -25,7 +25,8 @@ let isPreview = ProcessInfo.processInfo.environment["MULTICLAUDE_PREVIEW"] != ni
 // Releases are signed in CI with the matching private key (repo secret UPDATE_SIGNING_KEY).
 let updatePublicKey = "ovYVjB5Bst53pHaSwbk7KKX+JRAqv7zuponiduhHa+w="
 // Command-line modes (--list, --selftest-*, ...) only read; the menu bar app owns the profile list.
-let isCLI = CommandLine.arguments.count > 1
+// Only a --flag counts: macOS and Xcode can pass other arguments (-NSDocumentRevisionsDebugMode ...) to the app.
+let isCLI = CommandLine.arguments.count > 1 && CommandLine.arguments[1].hasPrefix("--")
 let isDemo = ProcessInfo.processInfo.environment["MULTICLAUDE_DEMO"] != nil   // sample profiles for README screenshots
 
 extension Color {
@@ -47,6 +48,26 @@ struct Profile: Codable, Identifiable, Hashable {
     var codeDir: String?   // pinned Claude Code folder, kept when the data folder is renamed
     var appName: String?   // name of this profile's Dock app; nil = "Claude <name>"
 
+    init(id: UUID = UUID(), name: String, dir: String?, color: Int? = nil, openAtLaunch: Bool? = nil,
+         codeDir: String? = nil, appName: String? = nil) {
+        (self.id, self.name, self.dir, self.color) = (id, name, dir, color)
+        (self.openAtLaunch, self.codeDir, self.appName) = (openAtLaunch, codeDir, appName)
+    }
+
+    // Lenient, so a list saved by another version still loads: a missing field falls back instead of
+    // failing the whole list (which would lose every profile's id, color and settings).
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = (try? c.decodeIfPresent(UUID.self, forKey: .id)) ?? UUID()
+        dir = try c.decodeIfPresent(String.self, forKey: .dir)   // a wrong dir would make it the default profile: fail
+        name = (try? c.decodeIfPresent(String.self, forKey: .name))
+            ?? dir.map { String(URL(fileURLWithPath: $0).lastPathComponent.replacingOccurrences(of: "Claude-", with: "")) } ?? "Claude"
+        color = try? c.decodeIfPresent(Int.self, forKey: .color)
+        openAtLaunch = try? c.decodeIfPresent(Bool.self, forKey: .openAtLaunch)
+        codeDir = try? c.decodeIfPresent(String.self, forKey: .codeDir)
+        appName = try? c.decodeIfPresent(String.self, forKey: .appName)
+    }
+
     var isDefault: Bool { dir == nil }
     var initial: String { String(name.prefix(1)).uppercased() }
     var dockAppName: String {
@@ -61,9 +82,15 @@ struct Profile: Codable, Identifiable, Hashable {
     var nsTint: NSColor { Palette.colors[(color ?? 0) % Palette.colors.count].color }
     private var key: String { name.lowercased().filter { $0.isLetter || $0.isNumber } }
 
+    private var aliasKey: String { key.isEmpty ? "claude" + id.uuidString.prefix(4).lowercased() : key }
+
     var shellAlias: String {
-        guard let dir else { return "alias \(key)='open -a \"Claude\"'" }
-        return "alias \(key)='open -n -a \"Claude\" --args --user-data-dir=\"\(dir)\"'"
+        guard let dir else { return "alias \(aliasKey)='open -a \"Claude\"'" }
+        // The readable form when the path has nothing a shell would expand or that would end the quotes.
+        if !dir.contains(where: { "'\"$`\\".contains($0) }) {
+            return "alias \(aliasKey)='open -n -a \"Claude\" --args --user-data-dir=\"\(dir)\"'"
+        }
+        return "alias \(aliasKey)=" + shellQuote("open -n -a Claude --args " + shellQuote("--user-data-dir=" + dir))
     }
 
     // Claude Code keeps its sign-in per config folder (and per Keychain entry on macOS),
@@ -76,8 +103,11 @@ struct Profile: Codable, Identifiable, Hashable {
     }
 
     var codeAlias: String {
-        guard let codeConfigDir else { return "alias claude-\(key)='claude'" }
-        return "alias claude-\(key)='CLAUDE_CONFIG_DIR=\"\(codeConfigDir)\" claude'"
+        guard let codeConfigDir else { return "alias claude-\(aliasKey)='claude'" }
+        if !codeConfigDir.contains(where: { "'\"$`\\".contains($0) }) {
+            return "alias claude-\(aliasKey)='CLAUDE_CONFIG_DIR=\"\(codeConfigDir)\" claude'"
+        }
+        return "alias claude-\(aliasKey)=" + shellQuote("CLAUDE_CONFIG_DIR=" + shellQuote(codeConfigDir) + " claude")
     }
 }
 
@@ -103,10 +133,12 @@ enum Seed {
         var seen = Set<String>()
         let home = FileManager.default.homeDirectoryForCurrentUser.path
         let rc = (try? String(contentsOfFile: home + "/.zshrc", encoding: .utf8)) ?? ""
-        let re = try! NSRegularExpression(pattern: #"alias\s+(\w+)=['"]open -n -a "?Claude"? --args --user-data-dir="?([^"']+)"?['"]"#)
+        let re = try! NSRegularExpression(pattern: #"(?m)^\s*alias\s+(\w+)=['"]open -n -a "?Claude"? --args --user-data-dir="?([^"']+)"?['"]"#)
         for m in re.matches(in: rc, range: NSRange(rc.startIndex..., in: rc)) {
             guard let n = Range(m.range(at: 1), in: rc), let d = Range(m.range(at: 2), in: rc) else { continue }
-            let dir = String(rc[d]).replacingOccurrences(of: "$HOME", with: home)
+            let dir = (String(rc[d]).replacingOccurrences(of: "${HOME}", with: home)
+                .replacingOccurrences(of: "$HOME", with: home) as NSString).expandingTildeInPath
+            guard dir.hasPrefix("/"), !seen.contains(dir) else { continue }
             list.append(Profile(name: String(rc[n]).capitalized, dir: dir))
             seen.insert(dir)
         }
@@ -189,10 +221,13 @@ final class Engine: ObservableObject {
     private var claudeVersion = UpdateWatch.installedVersion()
     private var updatedAt: Date?
     private var quitAt: [UUID: Date] = [:]    // profiles that stopped without MultiClaude quitting them
-    private var userQuit: Set<UUID> = []
+    private var userQuit: [UUID: Date] = [:]   // quits MultiClaude asked for; Claude may still refuse (quit dialog)
     private var stopLog: [UUID: Date] = [:]   // last unrequested stop per profile, kept after it relaunches
     private var strayHandled: Date?           // the update whose stray default window was already closed
     private var bareHandled: [UUID: Date] = [:]   // profile copies last reopened after a bare start
+    private var busy: Set<UUID> = []          // profiles being duplicated: their folder must stay put
+    private var inFlight: Set<String> = []    // folders being written by a duplicate, not to be adopted
+    private var failedMoves: Set<String> = []
 
     private init() {
         if isDemo {
@@ -204,12 +239,29 @@ final class Engine: ObservableObject {
             frontID = profiles[1].id
             return
         }
-        if let data = defaults.data(forKey: "profiles"), let list = try? JSONDecoder().decode([Profile].self, from: data) {
+        let data = defaults.data(forKey: "profiles")
+        var unreadable = false
+        if let data, let list = try? JSONDecoder().decode([Profile].self, from: data) {
             profiles = list
         } else {
+            // A list that can't be read is kept aside, never just written over by the fresh one.
+            if let data, !isCLI {
+                let stamp = ISO8601DateFormatter().string(from: Date()).replacingOccurrences(of: ":", with: "")
+                defaults.set(data, forKey: "profiles-unreadable-\(stamp)")
+                Log.write("saved profile list could not be read; kept as profiles-unreadable-\(stamp), starting from the Claude folders")
+                unreadable = true
+            }
             profiles = Seed.profiles()
         }
+        if unreadable { notice = "MultiClaude couldn't read its saved profiles and rebuilt the list from your Claude folders." }
         for i in profiles.indices where profiles[i].color == nil { profiles[i].color = nextColor() }
+        if !isCLI {
+            // Copies cut short by a quit or crash during Duplicate (see Duplicate.clone).
+            for n in (try? FileManager.default.contentsOfDirectory(atPath: supportDir.path)) ?? [] where n.hasPrefix(".partial-") {
+                try? FileManager.default.removeItem(at: supportDir.appendingPathComponent(n))
+                Log.write("removed \(n), a duplicate cut short")
+            }
+        }
         discoverFolders()
     }
 
@@ -229,7 +281,7 @@ final class Engine: ObservableObject {
                 MainActor.assumeIsolated {
                     // A bare copy can hand off to the default window and quit before refresh() looks.
                     if launchedClaude, let app = launched, let owner = Engine.shared.runtimeOwner(app), !owner.isDefault,
-                       !ProcArgs.of(app.processIdentifier).contains(where: { $0.hasPrefix("--user-data-dir=") }) {
+                       let args = ProcArgs.of(app.processIdentifier), !args.contains(where: { $0.hasPrefix("--user-data-dir=") }) {
                         Engine.shared.reopenBareCopy(app, of: owner)
                     }
                     Engine.shared.refresh()
@@ -248,9 +300,10 @@ final class Engine: ObservableObject {
         }
         if !isDemo { Updater.start() }
         // Electron instances launched with `open -n` sometimes skip the launch notification; poll as a backstop.
-        Timer.scheduledTimer(withTimeInterval: 3, repeats: true) { _ in
+        // In the common modes, so it keeps running while an alert or menu is up.
+        RunLoop.main.add(Timer(timeInterval: 3, repeats: true) { _ in
             MainActor.assumeIsolated { Engine.shared.refresh() }
-        }
+        }, forMode: .common)
         refresh()
         // A restart after a self-update keeps whatever is open; it does not reopen startup profiles.
         if !isDemo && !afterSelfUpdate {
@@ -302,7 +355,7 @@ final class Engine: ObservableObject {
     }
 
     func shortcutHint(for p: Profile) -> String? {
-        guard isOn(.profileShortcuts), let i = profiles.firstIndex(of: p), i < 9 else { return nil }
+        guard isOn(.profileShortcuts), let i = profiles.firstIndex(where: { $0.id == p.id }), i < 9 else { return nil }
         return "⌃⌥\(i + 1)"
     }
 
@@ -387,8 +440,10 @@ final class Engine: ObservableObject {
         notice = others.isEmpty ? "Sign in to \(p.name) in its window."
             : "Sign in to \(p.name) in its window. \(names) reopen\(others.count == 1 ? "s" : "") once you're signed in."
         func next(_ rest: [Profile]) {
+            // Stop quitting accounts once the sign-in is over or cancelled; finishSignIn reopens the ones already closed.
+            guard Engine.shared.signIn?.target == p.id else { return }
             guard let first = rest.first else { Engine.shared.open(p); return }
-            Engine.shared.quitAndWait(first) { next(Array(rest.dropFirst())) }
+            Engine.shared.quitAndWait(first) { _ in next(Array(rest.dropFirst())) }
         }
         next(others)
     }
@@ -397,7 +452,8 @@ final class Engine: ObservableObject {
     // otherwise to Claude as usual.
     func relay(_ link: String) {
         Log.write("link in: \(Log.redact(link)) front=\(NSWorkspace.shared.frontmostApplication?.bundleIdentifier ?? "-") last=\(lastClaudePid.map(String.init) ?? "-")")
-        if let s = signIn, s.routing, let app = running[s.target], LinkRelay.send(link, to: app.processIdentifier) {
+        guard link.lowercased().hasPrefix("claude:") else { Log.write("ignored a link that isn't claude://"); return }
+        if let s = signIn, s.routing, let app = running[s.target], !app.isTerminated, LinkRelay.send(link, to: app.processIdentifier) {
             signIn?.sawBrowser = true
             LinkRelay.bringForward(app)
             return
@@ -405,14 +461,18 @@ final class Engine: ObservableObject {
         // Otherwise the Claude window in front, or the one used last.
         let front = NSWorkspace.shared.frontmostApplication
         let pid = front?.bundleIdentifier == claudeBundleID ? front?.processIdentifier : lastClaudePid
-        if let pid, let app = NSRunningApplication(processIdentifier: pid), !app.isTerminated, LinkRelay.send(link, to: pid) {
+        // The pid must still be a Claude: a pid can be reused by another app, and links can carry sign-in codes.
+        if let pid, let app = NSRunningApplication(processIdentifier: pid), !app.isTerminated,
+           app.bundleIdentifier == claudeBundleID, LinkRelay.send(link, to: pid) {
             Log.write("link sent to pid \(pid)")
             LinkRelay.bringForward(app)
             return
         }
+        if let pid { Log.write("link not delivered to pid \(pid); handing it to Claude") }
         if !isOn(.routeSignIn) { LinkRelay.giveBack() }
-        if let url = URL(string: link) {
-            NSWorkspace.shared.open([url], withApplicationAt: LinkRelay.claudeApp, configuration: NSWorkspace.OpenConfiguration())
+        guard let url = URL(string: link) else { Log.write("link dropped: unparseable"); return }
+        NSWorkspace.shared.open([url], withApplicationAt: LinkRelay.claudeApp, configuration: NSWorkspace.OpenConfiguration()) { _, err in
+            if let err { Log.write("link dropped: Claude didn't take it (\(err.localizedDescription))") }
         }
     }
 
@@ -449,9 +509,12 @@ final class Engine: ObservableObject {
         guard !isDemo else { return }
         var found: [UUID: NSRunningApplication] = [:]
         for app in NSWorkspace.shared.runningApplications where app.bundleIdentifier == claudeBundleID && !app.isTerminated {
-            let dir = ProcArgs.of(app.processIdentifier)
-                .first { $0.hasPrefix("--user-data-dir=") }
-                .map { Folders.canonical(String($0.dropFirst(16))) }
+            guard let args = ProcArgs.of(app.processIdentifier) else {
+                // Unreadable for now: keep whatever this process was matched to before.
+                if let known = running.first(where: { $0.value.processIdentifier == app.processIdentifier }) { found[known.key] = app }
+                continue
+            }
+            let dir = args.first { $0.hasPrefix("--user-data-dir=") }.map { Folders.canonical(String($0.dropFirst(16))) }
             if dir == nil, let owner = runtimeOwner(app), !owner.isDefault {
                 reopenBareCopy(app, of: owner)
                 continue
@@ -465,12 +528,14 @@ final class Engine: ObservableObject {
 
         let now = Date()
         for id in running.keys where found[id] == nil {
-            if userQuit.remove(id) == nil {
+            let asked = userQuit.removeValue(forKey: id).map { now.timeIntervalSince($0) < 60 } ?? false
+            if !asked {
                 quitAt[id] = now
                 stopLog[id] = now
             }
         }
         for id in found.keys { quitAt[id] = nil }
+        userQuit = userQuit.filter { now.timeIntervalSince($0.value) < 60 }   // a quit Claude refused
         quitAt = quitAt.filter { now.timeIntervalSince($0.value) < 300 }
         stopLog = stopLog.filter { now.timeIntervalSince($0.value) < 600 }
         if let v = UpdateWatch.installedVersion(), v != claudeVersion {
@@ -481,7 +546,7 @@ final class Engine: ObservableObject {
         let front = NSWorkspace.shared.frontmostApplication?.processIdentifier
         if let front, found.values.contains(where: { $0.processIdentifier == front }) { lastClaudePid = front }
         let newFront = found.first { $0.value.processIdentifier == front }?.key
-        if Set(found.keys) != Set(running.keys) || newFront != frontID {
+        if found.mapValues(\.processIdentifier) != running.mapValues(\.processIdentifier) || newFront != frontID {
             running = found
             frontID = newFront
             onChange?()
@@ -539,15 +604,47 @@ final class Engine: ObservableObject {
             LinkRelay.bringForward(app)
             return
         }
-        if let dir = p.dir { try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true) }
-        let anyClaude = NSWorkspace.shared.runningApplications.contains { $0.bundleIdentifier == claudeBundleID && !$0.isTerminated }
+        guard pending[p.id] == nil else { return }   // already starting; a second open would start a second process
+        let claude = realClaudeApp()
+        guard FileManager.default.fileExists(atPath: claude.appendingPathComponent("Contents/Info.plist").path) else {
+            notice = "Claude isn't installed. Install it from claude.ai/download, then open \(p.name) again."
+            Log.write("open \(p.name): no Claude.app at \(claude.path)")
+            return
+        }
+        if let dir = p.dir {
+            do { try FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true) } catch {
+                notice = "Couldn't open \(p.name): its folder can't be created."
+                Log.write("open \(p.name): can't create \(dir): \(error.localizedDescription)")
+                return
+            }
+        }
+        let anyClaude = !pending.isEmpty   // one still starting counts: `open -a` without -n would just bring it forward
+            || NSWorkspace.shared.runningApplications.contains { $0.bundleIdentifier == claudeBundleID && !$0.isTerminated }
         // With profile apps on, the profile runs in its own named copy of Claude (see Runtimes).
-        let app = (isOn(.dockApps) && !isDemo ? Runtimes.ensure(p, from: realClaudeApp()) : nil) ?? realClaudeApp()
+        let app = (isOn(.dockApps) && !isDemo ? Runtimes.ensure(p, from: claude) : nil) ?? claude
         let args = Launch.openArgs(app: app.path, dir: p.dir, anyClaudeRunning: anyClaude)
         let task = Process()
         task.executableURL = URL(fileURLWithPath: "/usr/bin/open")
         task.arguments = args
-        do { try task.run() } catch { NSSound.beep(); return }
+        let id = p.id, name = p.name
+        task.terminationHandler = { t in
+            guard t.terminationStatus != 0 else { return }
+            let status = t.terminationStatus
+            DispatchQueue.main.async {
+                MainActor.assumeIsolated {
+                    let e = Engine.shared
+                    e.pending[id] = nil
+                    e.notice = "Claude didn't start for \(name)."
+                    Log.write("open \(name): /usr/bin/open exited with \(status)")
+                    e.onChange?()
+                }
+            }
+        }
+        do { try task.run() } catch {
+            notice = "Couldn't open \(p.name)."
+            Log.write("open \(p.name): \(error.localizedDescription)")
+            return
+        }
         objectWillChange.send()
         pending[p.id] = Date()
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { Engine.shared.refresh() }
@@ -562,13 +659,13 @@ final class Engine: ObservableObject {
         guard UpdateWatch.isStrayDefault(defaultLaunch: app.launchDate, defaultStop: stopLog[d.id],
                                          profileStops: others, updatedAt: updatedAt) else { return }
         strayHandled = updatedAt
-        userQuit.insert(d.id)
+        userQuit[d.id] = Date()
         app.terminate()
     }
 
     func quit(_ p: Profile) {
         guard let app = running[p.id] else { return }
-        userQuit.insert(p.id)
+        userQuit[p.id] = Date()
         app.terminate()
     }
 
@@ -595,36 +692,50 @@ final class Engine: ObservableObject {
 
     @discardableResult
     func add(name raw: String) -> Bool {
-        guard let p = newProfile(named: raw) else { NSSound.beep(); return false }
+        guard let p = newProfile(named: raw), let dir = p.dir else {
+            NSSound.beep()
+            notice = raw.trimmingCharacters(in: .whitespaces).isEmpty ? nil
+                : "Couldn't add \(raw.trimmingCharacters(in: .whitespaces)): the name needs a letter or digit and must not be taken."
+            return false
+        }
+        // The folder of a profile taken off the list earlier: it comes back with its account and chats.
+        if FileManager.default.fileExists(atPath: dir) {
+            defaults.set(ignoredFolders.filter { $0.lowercased() != Folders.canonical(dir) }, forKey: "ignoredFolders")
+            notice = "\(p.name)'s folder was already there, so it opens with the account and chats it had."
+        }
         profiles.append(p)
         save()
         return true
     }
 
-    // A profile with a fresh Claude-<name> folder, or nil when the name is empty, taken or its folder exists.
+    // A profile with a Claude-<name> folder, or nil when the name is empty or taken by another profile
+    // or its folder. The folder may already exist on disk (see add and duplicate).
     func newProfile(named raw: String) -> Profile? {
         let name = raw.trimmingCharacters(in: .whitespaces)
-        let slug = name.filter { $0.isLetter || $0.isNumber || $0 == "-" || $0 == "_" }
+        let slug = Folders.slug(name)
         let dir = supportDir.appendingPathComponent("Claude-\(slug)").path
         guard !slug.isEmpty, !profiles.contains(where: { $0.name.caseInsensitiveCompare(name) == .orderedSame }),
-              !profiles.contains(where: { $0.dir == dir }) else { return nil }
+              !profiles.contains(where: { $0.dir.map(Folders.canonical) == Folders.canonical(dir) }),
+              !inFlight.contains(dir) else { return nil }
         return Profile(name: name, dir: dir, color: nextColor())
     }
 
     func setOpenAtLaunch(_ p: Profile, _ on: Bool) {
-        guard let i = profiles.firstIndex(of: p) else { return }
+        guard let i = profiles.firstIndex(where: { $0.id == p.id }) else { return }
         profiles[i].openAtLaunch = on
         save()
     }
 
-    // Quits a running profile and calls back once its process is gone (or after 15 s).
-    func quitAndWait(_ p: Profile, then done: @escaping @Sendable @MainActor () -> Void) {
-        guard let app = running[p.id] else { done(); return }
-        userQuit.insert(p.id)
+    // Quits a running profile and calls back once its process is gone (true) or after 15 s (false: still open,
+    // for example behind a quit dialog).
+    func quitAndWait(_ p: Profile, then done: @escaping @Sendable @MainActor (Bool) -> Void) {
+        guard let app = running[p.id], !app.isTerminated else { done(true); return }
+        userQuit[p.id] = Date()
         app.terminate()
         func poll(_ n: Int) {
             if app.isTerminated || n > 60 {
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { MainActor.assumeIsolated { done() } }
+                let gone = app.isTerminated
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { MainActor.assumeIsolated { done(gone) } }
                 return
             }
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { poll(n + 1) }
@@ -635,22 +746,46 @@ final class Engine: ObservableObject {
     // Clones a profile's whole data folder, sign-in and chats included, into a new profile.
     // APFS clones make the copy instant and free until the two folders diverge.
     func duplicate(_ source: Profile, as name: String) {
-        guard let p = newProfile(named: name), let dst = p.dir else { NSSound.beep(); return }
+        guard !busy.contains(source.id) else { NSSound.beep(); return }
+        guard let p = newProfile(named: name), let dst = p.dir, !FileManager.default.fileExists(atPath: dst) else {
+            notice = "Couldn't duplicate \(source.name): pick a name that no profile or folder uses yet."
+            return
+        }
         let wasRunning = isRunning(source)
+        busy.insert(source.id)
+        inFlight.insert(dst)
         notice = "Duplicating \(source.name)…"
-        quitAndWait(source) {
+        quitAndWait(source) { quit in
+            let e = Engine.shared
+            // Copying a folder its Claude is still writing would give the copy torn databases.
+            let live = e.profiles.first { $0.id == source.id } ?? source
+            guard quit, !Folders.inUse(live.folderURL.path) else {
+                e.busy.remove(source.id)
+                e.inFlight.remove(dst)
+                e.notice = "Couldn't duplicate \(source.name): it didn't quit. Nothing was changed."
+                return
+            }
+            let src = live.folderURL.path
             Task.detached {
-                let ok = Duplicate.clone(from: source.folderURL.path, to: dst)
+                let result = Duplicate.clone(from: src, to: dst)
                 await MainActor.run {
                     let e = Engine.shared
-                    if ok {
-                        e.profiles.append(p)
+                    e.busy.remove(source.id)
+                    e.inFlight.remove(dst)
+                    switch result {
+                    case .success where !e.profiles.contains(where: { $0.dir.map(Folders.canonical) == Folders.canonical(dst) }):
+                        var added = p
+                        added.color = e.nextColor()
+                        e.profiles.append(added)
                         e.save()
                         e.notice = "Duplicated \(source.name) as \(p.name). Both are signed in to the same account until you sign one out."
-                    } else {
+                    case .success:
+                        e.notice = "Duplicated \(source.name) as \(p.name)."
+                    case .failure(let err):
+                        Log.write("duplicate \(source.name): \(err)")
                         e.notice = "Couldn't duplicate \(source.name). Nothing was changed."
                     }
-                    if wasRunning { e.open(source) }
+                    if wasRunning { e.open(live) }
                 }
             }
         }
@@ -659,18 +794,26 @@ final class Engine: ObservableObject {
     func copyMCPServers(from source: Profile, to target: Profile, restart: Bool) {
         do {
             let n = try MCP.copy(from: source, to: target)
+            guard n > 0 else { notice = "\(source.name) has no MCP servers to copy."; return }
             notice = "Copied \(n) MCP server\(n == 1 ? "" : "s") from \(source.name) to \(target.name)."
                 + (restart || !isRunning(target) ? "" : " Reopen \(target.name) to load them.")
-            if restart && isRunning(target) { quitAndWait(target) { Engine.shared.open(target) } }
+            if restart && isRunning(target) { quitAndWait(target) { _ in Engine.shared.open(target) } }
+        } catch MCP.Failure.unreadable(let who) {
+            notice = "Couldn't copy MCP servers: \(who == .source ? source.name : target.name)'s config file isn't valid JSON."
         } catch {
-            notice = "Couldn't copy MCP servers: \(target.name)'s config file isn't valid JSON."
+            notice = "Couldn't copy MCP servers: \(error.localizedDescription)"
+            Log.write("copy MCP servers \(source.name) to \(target.name): \(error)")
         }
     }
 
     // The folder follows the new name on its own (see alignFolders), once the profile is closed.
     func rename(_ p: Profile, to raw: String) {
         let name = raw.trimmingCharacters(in: .whitespaces)
-        guard !name.isEmpty, let i = profiles.firstIndex(of: p) else { return }
+        guard !name.isEmpty, let i = profiles.firstIndex(where: { $0.id == p.id }) else { return }
+        guard !profiles.contains(where: { $0.id != p.id && $0.name.caseInsensitiveCompare(name) == .orderedSame }) else {
+            notice = "Another profile is already called \(name)."
+            return
+        }
         profiles[i].name = name
         save()
         alignFolders()
@@ -679,7 +822,7 @@ final class Engine: ObservableObject {
     // Takes the profile off the list. Its data folder stays on disk and is not added back.
     func remove(_ p: Profile) {
         guard !p.isDefault, let dir = p.dir else { return }
-        defaults.set(Array(Set(ignoredFolders + [Folders.canonical(dir)])), forKey: "ignoredFolders")
+        defaults.set(Array(Set(ignoredFolders.map { $0.lowercased() } + [Folders.canonical(dir)])), forKey: "ignoredFolders")
         profiles.removeAll { $0.id == p.id }
         save()
     }
@@ -689,7 +832,8 @@ final class Engine: ObservableObject {
     // Adds every Claude-* folder in Application Support that no profile uses yet.
     func discoverFolders() {
         guard !isDemo, !isCLI else { return }
-        let known = Set(profiles.compactMap(\.dir).map(Folders.canonical) + ignoredFolders)
+        let known = Set(profiles.compactMap(\.dir).map(Folders.canonical) + ignoredFolders.map { $0.lowercased() }
+                        + inFlight.map(Folders.canonical))
         let found = Folders.candidates(in: supportDir.path).filter { !known.contains(Folders.canonical($0)) }
         guard !found.isEmpty else { return }
         for dir in found {
@@ -704,30 +848,41 @@ final class Engine: ObservableObject {
     func alignFolders() {
         guard !isDemo, !isCLI, signIn == nil else { return }
         // Read the live processes here rather than trusting `running`, which may not be filled in yet.
-        let live = Set(NSWorkspace.shared.runningApplications
-            .filter { $0.bundleIdentifier == claudeBundleID && !$0.isTerminated }
-            .compactMap { ProcArgs.of($0.processIdentifier).first { $0.hasPrefix("--user-data-dir=") } }
+        let claudes = NSWorkspace.shared.runningApplications.filter { $0.bundleIdentifier == claudeBundleID && !$0.isTerminated }
+        let argv = claudes.map { ProcArgs.of($0.processIdentifier) }
+        guard !argv.contains(where: { $0 == nil }) else { return }   // a Claude we can't read might be using any folder
+        let live = Set(argv.compactMap { $0?.first { $0.hasPrefix("--user-data-dir=") } }
             .map { Folders.canonical(String($0.dropFirst(16))) })
         var changed = false
         for i in profiles.indices {
             let p = profiles[i]
             guard let dir = p.dir, !live.contains(Folders.canonical(dir)), !isRunning(p), pending[p.id] == nil,
-                  !Folders.inUse(dir),
-                  let target = Folders.target(for: p.name, current: dir, in: supportDir.path) else { continue }
+                  !busy.contains(p.id), !Folders.inUse(dir),
+                  let target = Folders.target(for: p.name, current: dir, in: supportDir.path),
+                  !failedMoves.contains(dir + "\t" + target) else { continue }
             let oldCode = p.codeConfigDir
-            if Folders.move(dir, to: target) {
+            switch Folders.move(dir, to: target) {
+            case .moved:
                 if p.codeDir == nil, let oldCode, FileManager.default.fileExists(atPath: oldCode) {
                     profiles[i].codeDir = oldCode   // its Keychain sign-in is tied to this path
                 }
                 profiles[i].dir = target
                 changed = true
+            case .stranded:
+                // Moved, but neither the link nor the way back worked: follow the data to where it is.
+                profiles[i].dir = target
+                changed = true
+                Log.write("folder \(dir) moved to \(target) but the link back failed")
+            case .failed(let why):
+                failedMoves.insert(dir + "\t" + target)   // tried again at the next launch, not every 3 s
+                Log.write("couldn't rename \(dir) to \(target): \(why)")
             }
         }
         if changed { save() }
     }
 
     func setColor(_ p: Profile, _ c: Int) {
-        guard let i = profiles.firstIndex(of: p) else { return }
+        guard let i = profiles.firstIndex(where: { $0.id == p.id }) else { return }
         profiles[i].color = c
         save()
     }
@@ -757,7 +912,7 @@ final class Engine: ObservableObject {
     }
 
     func renameApp(_ p: Profile, to raw: String) {
-        guard let i = profiles.firstIndex(of: p) else { return }
+        guard let i = profiles.firstIndex(where: { $0.id == p.id }) else { return }
         let name = raw.trimmingCharacters(in: .whitespaces)
         profiles[i].appName = name.isEmpty || name == Profile(name: p.name, dir: p.dir).dockAppName ? nil : name
         save()
@@ -784,7 +939,7 @@ final class Engine: ObservableObject {
     }
 
     func move(_ p: Profile, by delta: Int) {
-        guard let i = profiles.firstIndex(of: p) else { return }
+        guard let i = profiles.firstIndex(where: { $0.id == p.id }) else { return }
         let j = i + delta
         guard profiles.indices.contains(j) else { return }
         profiles.swapAt(i, j)
@@ -807,6 +962,16 @@ enum Updater {
     static let latestURL = URL(string: "https://api.github.com/repos/QuentinCar0n/multiclaude/releases/latest")!
     nonisolated(unsafe) static var relaunching = false
     nonisolated(unsafe) static var busy = false
+    nonisolated(unsafe) static var installedPending: String?   // swapped in, waiting for the relaunch
+    static let maxZipSize = 64 << 20
+
+    // Its own session, so a stalled download gives up instead of blocking every later check.
+    static let session: URLSession = {
+        let c = URLSessionConfiguration.ephemeral
+        c.timeoutIntervalForRequest = 30
+        c.timeoutIntervalForResource = 300
+        return URLSession(configuration: c)
+    }()
 
     struct Release { let version: String; let zip: URL; let signature: URL }
 
@@ -821,18 +986,31 @@ enum Updater {
 
     @MainActor static func checkIfDue(force: Bool) {
         let d = UserDefaults.standard
-        guard Engine.shared.isOn(.autoUpdate), !busy else { return }
+        guard Engine.shared.isOn(.autoUpdate), !busy, installedPending == nil else { return }
         if !force, let last = d.object(forKey: "lastUpdateCheck") as? Date, -last.timeIntervalSinceNow < 86_400 { return }
-        d.set(Date(), forKey: "lastUpdateCheck")
+        // A test build (1.5-rc1, 0.0.0-ci) is never replaced by a release behind the tester's back.
+        guard !currentVersion.contains("-") else { return }
         let target = Bundle.main.bundleURL
         guard target.pathExtension == "app",
-              FileManager.default.isWritableFile(atPath: target.deletingLastPathComponent().path) else { return }
+              FileManager.default.isWritableFile(atPath: target.deletingLastPathComponent().path) else {
+            if force { Log.write("update: skipped, \(target.deletingLastPathComponent().path) isn't writable") }
+            return
+        }
         busy = true
         Task.detached {
-            let installed = try? await updateIfNewer(at: target)
+            let outcome: Result<String?, Error>
+            do { outcome = .success(try await updateIfNewer(at: target)) } catch { outcome = .failure(error) }
+            let installed = try? outcome.get(), failure = { if case .failure(let e) = outcome { return "\(e)" } else { return nil } }() as String?
             await MainActor.run {
                 busy = false
-                if let installed { relaunchWhenIdle(version: installed, app: target) }
+                // A failed check is tried again in 3 hours rather than the next day (or every hour for a bad release).
+                if let failure { Log.write("update failed: \(failure)") }
+                d.set(failure == nil ? Date() : Date().addingTimeInterval(-86_400 + 3 * 3600), forKey: "lastUpdateCheck")
+                if let installed = installed ?? nil {
+                    installedPending = installed
+                    Log.write("update: installed \(installed), relaunching when idle")
+                    relaunchWhenIdle(version: installed, app: target)
+                }
             }
         }
     }
@@ -848,9 +1026,10 @@ enum Updater {
         var req = URLRequest(url: latestURL, timeoutInterval: 30)
         req.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
         req.setValue("MultiClaude/\(appVersion)", forHTTPHeaderField: "User-Agent")
-        let (data, resp) = try await URLSession.shared.data(for: req)
-        guard (resp as? HTTPURLResponse)?.statusCode == 200,
-              let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+        let (data, resp) = try await session.data(for: req)
+        let status = (resp as? HTTPURLResponse)?.statusCode ?? 0
+        guard status == 200 else { throw UpdateError.command("GitHub answered \(status)") }
+        guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
               let tag = json["tag_name"] as? String,
               let assets = json["assets"] as? [[String: Any]],
               let asset = assets.first(where: { ($0["name"] as? String)?.hasSuffix(".zip") == true }),
@@ -863,35 +1042,48 @@ enum Updater {
 
     static func trusted(_ any: Any?) -> URL? {
         guard let s = any as? String, let url = URL(string: s), url.scheme == "https", url.host == "github.com",
+              url.port == nil, url.user == nil, !url.path.contains(".."),
               url.path.hasPrefix("/QuentinCar0n/multiclaude/releases/download/") else { return nil }
         return url
     }
 
+    // Dotted numbers; a pre-release (1.5-rc1) sorts below its release (1.5) and above the one before.
     static func isNewer(_ a: String, than b: String) -> Bool {
-        let x = a.split(separator: ".").map { Int($0) ?? 0 }, y = b.split(separator: ".").map { Int($0) ?? 0 }
+        func parts(_ v: String) -> ([Int], Bool) {
+            let core = v.split(separator: "-", maxSplits: 1).first.map(String.init) ?? v
+            return (core.split(separator: ".").map { Int($0) ?? 0 }, v.contains("-"))
+        }
+        let (x, xPre) = parts(a), (y, yPre) = parts(b)
         for i in 0..<max(x.count, y.count) {
             let l = i < x.count ? x[i] : 0, r = i < y.count ? y[i] : 0
             if l != r { return l > r }
         }
-        return false
+        return yPre && !xPre
     }
 
     // Downloads the release zip, checks that it holds MultiClaude at the advertised version with an intact
     // signature, then swaps it in place of the running bundle.
     static func install(_ r: Release, at target: URL) async throws {
         let fm = FileManager.default
-        let work = fm.temporaryDirectory.appendingPathComponent("MultiClaude-update-\(UUID().uuidString)")
+        // Staged on the same volume as the app, so the final swap is a rename and never a half-done copy.
+        let work = (try? fm.url(for: .itemReplacementDirectory, in: .userDomainMask, appropriateFor: target, create: true))
+            ?? fm.temporaryDirectory.appendingPathComponent("MultiClaude-update-\(UUID().uuidString)")
         try fm.createDirectory(at: work, withIntermediateDirectories: true)
         defer { try? fm.removeItem(at: work) }
-        let (tmp, resp) = try await URLSession.shared.download(from: r.zip)
+        let (tmp, resp) = try await session.download(from: r.zip)
+        defer { try? fm.removeItem(at: tmp) }
         guard (resp as? HTTPURLResponse)?.statusCode == 200 else { throw UpdateError.download }
-        let zip = work.appendingPathComponent("update.zip")
-        try fm.moveItem(at: tmp, to: zip)
+        let size = ((try? fm.attributesOfItem(atPath: tmp.path))?[.size] as? NSNumber)?.intValue ?? Int.max
+        guard size < maxZipSize else { throw UpdateError.download }
+        let bytes = try Data(contentsOf: tmp)
         // The zip must carry a signature made with the release key; HTTPS alone would trust whoever controls the repo.
-        let (sigData, sigResp) = try await URLSession.shared.data(from: r.signature)
+        let (sigData, sigResp) = try await session.data(from: r.signature)
         guard (sigResp as? HTTPURLResponse)?.statusCode == 200,
-              UpdateSignature.verify(try Data(contentsOf: zip), signatureBase64: String(decoding: sigData, as: UTF8.self))
+              UpdateSignature.verify(bytes, signatureBase64: String(decoding: sigData, as: UTF8.self))
         else { throw UpdateError.signature }
+        // Unpack the very bytes that were verified, not the file the download left behind.
+        let zip = work.appendingPathComponent("update.zip")
+        try bytes.write(to: zip)
         try run("/usr/bin/ditto", ["-x", "-k", zip.path, work.path])
         let app = work.appendingPathComponent("MultiClaude.app")
         let info = NSDictionary(contentsOf: app.appendingPathComponent("Contents/Info.plist"))
@@ -901,27 +1093,39 @@ enum Updater {
         _ = try fm.replaceItemAt(target, withItemAt: app)
     }
 
+    // Runs a tool and throws with the first lines of its error output when it fails.
     static func run(_ tool: String, _ args: [String]) throws {
         let p = Process()
         p.executableURL = URL(fileURLWithPath: tool)
         p.arguments = args
         p.standardOutput = FileHandle.nullDevice
-        p.standardError = FileHandle.nullDevice
+        let err = Pipe()
+        p.standardError = err
         try p.run()
+        let text = String(decoding: err.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
         p.waitUntilExit()
-        if p.terminationStatus != 0 { throw UpdateError.command(tool) }
+        if p.terminationStatus != 0 {
+            let first = text.split(separator: "\n").prefix(3).joined(separator: " | ")
+            throw UpdateError.command("\(URL(fileURLWithPath: tool).lastPathComponent) exited \(p.terminationStatus)\(first.isEmpty ? "" : ": " + first)")
+        }
     }
 
+    // Waits while the panel is open or a sign-in is relaying links (a restart would drop it). The new copy
+    // starts once this process is gone, so `open` can't just bring the old one forward.
     @MainActor static func relaunchWhenIdle(version: String, app: URL) {
-        guard !PanelController.shared.isOpen else {
+        guard !PanelController.shared.isOpen, Engine.shared.signIn == nil else {
             DispatchQueue.main.asyncAfter(deadline: .now() + 30) { relaunchWhenIdle(version: version, app: app) }
             return
         }
-        UserDefaults.standard.set(version, forKey: "updatedTo")
         let sh = Process()
         sh.executableURL = URL(fileURLWithPath: "/bin/sh")
-        sh.arguments = ["-c", "sleep 1; /usr/bin/open \"$0\"", app.path]
-        try? sh.run()
+        sh.arguments = ["-c", "i=0; while kill -0 \"$1\" 2>/dev/null && [ $i -lt 100 ]; do sleep 0.1; i=$((i+1)); done; /usr/bin/open \"$0\"",
+                        app.path, String(ProcessInfo.processInfo.processIdentifier)]
+        do { try sh.run() } catch {
+            Log.write("update: can't relaunch (\(error.localizedDescription)); \(version) starts next time")
+            return
+        }
+        UserDefaults.standard.set(version, forKey: "updatedTo")
         relaunching = true
         NSApp.terminate(nil)
     }
@@ -932,20 +1136,31 @@ enum Updater {
 // ~/Library/Logs/MultiClaude.log: link relays and sign-ins, for support. Links are logged without their query.
 enum Log {
     static let url = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Logs/MultiClaude.log")
+    static let maxSize: UInt64 = 1 << 20   // past 1 MB the log moves to MultiClaude.log.1 and starts over
+
     static func write(_ line: String) {
         guard !isCLI else { return }
-        let text = ISO8601DateFormatter().string(from: Date()) + " " + line + "\n"
+        let text = ISO8601DateFormatter().string(from: Date()) + " " + String(line.prefix(400)) + "\n"
+        let fm = FileManager.default
+        if ((try? fm.attributesOfItem(atPath: url.path))?[.size] as? NSNumber)?.uint64Value ?? 0 > maxSize {
+            let old = url.appendingPathExtension("1")
+            try? fm.removeItem(at: old)
+            try? fm.moveItem(at: url, to: old)
+        }
         if let h = try? FileHandle(forWritingTo: url) {
             _ = try? h.seekToEnd(); try? h.write(contentsOf: Data(text.utf8)); try? h.close()
         } else {
-            try? Data(text.utf8).write(to: url)
+            // Only the user reads it: links and folder names are private.
+            fm.createFile(atPath: url.path, contents: Data(text.utf8), attributes: [.posixPermissions: 0o600])
         }
     }
+    // Scheme, host and the first path segment: enough to tell a sign-in from a chat link, and no codes,
+    // ids or tokens, wherever in the link they sit.
     static func redact(_ link: String) -> String {
-        guard var c = URLComponents(string: link) else { return "<unparseable>" }
-        if c.query != nil { c.query = "…" }
-        c.fragment = nil
-        return c.string ?? "<unparseable>"
+        guard let c = URLComponents(string: link), let scheme = c.scheme else { return "<unparseable>" }
+        let first = c.path.split(separator: "/").first.map { "/" + $0 } ?? ""
+        let more = c.path.split(separator: "/").count > 1 || c.query != nil || c.fragment != nil
+        return "\(scheme)://\(c.host ?? "")\(first)\(more ? "/…" : "")"
     }
 }
 
@@ -1023,13 +1238,18 @@ enum SignInLog {
 }
 
 enum Folders {
+    // A folder's identity for comparisons only (never for file operations): symlinks resolved, and lowercased
+    // because the Mac's volumes ignore case, so "claude-work" typed in an alias is the same folder.
     static func canonical(_ path: String) -> String {
-        URL(fileURLWithPath: path).standardizedFileURL.resolvingSymlinksInPath().path
+        URL(fileURLWithPath: (path as NSString).expandingTildeInPath).standardizedFileURL.resolvingSymlinksInPath().path.lowercased()
     }
 
-    // Electron keeps a SingletonLock link in the folder while an instance uses it.
+    // Electron keeps a SingletonLock link ("<host>-<pid>") in the folder while an instance uses it.
+    // A lock left by a crash names a process that is gone, and doesn't count.
     static func inUse(_ dir: String) -> Bool {
-        (try? FileManager.default.destinationOfSymbolicLink(atPath: dir + "/SingletonLock")) != nil
+        guard let lock = try? FileManager.default.destinationOfSymbolicLink(atPath: dir + "/SingletonLock") else { return false }
+        guard let pid = lock.split(separator: "-").last.flatMap({ pid_t($0) }), pid > 0 else { return true }
+        return kill(pid, 0) == 0 || errno == EPERM
     }
 
     static func slug(_ name: String) -> String {
@@ -1061,25 +1281,34 @@ enum Folders {
         return target
     }
 
-    static func move(_ from: String, to: String) -> Bool {
+    enum MoveResult: Equatable { case moved, failed(String), stranded }
+
+    static func move(_ from: String, to: String) -> MoveResult {
         let fm = FileManager.default
+        do { try fm.moveItem(atPath: from, toPath: to) } catch { return .failed(error.localizedDescription) }
         do {
-            try fm.moveItem(atPath: from, toPath: to)
             try fm.createSymbolicLink(atPath: from, withDestinationPath: to)
-            return true
+            return .moved
         } catch {
-            if !fm.fileExists(atPath: from), fm.fileExists(atPath: to) { try? fm.moveItem(atPath: to, toPath: from) }
-            return false
+            // No link means old paths inside Claude's data would break; put the folder back.
+            if (try? fm.moveItem(atPath: to, toPath: from)) != nil { return .failed(error.localizedDescription) }
+            return .stranded
         }
     }
 }
 
 enum MCP {
+    enum Side { case source, target }
+    enum Failure: Error { case unreadable(Side) }
+
     static func configURL(_ p: Profile) -> URL { p.folderURL.appendingPathComponent("claude_desktop_config.json") }
 
+    // A missing or empty file is an empty config; a file that exists but isn't a JSON object throws.
     static func read(_ url: URL) throws -> [String: Any] {
-        guard let data = try? Data(contentsOf: url), !data.isEmpty else { return [:] }
-        guard let obj = try JSONSerialization.jsonObject(with: data) as? [String: Any] else { throw CocoaError(.fileReadCorruptFile) }
+        guard FileManager.default.fileExists(atPath: url.path) else { return [:] }
+        let data = try Data(contentsOf: url)
+        guard !data.isEmpty else { return [:] }
+        guard let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { throw CocoaError(.fileReadCorruptFile) }
         return obj
     }
 
@@ -1098,14 +1327,21 @@ enum MCP {
 
     @discardableResult
     static func copy(from source: Profile, to target: Profile) throws -> Int {
-        let servers = self.servers(source)
+        guard let src = try? read(configURL(source)) else { throw Failure.unreadable(.source) }
+        let servers = src["mcpServers"] as? [String: Any] ?? [:]
+        guard !servers.isEmpty else { return 0 }   // nothing to add: the target file isn't touched
         let url = configURL(target)
-        let merged = merge(try read(url), adding: servers)
+        guard let current = try? read(url) else { throw Failure.unreadable(.target) }
+        let merged = merge(current, adding: servers)
         let fm = FileManager.default
         if fm.fileExists(atPath: url.path) {
             let f = DateFormatter()
+            f.locale = Locale(identifier: "en_US_POSIX")
             f.dateFormat = "yyyyMMdd-HHmmss"
-            try fm.copyItem(at: url, to: url.appendingPathExtension("bak-" + f.string(from: Date())))
+            var backup = url.appendingPathExtension("bak-" + f.string(from: Date()))
+            var n = 2
+            while fm.fileExists(atPath: backup.path) { backup = url.appendingPathExtension("bak-" + f.string(from: Date()) + "-\(n)"); n += 1 }
+            try fm.copyItem(at: url, to: backup)
         } else {
             try fm.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
         }
@@ -1116,19 +1352,28 @@ enum MCP {
 }
 
 enum Duplicate {
-    // `cp -c` clones on APFS. The destination must not exist yet.
-    static func clone(from src: String, to dst: String) -> Bool {
+    // `cp -c` clones on APFS. The destination must not exist yet. The copy is made under a hidden name and
+    // renamed at the end, so a copy cut short (quit, crash, full disk) is never taken for a profile folder.
+    static func clone(from source: String, to dst: String) -> Result<Void, UpdateError> {
         let fm = FileManager.default
-        guard fm.fileExists(atPath: src), !fm.fileExists(atPath: dst) else { return false }
-        do { try Updater.run("/bin/cp", ["-cR", src, dst]) } catch {
-            try? fm.removeItem(atPath: dst)
-            return false
+        // The source may be the link left by a folder rename; copy the folder it points to.
+        let src = URL(fileURLWithPath: source).resolvingSymlinksInPath().path
+        guard fm.fileExists(atPath: src), !fm.fileExists(atPath: dst) else { return .failure(.command("source missing or destination taken")) }
+        let parent = URL(fileURLWithPath: dst).deletingLastPathComponent().path
+        let partial = parent + "/.partial-" + UUID().uuidString
+        do { try Updater.run("/bin/cp", ["-cR", src, partial]) } catch {
+            try? fm.removeItem(atPath: partial)
+            return .failure(error as? UpdateError ?? .command("\(error)"))
         }
         // Electron's single-instance lock files belong to the source process.
         for lock in ["SingletonLock", "SingletonSocket", "SingletonCookie"] {
-            try? fm.removeItem(atPath: dst + "/" + lock)
+            try? fm.removeItem(atPath: partial + "/" + lock)
         }
-        return true
+        do { try fm.moveItem(atPath: partial, toPath: dst) } catch {
+            try? fm.removeItem(atPath: partial)
+            return .failure(.command(error.localizedDescription))
+        }
+        return .success(())
     }
 }
 
@@ -1187,12 +1432,14 @@ enum UpdateWatch {
 
 // Reads a process's argv through sysctl, so no `ps` has to run.
 enum ProcArgs {
-    static func of(_ pid: pid_t) -> [String] {
+    // nil when the arguments can't be read (the process is exiting, or belongs to someone else), which
+    // callers must not take for "started without --user-data-dir".
+    static func of(_ pid: pid_t) -> [String]? {
         var mib = [CTL_KERN, KERN_PROCARGS2, pid]
         var size = 0
-        guard sysctl(&mib, 3, nil, &size, nil, 0) == 0, size > 4 else { return [] }
+        guard sysctl(&mib, 3, nil, &size, nil, 0) == 0, size > 4 else { return nil }
         var buf = [UInt8](repeating: 0, count: size)
-        guard sysctl(&mib, 3, &buf, &size, nil, 0) == 0 else { return [] }
+        guard sysctl(&mib, 3, &buf, &size, nil, 0) == 0, size > 4 else { return nil }
         let argc = buf.withUnsafeBytes { $0.load(as: Int32.self) }
         var i = 4
         while i < size && buf[i] != 0 { i += 1 }   // executable path
@@ -1302,7 +1549,10 @@ enum AppIcon {
     }
 
     static func claudeTinted(_ side: CGFloat, color: NSColor) -> NSImage? {
-        let src = NSWorkspace.shared.icon(forFile: realClaudeApp().path)
+        // icon(forFile:) hands back a generic app icon for a missing path; the letter tile is better then.
+        let claude = realClaudeApp()
+        guard FileManager.default.fileExists(atPath: claude.appendingPathComponent("Contents/Info.plist").path) else { return nil }
+        let src = NSWorkspace.shared.icon(forFile: claude.path)
         var rect = NSRect(x: 0, y: 0, width: side, height: side)
         guard let cg = src.cgImage(forProposedRect: &rect, context: nil, hints: nil) else { return nil }
         let orange = NSColor.claude.usingColorSpace(.sRGB)!, target = color.usingColorSpace(.sRGB) ?? color
@@ -1320,10 +1570,32 @@ enum AppIcon {
         return NSImage(cgImage: out, size: NSSize(width: side, height: side))
     }
 
+    // The profile icon as a Finder custom icon: one 8-bit sRGB bitmap per icns size. NSWorkspace.setIcon
+    // faults inside IconServices when given a single large rep (seen on macOS 27), so every size is explicit.
+    static func finderIcon(color: NSColor, letter: String) -> NSImage {
+        let art = claudeTinted(1024, color: color)
+        let icon = NSImage(size: NSSize(width: 512, height: 512))
+        for (pt, scale) in [16, 32, 128, 256, 512].flatMap({ pt in [(pt, 1), (pt, 2)] }) {
+            let px = pt * scale
+            guard let rep = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: px, pixelsHigh: px, bitsPerSample: 8,
+                                             samplesPerPixel: 4, hasAlpha: true, isPlanar: false, colorSpaceName: .calibratedRGB,
+                                             bytesPerRow: 0, bitsPerPixel: 0)?.retagging(with: .sRGB) else { continue }
+            NSGraphicsContext.saveGraphicsState()
+            NSGraphicsContext.current = NSGraphicsContext(bitmapImageRep: rep)
+            NSGraphicsContext.current?.imageInterpolation = .high
+            (art ?? tile(CGFloat(px), color: color, letter: letter)).draw(in: NSRect(x: 0, y: 0, width: px, height: px))
+            NSGraphicsContext.restoreGraphicsState()
+            rep.size = NSSize(width: pt, height: pt)
+            icon.addRepresentation(rep)
+        }
+        return icon
+    }
+
     static func png(_ image: NSImage, pixels px: Int) -> Data? {
-        let rep = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: px, pixelsHigh: px,
-                                   bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false,
-                                   colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0)!
+        guard let rep = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: px, pixelsHigh: px,
+                                         bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false,
+                                         colorSpaceName: .calibratedRGB, bytesPerRow: 0, bitsPerPixel: 0)?.retagging(with: .sRGB)
+        else { return nil }
         NSGraphicsContext.saveGraphicsState()
         NSGraphicsContext.current = NSGraphicsContext(bitmapImageRep: rep)
         image.draw(in: NSRect(x: 0, y: 0, width: px, height: px))
@@ -1410,7 +1682,7 @@ enum Runtimes {
     static func ensure(_ p: Profile, from claude: URL, running: (URL) -> Bool = isRunning) -> URL? {
         let fm = FileManager.default
         let want = target(p)
-        guard let source = version(claude) else { return current(p.id) }
+        guard let sourceVersion = version(claude) else { return current(p.id) }
         if var rt = current(p.id) {
             if running(rt) {
                 // Only the icon can change under a running copy: it sits outside the bundle's code.
@@ -1424,7 +1696,7 @@ enum Runtimes {
             if rt.lastPathComponent != want.lastPathComponent, (try? fm.moveItem(at: rt, to: want)) != nil { rt = want }
             let current = version(rt) ?? ""
             let stamped = (try? String(contentsOf: stampURL(p.id), encoding: .utf8)) ?? ""
-            if stamped.hasPrefix("\(format)|"), current == source || Updater.isNewer(current, than: source) {
+            if stamped.hasPrefix("\(format)|"), current == sourceVersion || Updater.isNewer(current, than: sourceVersion) {
                 if stamped == stamp(p, version: current) && hasLook(rt) { return rt }
                 applyLook(p, to: rt, version: current)
                 return rt
@@ -1433,8 +1705,16 @@ enum Runtimes {
         }
         try? fm.createDirectory(at: dir(p.id), withIntermediateDirectories: true)
         // clonefile copies the whole bundle as one APFS clone; it fails rather than copy on other volumes.
-        guard clonefile(claude.path, want.path, 0) == 0 else { return nil }
-        applyLook(p, to: want, version: source)
+        let source = claude.resolvingSymlinksInPath()
+        guard clonefile(source.path, want.path, 0) == 0 else {
+            let why = String(cString: strerror(errno))
+            Log.write("profile copy for \(p.name) not made (\(why)); it runs from Claude.app")
+            if (try? fm.contentsOfDirectory(atPath: dir(p.id).path))?.filter({ $0 != "stamp" }).isEmpty == true {
+                try? fm.removeItem(at: dir(p.id))
+            }
+            return nil
+        }
+        applyLook(p, to: want, version: sourceVersion)
         return want
     }
 
@@ -1445,10 +1725,11 @@ enum Runtimes {
 
     static func applyLook(_ p: Profile, to app: URL, version: String, register: Bool = true) {
         let fm = FileManager.default
-        let ok = NSWorkspace.shared.setIcon(AppIcon.profile(1024, color: p.nsTint, letter: p.initial), forFile: app.path, options: [])
+        let ok = NSWorkspace.shared.setIcon(AppIcon.finderIcon(color: p.nsTint, letter: p.initial), forFile: app.path, options: [])
         Log.write("profile copy \(app.lastPathComponent): icon \(ok ? "set" : "FAILED"), Claude \(version)")
         try? fm.setAttributes([.modificationDate: Date()], ofItemAtPath: app.path)
         if register { LSRegisterURL(app as CFURL, true) }
+        // Written even when the icon failed: ensure() also checks hasLook, so a closed copy tries again.
         try? Data(stamp(p, version: version).utf8).write(to: stampURL(p.id))
     }
 
@@ -1484,8 +1765,11 @@ enum Launchers {
 
     // "Claude Work" -> "Claude Work.app", with the characters Finder can't show in a name replaced.
     static func fileName(_ name: String) -> String {
-        let clean = name.replacingOccurrences(of: "/", with: "-").replacingOccurrences(of: ":", with: "-")
+        var clean = String(String.UnicodeScalarView(name.unicodeScalars.filter { !CharacterSet.controlCharacters.contains($0) }))
+            .replacingOccurrences(of: "/", with: "-").replacingOccurrences(of: ":", with: "-")
             .trimmingCharacters(in: .whitespacesAndNewlines.union(CharacterSet(charactersIn: ".")))
+        // File names stop at 255 bytes; leave room for ".app", a " 2" and the hidden temporary names.
+        while clean.utf8.count > 200 { clean.removeLast() }
         return (clean.isEmpty ? "Claude" : clean) + ".app"
     }
 
@@ -1495,7 +1779,7 @@ enum Launchers {
             + (p.dir.map { "exec /usr/bin/open -n -a \"$app\" --args \(shellQuote("--user-data-dir=" + $0))" } ?? "exec /usr/bin/open -a \"$app\"")
         return """
         #!/bin/sh
-        # Made by MultiClaude for the profile \(shellQuote(p.name)). MultiClaude rewrites this app; edits are lost.
+        # Made by MultiClaude for the profile \(shellQuote(String(p.name.filter { !$0.isNewline }))). MultiClaude rewrites this app; edits are lost.
         /usr/bin/open -g "multiclaude://open?profile=\(p.id.uuidString)" 2>/dev/null && exit 0
         \(fallback)
 
@@ -1530,7 +1814,8 @@ enum Launchers {
 
     // The profile apps in `folder`, by profile. Other apps a user puts there are left alone.
     static func installed(in folder: URL) -> [UUID: URL] {
-        let items = (try? FileManager.default.contentsOfDirectory(at: folder, includingPropertiesForKeys: nil)) ?? []
+        let items = (try? FileManager.default.contentsOfDirectory(at: folder, includingPropertiesForKeys: nil,
+                                                                  options: [.skipsHiddenFiles])) ?? []
         var out: [UUID: URL] = [:]
         for app in items where app.pathExtension == "app" {
             guard let info = readInfo(app), (info["CFBundleIdentifier"] as? String)?.hasPrefix(idPrefix) == true,
@@ -1545,6 +1830,7 @@ enum Launchers {
         let fm = FileManager.default
         let tmp = dest.deletingLastPathComponent().appendingPathComponent(".\(p.id.uuidString).tmp.app")
         try? fm.removeItem(at: tmp)
+        defer { try? fm.removeItem(at: tmp) }   // left over only when a step below failed
         let contents = tmp.appendingPathComponent("Contents")
         try fm.createDirectory(at: contents.appendingPathComponent("MacOS"), withIntermediateDirectories: true)
         try fm.createDirectory(at: contents.appendingPathComponent("Resources"), withIntermediateDirectories: true)
@@ -1573,27 +1859,63 @@ enum Launchers {
         var have = installed(in: folder)
         for (id, url) in have where !profiles.contains(where: { $0.id == id }) {
             if (try? fm.removeItem(at: url)) != nil { result.removed.append(url) }
+            else { Log.write("profile app \(url.lastPathComponent): couldn't remove it") }
             have[id] = nil
+        }
+        // Hidden apps left by a run cut short (see write and the renames below).
+        for name in (try? fm.contentsOfDirectory(atPath: folder.path)) ?? []
+        where name.hasPrefix(".") && (name.hasSuffix(".tmp.app") || name.hasSuffix(".move.app")) {
+            guard let id = UUID(uuidString: String(name.dropFirst().prefix(36))), have[id] == nil else { continue }
+            let url = folder.appendingPathComponent(name)
+            if name.hasSuffix(".move.app"), profiles.contains(where: { $0.id == id }) { have[id] = url } else { try? fm.removeItem(at: url) }
         }
         guard !profiles.isEmpty else { return result }
         try? fm.createDirectory(at: folder, withIntermediateDirectories: true)
         var taken: Set<String> = ["claude.app"]   // never shadow Claude itself
+        var names: [UUID: String] = [:]
         for p in profiles {
             // Two profiles can't share a file name; the later one gets a number.
+            // The base is shortened first so the number survives fileName's length cap.
             var name = p.dockAppName, n = 2
-            while taken.contains(fileName(name).lowercased()) { name = "\(p.dockAppName) \(n)"; n += 1 }
+            var base = p.dockAppName
+            while base.utf8.count > 180 { base.removeLast() }
+            while taken.contains(fileName(name).lowercased()) {
+                name = n < 1000 ? "\(base) \(n)" : "\(base) \(p.id.uuidString.prefix(8))"
+                n += 1
+            }
             taken.insert(fileName(name).lowercased())
+            names[p.id] = name
+        }
+        // Apps that change name step aside under a hidden name first, so two profiles can swap names
+        // (after a reorder) without each one finding the other's app in its way.
+        var origin: [UUID: URL] = [:]
+        for p in profiles {
+            guard let current = have[p.id], let name = names[p.id],
+                  current.lastPathComponent != fileName(name) else { continue }
+            let aside = folder.appendingPathComponent(".\(p.id.uuidString).move.app")
+            if current.lastPathComponent == aside.lastPathComponent { continue }   // already aside from a cut-short run
+            try? fm.removeItem(at: aside)
+            if (try? fm.moveItem(at: current, to: aside)) != nil { origin[p.id] = current; have[p.id] = aside }
+        }
+        for p in profiles {
+            guard let name = names[p.id] else { continue }
             let dest = folder.appendingPathComponent(fileName(name))
             if let current = have[p.id] {
                 let same = current.standardizedFileURL == dest.standardizedFileURL
                 if same, readInfo(current)?["MCStamp"] as? String == stamp(for: p, name: name) { continue }
                 if !same {
-                    // Free the new name first if another profile's old app still sits there.
-                    if fm.fileExists(atPath: dest.path) && current.lastPathComponent.lowercased() != dest.lastPathComponent.lowercased() {
+                    let from = origin[p.id] ?? current
+                    if fm.fileExists(atPath: dest.path) {
+                        // Something MultiClaude didn't make holds the name: put the app back and report it.
+                        if let back = origin[p.id] { try? fm.moveItem(at: current, to: back) }
+                        Log.write("profile app \(dest.lastPathComponent): the name is taken by another file")
                         result.failed.append(p.name); continue
                     }
-                    do { try fm.moveItem(at: current, to: dest); result.moved.append((current, dest)) }
-                    catch { result.failed.append(p.name); continue }
+                    do { try fm.moveItem(at: current, to: dest); result.moved.append((from, dest)) }
+                    catch {
+                        Log.write("profile app \(dest.lastPathComponent): \(error.localizedDescription)")
+                        result.failed.append(p.name); continue
+                    }
                 }
             } else if fm.fileExists(atPath: dest.path) {
                 result.failed.append(p.name); continue   // a file MultiClaude didn't make; leave it
@@ -1601,7 +1923,10 @@ enum Launchers {
             do {
                 try write(p, name: name, to: dest)
                 if have[p.id] != nil { result.rewritten.append(dest) }
-            } catch { result.failed.append(p.name) }
+            } catch {
+                Log.write("profile app \(dest.lastPathComponent): \(error.localizedDescription)")
+                result.failed.append(p.name)
+            }
         }
         return result
     }
@@ -1611,9 +1936,13 @@ enum Launchers {
 // for its own profile apps, and only when the user pins one or one of them moves or goes away.
 enum Dock {
     static let domain = "com.apple.dock" as CFString
+    // Tiles taken off for an icon refresh and not put back yet; run at quit so they're never lost.
+    nonisolated(unsafe) static var pendingRestore: (() -> Void)?
 
-    static func entries() -> [[String: Any]] {
-        CFPreferencesCopyAppValue("persistent-apps" as CFString, domain) as? [[String: Any]] ?? []
+    // nil when the Dock's list can't be read; writing then would replace every pinned app.
+    static func entries() -> [[String: Any]]? {
+        guard let value = CFPreferencesCopyAppValue("persistent-apps" as CFString, domain) else { return [] }
+        return value as? [[String: Any]]
     }
 
     static func path(of entry: [String: Any]) -> String? {
@@ -1629,26 +1958,27 @@ enum Dock {
     }
 
     static func contains(_ app: URL) -> Bool {
-        entries().contains { path(of: $0) == app.standardizedFileURL.path }
+        (entries() ?? []).contains { path(of: $0) == app.standardizedFileURL.path }
     }
 
-    private static func write(_ list: [[String: Any]]) {
+    @discardableResult
+    private static func write(_ list: [[String: Any]]) -> Bool {
         CFPreferencesSetAppValue("persistent-apps" as CFString, list as CFArray, domain)
-        CFPreferencesAppSynchronize(domain)
+        guard CFPreferencesAppSynchronize(domain) else { Log.write("Dock: couldn't save its app list"); return false }
         // The Dock reads its tiles at start only.
         let p = Process()
         p.executableURL = URL(fileURLWithPath: "/usr/bin/killall")
         p.arguments = ["Dock"]
         try? p.run()
+        return true
     }
 
     @discardableResult
     static func add(_ app: URL) -> Bool {
-        if contains(app) { return true }
-        var list = entries()
+        guard var list = entries() else { Log.write("Dock: app list unreadable, not adding \(app.lastPathComponent)"); return false }
+        if list.contains(where: { path(of: $0) == app.standardizedFileURL.path }) { return true }
         list.append(entry(for: app))
-        write(list)
-        return true
+        return write(list)
     }
 
     // Points moved apps' tiles at their new path and drops the tiles of removed apps.
@@ -1658,9 +1988,10 @@ enum Dock {
         let gone = Set(removed.map(\.standardizedFileURL.path))
         let moves = Dictionary(moved.map { ($0.from.standardizedFileURL.path, $0.to) }, uniquingKeysWith: { a, _ in a })
         let redo = Set(refresh.map(\.standardizedFileURL.path))
+        guard let current = entries() else { Log.write("Dock: app list unreadable, left as it is"); return }
         var changed = false, refreshing = false
         var list: [[String: Any]] = [], without: [[String: Any]] = []
-        for e in entries() {
+        for e in current {
             guard let p = path(of: e) else { list.append(e); without.append(e); continue }
             if gone.contains(p) { changed = true; continue }
             let to = moves[p]
@@ -1673,7 +2004,20 @@ enum Dock {
         }
         guard refreshing else { if changed { write(list) }; return }
         write(without)
-        DispatchQueue.main.asyncAfter(deadline: .now() + 3) { write(list) }   // once the Dock is back up
+        // Once the Dock is back up, put the tiles back where they were. Re-read first so a change the user
+        // made in between stays; only our own tiles are re-inserted.
+        let back = list
+        pendingRestore = {
+            pendingRestore = nil
+            guard var now = entries() else { return }
+            let have = Set(now.compactMap(path(of:)))
+            for (i, e) in back.enumerated() {
+                guard let p = path(of: e), redo.contains(p), !have.contains(p) else { continue }
+                now.insert(e, at: min(i, now.count))
+            }
+            write(now)
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 3) { pendingRestore?() }
     }
 }
 
@@ -1979,6 +2323,7 @@ struct PlainRow: View {
 
 struct MenuView: View {
     @ObservedObject var engine = Engine.shared
+    @ObservedObject var panel = PanelController.shared
     @AppStorage("profilesOpen") private var profilesOpen = true
     @AppStorage("settingsOpen") private var settingsOpen = false
     @State private var editing: UUID?
@@ -2026,7 +2371,7 @@ struct MenuView: View {
             if profilesOpen {
                 VStack(spacing: 0) {
                     ForEach(engine.profiles) { ProfileRow(profile: $0, editing: $editing) }
-                    NewProfileRow()
+                    NewProfileRow().id(panel.closed)
                 }
                 .padding(.horizontal, 6)
                 .padding(.bottom, 5)
@@ -2051,6 +2396,8 @@ struct MenuView: View {
             .padding(.vertical, 5)
         }
         .frame(width: 300)
+        .onChange(of: panel.closed) { editing = nil }
+        .onExitCommand { PanelController.shared.close() }
         .fixedSize(horizontal: false, vertical: true)
         .onGeometryChange(for: CGSize.self, of: { $0.size }) { size in
             DispatchQueue.main.async { PanelController.shared.resize(to: size) }
@@ -2066,7 +2413,7 @@ final class KeyPanel: NSPanel {
 }
 
 @MainActor
-final class PanelController {
+final class PanelController: ObservableObject {
     static let shared = PanelController()
 
     private var panel: KeyPanel?
@@ -2101,7 +2448,9 @@ final class PanelController {
         panel?.orderOut(nil)
         if let monitor { NSEvent.removeMonitor(monitor) }
         monitor = nil
+        closed += 1   // drops a half-typed rename or new profile, so the panel reopens clean
     }
+    @Published var closed = 0
 
     func resize(to size: CGSize) {
         guard let panel, size.height > 0 else { return }
@@ -2285,6 +2634,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationWillTerminate(_ n: Notification) {
+        Dock.pendingRestore?()
         LinkRelay.giveBack()
         if Engine.shared.isOn(.quitWithApp) && !Updater.relaunching { Engine.shared.quitAll() }
     }
@@ -2312,7 +2662,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             b.image?.isTemplate = true
         }
         if let front {
-            b.title = " " + front.name
+            b.title = " " + (front.name.count > 18 ? front.name.prefix(17) + "…" : front.name)
         } else {
             b.title = count > 0 && engine.isOn(.showCount) ? " \(count)" : ""
         }
@@ -2424,10 +2774,11 @@ if args.count == 2, args[1] == "--selftest-profiles" {
     try? FileManager.default.createDirectory(at: src.appendingPathComponent("Local Storage"), withIntermediateDirectories: true)
     try? Data("chats".utf8).write(to: src.appendingPathComponent("Local Storage/db"))
     try? FileManager.default.createSymbolicLink(atPath: src.appendingPathComponent("SingletonLock").path, withDestinationPath: "host-123")
-    check("clone succeeds", Duplicate.clone(from: src.path, to: dst.path))
+    check("clone succeeds", (try? Duplicate.clone(from: src.path, to: dst.path).get()) != nil)
     check("clone copies data", (try? String(contentsOf: dst.appendingPathComponent("Local Storage/db"), encoding: .utf8)) == "chats")
     check("clone drops lock", (try? FileManager.default.destinationOfSymbolicLink(atPath: dst.appendingPathComponent("SingletonLock").path)) == nil)
-    check("clone refuses existing destination", !Duplicate.clone(from: src.path, to: dst.path))
+    check("clone refuses existing destination", (try? Duplicate.clone(from: src.path, to: dst.path).get()) == nil)
+    check("clone leaves no partial folder", !((try? FileManager.default.contentsOfDirectory(atPath: tmp.path)) ?? []).contains { $0.hasPrefix(".partial-") })
     let pa = Profile(name: "A", dir: tmp.appendingPathComponent("Claude-A").path)
     let pb = Profile(name: "B", dir: tmp.appendingPathComponent("Claude-B").path)
     try? FileManager.default.createDirectory(atPath: pa.dir!, withIntermediateDirectories: true)
@@ -2451,11 +2802,55 @@ if args.count == 2, args[1] == "--selftest-profiles" {
     check("target follows the name", tgt == sup + "/Claude-Augura")
     check("no target when already aligned", Folders.target(for: "Moonsun", current: sup + "/Claude-Moonsun", in: sup) == nil)
     check("no target onto another profile's folder", Folders.target(for: "Moonsun", current: sup + "/Claude-Work", in: sup) == nil)
-    check("move succeeds", Folders.move(sup + "/Claude-Work", to: sup + "/Claude-Augura"))
+    check("move succeeds", Folders.move(sup + "/Claude-Work", to: sup + "/Claude-Augura") == .moved)
     check("old path is a symlink to the new one", (try? FileManager.default.destinationOfSymbolicLink(atPath: sup + "/Claude-Work")) == sup + "/Claude-Augura")
     check("candidates skip the symlink", Folders.candidates(in: sup).map { URL(fileURLWithPath: $0).lastPathComponent } == ["Claude-Augura", "Claude-Moonsun"])
     check("canonical resolves the old path", Folders.canonical(sup + "/Claude-Work") == Folders.canonical(sup + "/Claude-Augura"))
     check("no target onto a leftover symlink", Folders.target(for: "Work", current: sup + "/Claude-Augura", in: sup) == nil)
+    check("canonical ignores case", Folders.canonical(sup + "/claude-augura") == Folders.canonical(sup + "/Claude-Augura"))
+    check("a missing move source fails cleanly", Folders.move(sup + "/Claude-Nope", to: sup + "/Claude-Nope2") != .moved
+          && !FileManager.default.fileExists(atPath: sup + "/Claude-Nope2"))
+    let lockDir = sup + "/Claude-Moonsun"
+    try? FileManager.default.createSymbolicLink(atPath: lockDir + "/SingletonLock", withDestinationPath: "host-\(ProcessInfo.processInfo.processIdentifier)")
+    check("a lock held by a live process is in use", Folders.inUse(lockDir))
+    try? FileManager.default.removeItem(atPath: lockDir + "/SingletonLock")
+    try? FileManager.default.createSymbolicLink(atPath: lockDir + "/SingletonLock", withDestinationPath: "host-99999999")
+    check("a lock left by a dead process is not", !Folders.inUse(lockDir))
+    // MCP: a broken source is refused, an empty one leaves the target alone.
+    try? Data("not json".utf8).write(to: MCP.configURL(pa))
+    let pc = Profile(name: "C", dir: tmp.appendingPathComponent("Claude-C").path)
+    try? FileManager.default.createDirectory(atPath: pc.dir!, withIntermediateDirectories: true)
+    var refusedSource = false
+    do { _ = try MCP.copy(from: pa, to: pc) } catch MCP.Failure.unreadable(.source) { refusedSource = true } catch {}
+    check("copy refuses a broken source file", refusedSource && !FileManager.default.fileExists(atPath: MCP.configURL(pc).path))
+    try? Data(#"{"preferences":{}}"#.utf8).write(to: MCP.configURL(pa))
+    check("copy with no servers writes nothing", (try? MCP.copy(from: pa, to: pc)) == 0 && !FileManager.default.fileExists(atPath: MCP.configURL(pc).path))
+    // A saved list from another version: missing fields fall back instead of losing every profile.
+    let saved = #"[{"id":"6F1C2D3E-0000-4000-8000-000000000001","name":"Work","dir":"/x/Claude-Work","color":2,"future":true},{"dir":"/x/Claude-Old"}]"#
+    let decoded = try? JSONDecoder().decode([Profile].self, from: Data(saved.utf8))
+    check("lenient decode keeps known profiles", decoded?.count == 2 && decoded?[0].name == "Work" && decoded?[0].color == 2
+          && decoded?[0].id.uuidString == "6F1C2D3E-0000-4000-8000-000000000001")
+    check("lenient decode names a profile from its folder", decoded?[1].name == "Old")
+    check("a profile with a malformed folder fails the list instead of becoming the default",
+          (try? JSONDecoder().decode([Profile].self, from: Data(#"[{"name":"X","dir":42}]"#.utf8))) == nil)
+    // The alias must give Claude the folder exactly, quotes and dollar signs included.
+    let quoted = Profile(name: "Q", dir: "/x/it's $HOME/Claude-Q")
+    let sh = Process(), out = Pipe()
+    sh.executableURL = URL(fileURLWithPath: "/bin/zsh")
+    sh.arguments = ["-fc", quoted.shellAlias + "\nfunction open { print -r -- \"${@[-1]}\" }\neval q"]
+    sh.standardOutput = out
+    try? sh.run(); sh.waitUntilExit()
+    check("alias passes an odd folder through intact",
+          String(decoding: out.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self) == "--user-data-dir=/x/it's $HOME/Claude-Q\n")
+    check("alias stays readable for a plain folder", Profile(name: "W", dir: "/x/Claude-W").shellAlias
+          == #"alias w='open -n -a "Claude" --args --user-data-dir="/x/Claude-W"'"#)
+    check("alias has a name even for a name without letters", Profile(name: "---", dir: "/x/Claude-z").shellAlias.hasPrefix("alias claude"))
+    check("log keeps only the first path segment", Log.redact("claude://claude.ai/login/SECRET?code=1#t") == "claude://claude.ai/login/…"
+          && Log.redact("claude://claude.ai/new") == "claude://claude.ai/new")
+    check("update URLs must be plain github.com release paths",
+          Updater.trusted("https://github.com/QuentinCar0n/multiclaude/releases/download/v1/x.zip") != nil
+          && Updater.trusted("https://github.com/QuentinCar0n/multiclaude/releases/download/../../../evil/x.zip") == nil
+          && Updater.trusted("https://github.com:8443/QuentinCar0n/multiclaude/releases/download/v1/x.zip") == nil)
     try? FileManager.default.removeItem(at: tmp)
     exit(ok ? 0 : 1)
 }
@@ -2575,6 +2970,22 @@ if args.count == 2, args[1] == "--selftest-launchers" {
     let ownerURL = Runtimes.dir(rp.id).appendingPathComponent("Claude X.app")
     check("a copy's bundle names its profile", Runtimes.owner(of: ownerURL) == rp.id
           && Runtimes.owner(of: URL(fileURLWithPath: "/Applications/Claude.app")) == nil)
+    // Two profiles with the same app name swap places in the list: their apps swap names instead of failing.
+    let swapDir = tmp.appendingPathComponent("swap")
+    var s1 = Profile(name: "S1", dir: "/tmp/Claude-S1", color: 1), s2 = Profile(name: "S2", dir: "/tmp/Claude-S2", color: 2)
+    s1.appName = "Claude Same"; s2.appName = "Claude Same"
+    _ = MainActor.assumeIsolated { Launchers.sync([s1, s2], in: swapDir) }
+    r = MainActor.assumeIsolated { Launchers.sync([s2, s1], in: swapDir) }
+    let swapped = Launchers.installed(in: swapDir)
+    check("reordered twins swap app names", r.failed.isEmpty && swapped[s2.id]?.lastPathComponent == "Claude Same.app"
+          && swapped[s1.id]?.lastPathComponent == "Claude Same 2.app")
+    check("no hidden leftovers after a swap", !((try? fm.contentsOfDirectory(atPath: swapDir.path)) ?? []).contains { $0.hasPrefix(".") })
+    check("a very long name still makes a valid file name", Launchers.fileName(String(repeating: "é", count: 300)).utf8.count <= 204
+          && Launchers.fileName("A\nB") == "AB.app")
+    var long1 = Profile(name: "L1", dir: "/tmp/Claude-L1", color: 1), long2 = Profile(name: "L2", dir: "/tmp/Claude-L2", color: 2)
+    long1.appName = String(repeating: "x", count: 250); long2.appName = long1.appName
+    r = MainActor.assumeIsolated { Launchers.sync([long1, long2], in: tmp.appendingPathComponent("long")) }
+    check("two identical long app names both get an app", r.failed.isEmpty && Launchers.installed(in: tmp.appendingPathComponent("long")).count == 2)
     let entry = Dock.entry(for: URL(fileURLWithPath: "/Users/x/Applications/MultiClaude Launchers/Claude Work.app"))
     check("dock entry round-trips its path", Dock.path(of: entry) == "/Users/x/Applications/MultiClaude Launchers/Claude Work.app")
     try? fm.removeItem(at: tmp)
@@ -2593,7 +3004,8 @@ if args.count == 3, args[1] == "--export-profile-icon" {   // --export-profile-i
     exit(0)
 }
 if args.count == 2, args[1] == "--selftest-version" {
-    let cases = [("1.2", "1.1", true), ("1.10", "1.9", true), ("1.2", "1.2", false), ("1.2", "1.2.1", false), ("2.0", "1.9.9", true)]
+    let cases = [("1.2", "1.1", true), ("1.10", "1.9", true), ("1.2", "1.2", false), ("1.2", "1.2.1", false), ("2.0", "1.9.9", true),
+                 ("1.5", "1.5-rc1", true), ("1.5-rc1", "1.5", false), ("1.4", "1.5-rc1", false), ("1.5-rc1", "1.4", true)]
     var ok = true
     for (a, b, want) in cases {
         let got = Updater.isNewer(a, than: b)

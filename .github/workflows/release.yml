@@ -28,6 +28,8 @@ jobs:
         id: version
         run: |
           if [[ "$GITHUB_REF_TYPE" == "tag" ]]; then v="${GITHUB_REF_NAME#v}"; else v="0.0.0-ci"; fi
+          # The version lands in file names, Info.plist and the cask, so only plain versions get through.
+          [[ "$v" =~ ^[0-9]+(\.[0-9]+)*(-[0-9A-Za-z.]+)?$ ]] || { echo "Bad version '$v' from tag $GITHUB_REF_NAME"; exit 1; }
           echo "VERSION=$v" >> "$GITHUB_ENV"
           echo "version=$v" >> "$GITHUB_OUTPUT"
           echo "BUILD=${{ github.run_number }}" >> "$GITHUB_ENV"
@@ -58,7 +60,7 @@ jobs:
       contents: write
     env:
       VERSION: ${{ needs.build.outputs.version }}
-      TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+      HAS_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN != '' }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
@@ -90,12 +92,21 @@ jobs:
 
           **Install:** `brew install --cask quentincar0n/tap/multiclaude`, or unzip and move MultiClaude.app to Applications. The app is not notarized, so right-click it and choose Open the first time.
           NOTES
-          pre=(); [[ "$VERSION" == *-* ]] && pre=(--prerelease)
+          flags=()
+          if [[ "$VERSION" == *-* ]]; then
+            flags=(--prerelease)
+          else
+            # A fix tagged on an older line must not become "latest": installed copies and the cask follow latest.
+            newest=$(git ls-remote --tags origin 'v*' | sed -E 's|.*refs/tags/v||; /\^\{\}$/d; /-/d' | sort -t. -k1,1n -k2,2n -k3,3n | tail -n 1)
+            if [[ "$newest" != "$VERSION" ]]; then flags=(--latest=false); echo "IS_LATEST=false" >> "$GITHUB_ENV"; fi
+          fi
           gh release create "$GITHUB_REF_NAME" "build/MultiClaude-$VERSION.zip" "build/MultiClaude-$VERSION.zip.sig" \
-            --title "MultiClaude $VERSION" --notes-file build/notes.md "${pre[@]}"
+            --title "MultiClaude $VERSION" --notes-file build/notes.md "${flags[@]}"
 
       - name: Bump Homebrew cask
-        if: env.TAP_TOKEN != '' && !contains(env.VERSION, '-')
+        if: env.HAS_TAP_TOKEN == 'true' && !contains(env.VERSION, '-') && env.IS_LATEST != 'false'
+        env:
+          TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}   # only this step sees the token
         run: |
           SHA=$(cut -d' ' -f1 build/sha256.txt)
           git clone "https://x-access-token:${TAP_TOKEN}@github.com/QuentinCar0n/homebrew-tap.git" tap
