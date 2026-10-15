@@ -6,6 +6,9 @@ import SwiftUI
 import ServiceManagement
 import Carbon.HIToolbox
 import CryptoKit
+import IOKit.pwr_mgt
+import IOKit.ps
+import UserNotifications
 
 let appVersion = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "1.0"
 let websiteURL = URL(string: "https://somalabs.me")!
@@ -155,6 +158,7 @@ enum Seed {
 
 enum Setting: String, CaseIterable, Identifiable {
     case launchAtLogin, autoUpdate, routeSignIn, reopenAfterUpdate, shortcut, profileShortcuts, showActive, showCount, coloredIcon, dockApps, quitWithApp
+    case reverseMouse, reverseTrackpad
 
     static let onByDefault: Set<Setting> = [.autoUpdate, .routeSignIn, .reopenAfterUpdate, .showActive, .showCount]
 
@@ -173,6 +177,8 @@ enum Setting: String, CaseIterable, Identifiable {
         case .coloredIcon: "Colored Menu Bar Icon"
         case .dockApps: "App for Each Profile"
         case .quitWithApp: "Quit Profiles with MultiClaude"
+        case .reverseMouse: "Reverse Mouse Scroll"
+        case .reverseTrackpad: "Reverse Trackpad Scroll"
         }
     }
 
@@ -189,6 +195,8 @@ enum Setting: String, CaseIterable, Identifiable {
         case .coloredIcon: "paintpalette"
         case .dockApps: "dock.rectangle"
         case .quitWithApp: "xmark.circle"
+        case .reverseMouse: "computermouse"
+        case .reverseTrackpad: "rectangle.and.hand.point.up.left"
         }
     }
 
@@ -334,14 +342,20 @@ final class Engine: ObservableObject {
         if s == .shortcut || s == .profileShortcuts { updateHotKeys() }
         if s == .routeSignIn { on ? holdLinks() : LinkRelay.giveBack() }
         if s == .dockApps { syncLaunchers() }
+        if s == .reverseMouse || s == .reverseTrackpad { updateScroll() }
         onChange?()
     }
 
-    // ⌃⌥⌘M opens the panel; ⌃⌥1 to ⌃⌥9 open or focus the profiles in list order.
+    func updateScroll() { ScrollReverser.update(mouse: isOn(.reverseMouse), trackpad: isOn(.reverseTrackpad)) }
+
+    // ⌃⌥⌘M opens the panel; ⌃⌥⌘A turns keep-awake on or off; ⌃⌥1 to ⌃⌥9 open or focus the profiles in list order.
     func updateHotKeys() {
         var keys: [HotKey.Binding] = []
         if isOn(.shortcut) {
             keys.append(.init(key: kVK_ANSI_M, mods: cmdKey | optionKey | controlKey) { Engine.shared.onPanelHotKey?() })
+        }
+        if Awake.shared.isOn(.shortcut) {
+            keys.append(.init(key: kVK_ANSI_A, mods: cmdKey | optionKey | controlKey) { Awake.shared.toggleActive() })
         }
         if isOn(.profileShortcuts) {
             for (i, p) in profiles.prefix(9).enumerated() {
@@ -507,6 +521,11 @@ final class Engine: ObservableObject {
     // Matches each Claude process to a profile through its --user-data-dir argument.
     func refresh() {
         guard !isDemo else { return }
+        if isOn(.reverseMouse) || isOn(.reverseTrackpad) {
+            let before = (ScrollReverser.cocaineMouse, ScrollReverser.cocaineTrackpad)
+            updateScroll()
+            if before != (ScrollReverser.cocaineMouse, ScrollReverser.cocaineTrackpad) { objectWillChange.send() }
+        }
         var found: [UUID: NSRunningApplication] = [:]
         for app in NSWorkspace.shared.runningApplications where app.bundleIdentifier == claudeBundleID && !app.isTerminated {
             guard let args = ProcArgs.of(app.processIdentifier) else {
@@ -1113,7 +1132,7 @@ enum Updater {
     // Waits while the panel is open or a sign-in is relaying links (a restart would drop it). The new copy
     // starts once this process is gone, so `open` can't just bring the old one forward.
     @MainActor static func relaunchWhenIdle(version: String, app: URL) {
-        guard !PanelController.shared.isOpen, Engine.shared.signIn == nil else {
+        guard !PanelController.shared.isOpen, Engine.shared.signIn == nil, !Awake.shared.lidApplied else {
             DispatchQueue.main.asyncAfter(deadline: .now() + 30) { relaunchWhenIdle(version: version, app: app) }
             return
         }
@@ -1126,6 +1145,7 @@ enum Updater {
             return
         }
         UserDefaults.standard.set(version, forKey: "updatedTo")
+        Awake.shared.saveForRelaunch()
         relaunching = true
         NSApp.terminate(nil)
     }
@@ -1492,6 +1512,324 @@ enum HotKey {
                 refs.append(ref)
                 actions[UInt32(i + 1)] = b.action
             }
+        }
+    }
+}
+
+// MARK: - Keep awake and scroll direction (ported from Cocaine)
+
+enum AwakeSetting: String, CaseIterable, Identifiable {
+    case activateAtLaunch, leftClick, shortcut, allowDisplaySleep, lidClosed
+    case notifications, powerConnect, powerDisconnect, lowBattery
+
+    var id: String { rawValue }
+    var key: String { "awake." + rawValue }   // apart from MultiClaude's own settings of the same name
+
+    var title: String {
+        switch self {
+        case .activateAtLaunch: "Activate at Launch"
+        case .leftClick: "Activate with Left Click"
+        case .shortcut: "Keyboard Shortcut"
+        case .allowDisplaySleep: "Allow Display Sleep"
+        case .lidClosed: "Keep Awake with Lid Closed"
+        case .notifications: "Notify When It Turns Off"
+        case .powerConnect: "Activate on Power Connect"
+        case .powerDisconnect: "Deactivate on Power Disconnect"
+        case .lowBattery: "Deactivate When Below 20%"
+        }
+    }
+
+    var symbol: String {
+        switch self {
+        case .activateAtLaunch: "switch.2"
+        case .leftClick: "cursorarrow.click"
+        case .shortcut: "command"
+        case .allowDisplaySleep: "moon"
+        case .lidClosed: "laptopcomputer.and.arrow.down"
+        case .notifications: "bell"
+        case .powerConnect: "bolt"
+        case .powerDisconnect: "bolt.slash"
+        case .lowBattery: "battery.25"
+        }
+    }
+
+    var hint: String? {
+        switch self {
+        case .shortcut: "⌃⌥⌘A"
+        default: nil
+        }
+    }
+}
+
+// Holds an IOKit power assertion for a chosen duration or until turned off, like `caffeinate`.
+@MainActor
+final class Awake: ObservableObject {
+    static let shared = Awake()
+
+    @Published private(set) var active = false
+    @Published private(set) var minutes: Int
+    @Published private(set) var endDate: Date?
+    @Published private(set) var tick = Date()
+
+    private let defaults = UserDefaults.standard
+    private var assertion: IOPMAssertionID = 0
+    private var holding = false
+    private(set) var lidApplied = false
+    private var timer: Timer?
+    private var powerSource: CFRunLoopSource?
+    private var lastOnAC = true
+
+    private init() {
+        minutes = defaults.object(forKey: "awake.minutes") as? Int ?? 0
+    }
+
+    func boot() {
+        lastOnAC = Power.snapshot().onAC
+        powerSource = IOPSNotificationCreateRunLoopSource({ _ in
+            MainActor.assumeIsolated { Awake.shared.powerChanged() }
+        }, nil)?.takeRetainedValue()
+        if let powerSource { CFRunLoopAddSource(CFRunLoopGetMain(), powerSource, .defaultMode) }
+        // A self-update restart picks the keep-awake back up where it was.
+        if let resume = defaults.object(forKey: "awake.resume") as? Double {
+            defaults.removeObject(forKey: "awake.resume")
+            if resume == 0 { start(until: nil) }
+            else if resume > Date().timeIntervalSince1970 { start(until: Date(timeIntervalSince1970: resume)) }
+        } else if isOn(.activateAtLaunch) {
+            activate()
+        }
+    }
+
+    // Called just before a self-update restart.
+    func saveForRelaunch() {
+        guard active else { return }
+        defaults.set(endDate?.timeIntervalSince1970 ?? 0, forKey: "awake.resume")
+    }
+
+    func isOn(_ s: AwakeSetting) -> Bool { defaults.bool(forKey: s.key) }
+
+    func toggle(_ s: AwakeSetting) {
+        let on = !isOn(s)
+        objectWillChange.send()
+        if s == .notifications && on {
+            UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { _, _ in }
+        }
+        defaults.set(on, forKey: s.key)
+        if s == .shortcut { Engine.shared.updateHotKeys() }
+        if s == .allowDisplaySleep && holding { takeAssertion() }
+        if s == .lidClosed && active { setLid(on) }
+        Engine.shared.onChange?()
+    }
+
+    func activate(minutes m: Int? = nil) {
+        if let m { setMinutes(m) }
+        start(until: minutes == 0 ? nil : Date().addingTimeInterval(TimeInterval(minutes * 60)))
+    }
+
+    private func start(until end: Date?) {
+        guard takeAssertion() else { return }
+        if isOn(.lidClosed) && !lidApplied { setLid(true) }
+        active = true
+        endDate = end
+        timer?.invalidate()
+        timer = Timer(timeInterval: 1, repeats: true) { _ in
+            MainActor.assumeIsolated { Awake.shared.onTick() }
+        }
+        RunLoop.main.add(timer!, forMode: .common)
+        Engine.shared.onChange?()
+    }
+
+    func deactivate(reason: String? = nil) {
+        guard active || holding || lidApplied else { return }
+        if holding { IOPMAssertionRelease(assertion) }
+        holding = false
+        if lidApplied { setLid(false) }
+        active = false
+        endDate = nil
+        timer?.invalidate()
+        timer = nil
+        if let reason, isOn(.notifications) { notify(reason) }
+        Engine.shared.onChange?()
+    }
+
+    func toggleActive() { active ? deactivate() : activate() }
+
+    func setMinutes(_ m: Int) {
+        minutes = m
+        defaults.set(m, forKey: "awake.minutes")
+    }
+
+    var durationLabel: String {
+        if minutes == 0 { return "∞" }
+        let h = minutes / 60, m = minutes % 60
+        if h == 0 { return "\(m)min" }
+        return m == 0 ? "\(h)hr" : "\(h)hr \(m)min"
+    }
+
+    var remainingText: String? {
+        guard active else { return nil }
+        guard let endDate else { return "Until turned off" }
+        let s = max(0, Int(endDate.timeIntervalSince(tick)))
+        let h = s / 3600, m = (s % 3600) / 60, sec = s % 60
+        return h > 0 ? String(format: "%d:%02d:%02d left", h, m, sec) : String(format: "%d:%02d left", m, sec)
+    }
+
+    @discardableResult
+    private func takeAssertion() -> Bool {
+        if holding { IOPMAssertionRelease(assertion) }
+        let type = (isOn(.allowDisplaySleep)
+            ? kIOPMAssertionTypePreventUserIdleSystemSleep
+            : kIOPMAssertionTypePreventUserIdleDisplaySleep) as CFString
+        holding = IOPMAssertionCreateWithName(type, IOPMAssertionLevel(kIOPMAssertionLevelOn),
+                                              "MultiClaude keep-awake" as CFString, &assertion) == kIOReturnSuccess
+        if !holding { NSSound.beep(); Log.write("keep-awake: power assertion refused") }
+        return holding
+    }
+
+    private func onTick() {
+        tick = Date()
+        if let endDate, tick >= endDate { deactivate(reason: "Time is up, your Mac can sleep again.") }
+    }
+
+    // Lid-closed awake needs `pmset disablesleep`, which only root can set. macOS asks for the password.
+    private func setLid(_ on: Bool) {
+        let src = "do shell script \"/usr/bin/pmset -a disablesleep \(on ? 1 : 0)\" with administrator privileges"
+        var err: NSDictionary?
+        NSAppleScript(source: src)?.executeAndReturnError(&err)
+        if err == nil { lidApplied = on }
+    }
+
+    private func powerChanged() {
+        let p = Power.snapshot()
+        if p.onAC != lastOnAC {
+            lastOnAC = p.onAC
+            if p.onAC && isOn(.powerConnect) && !active { activate() }
+            if !p.onAC && isOn(.powerDisconnect) && active { deactivate(reason: "Power disconnected.") }
+        }
+        if !p.onAC, active, isOn(.lowBattery), let pct = p.percent, pct < 20 {
+            deactivate(reason: "Battery below 20%.")
+        }
+    }
+
+    private func notify(_ body: String) {
+        let c = UNMutableNotificationContent()
+        c.title = "Keep Awake is off"
+        c.body = body
+        UNUserNotificationCenter.current().add(UNNotificationRequest(identifier: UUID().uuidString, content: c, trigger: nil))
+    }
+}
+
+enum Power {
+    static func snapshot() -> (onAC: Bool, percent: Int?) {
+        guard let info = IOPSCopyPowerSourcesInfo()?.takeRetainedValue() else { return (true, nil) }
+        let type = IOPSGetProvidingPowerSourceType(info)?.takeUnretainedValue() as String?
+        var pct: Int?
+        if let list = IOPSCopyPowerSourcesList(info)?.takeRetainedValue() as? [CFTypeRef] {
+            for ps in list {
+                guard let d = IOPSGetPowerSourceDescription(info, ps)?.takeUnretainedValue() as? [String: Any],
+                      let cur = d[kIOPSCurrentCapacityKey] as? Int, let max = d[kIOPSMaxCapacityKey] as? Int, max > 0
+                else { continue }
+                pct = cur * 100 / max
+            }
+        }
+        return (type == kIOPMACPowerKey, pct)
+    }
+}
+
+// Cocaine, the keep-awake app this part comes from, may run next to MultiClaude. Two scroll reversers
+// would flip each event twice, so MultiClaude leaves a direction alone while Cocaine already reverses it.
+enum Cocaine {
+    static let bundleID = "me.somalabs.cocaine"
+
+    static func reverses(mouse: Bool) -> Bool {
+        guard !NSRunningApplication.runningApplications(withBundleIdentifier: bundleID).isEmpty else { return false }
+        CFPreferencesAppSynchronize(bundleID as CFString)
+        return CFPreferencesGetAppBooleanValue((mouse ? "reverseMouse" : "reverseTrackpad") as CFString, bundleID as CFString, nil)
+    }
+}
+
+// Flips scroll direction through a session event tap, which needs Accessibility permission.
+// Wheel mice send line-based (non-continuous) events; trackpads send continuous ones.
+// A Magic Mouse also sends continuous events, so it follows the trackpad switch.
+@MainActor
+enum ScrollReverser {
+    // What the flip applies: the setting, minus any direction Cocaine already reverses.
+    nonisolated(unsafe) static var reverseMouse = false
+    nonisolated(unsafe) static var reverseTrackpad = false
+    nonisolated(unsafe) static var tap: CFMachPort?
+    static var source: CFRunLoopSource?
+    static var waitTimer: Timer?
+    static var cocaineMouse = false
+    static var cocaineTrackpad = false
+
+    static func update(mouse: Bool, trackpad: Bool) {
+        cocaineMouse = mouse && Cocaine.reverses(mouse: true)
+        cocaineTrackpad = trackpad && Cocaine.reverses(mouse: false)
+        reverseMouse = mouse && !cocaineMouse
+        reverseTrackpad = trackpad && !cocaineTrackpad
+        guard reverseMouse || reverseTrackpad else { stop(); return }
+        guard tap == nil else { return }
+        let prompt = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
+        if AXIsProcessTrustedWithOptions(prompt) {
+            start()
+        } else if waitTimer == nil {
+            // Install the tap as soon as the person grants access in System Settings.
+            waitTimer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { _ in
+                MainActor.assumeIsolated {
+                    guard AXIsProcessTrusted() else { return }
+                    waitTimer?.invalidate()
+                    waitTimer = nil
+                    if reverseMouse || reverseTrackpad { start() }
+                    Engine.shared.objectWillChange.send()
+                }
+            }
+        }
+    }
+
+    // Shown next to the setting when it can't act yet.
+    static func hint(mouse: Bool) -> String? {
+        if mouse ? cocaineMouse : cocaineTrackpad { return "on in Cocaine" }
+        if (mouse ? reverseMouse : reverseTrackpad) && tap == nil { return "needs Accessibility" }
+        return nil
+    }
+
+    private static func start() {
+        let mask = CGEventMask(1) << CGEventType.scrollWheel.rawValue
+        tap = CGEvent.tapCreate(tap: .cgSessionEventTap, place: .headInsertEventTap, options: .defaultTap,
+                                eventsOfInterest: mask, callback: { _, type, event, _ in
+            if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
+                if let t = ScrollReverser.tap { CGEvent.tapEnable(tap: t, enable: true) }
+            } else if type == .scrollWheel {
+                ScrollReverser.flip(event)
+            }
+            return Unmanaged.passUnretained(event)
+        }, userInfo: nil)
+        guard let tap else { NSSound.beep(); Log.write("scroll: event tap refused"); return }
+        source = CFMachPortCreateRunLoopSource(nil, tap, 0)
+        CFRunLoopAddSource(CFRunLoopGetMain(), source, .commonModes)
+        CGEvent.tapEnable(tap: tap, enable: true)
+    }
+
+    private static func stop() {
+        waitTimer?.invalidate()
+        waitTimer = nil
+        if let tap { CGEvent.tapEnable(tap: tap, enable: false) }
+        if let source { CFRunLoopRemoveSource(CFRunLoopGetMain(), source, .commonModes) }
+        tap = nil
+        source = nil
+    }
+
+    nonisolated static func flip(_ e: CGEvent) {
+        let continuous = e.getIntegerValueField(.scrollWheelEventIsContinuous) != 0
+        guard continuous ? reverseTrackpad : reverseMouse else { return }
+        let axes: [(CGEventField, CGEventField, CGEventField)] = [
+            (.scrollWheelEventDeltaAxis1, .scrollWheelEventFixedPtDeltaAxis1, .scrollWheelEventPointDeltaAxis1),
+            (.scrollWheelEventDeltaAxis2, .scrollWheelEventFixedPtDeltaAxis2, .scrollWheelEventPointDeltaAxis2),
+        ]
+        for (line, fixed, point) in axes {
+            let l = e.getIntegerValueField(line), f = e.getDoubleValueField(fixed), p = e.getIntegerValueField(point)
+            e.setIntegerValueField(line, value: -l)
+            e.setDoubleValueField(fixed, value: -f)
+            e.setIntegerValueField(point, value: -p)
         }
     }
 }
@@ -2288,24 +2626,38 @@ struct NewProfileRow: View {
     }
 }
 
-struct SettingRow: View {
-    let setting: Setting
-    @ObservedObject var engine = Engine.shared
+struct ToggleRow: View {
+    let symbol: String
+    let title: String
+    let hint: String?
+    let on: Bool
+    let action: () -> Void
 
     var body: some View {
-        let on = engine.isOn(setting)
         HStack(spacing: 9) {
-            Badge(on: on) { Image(systemName: setting.symbol).font(.system(size: 12, weight: .medium)) }
-            Text(setting.title).font(.system(size: 13)).foregroundStyle(.primary.opacity(on ? 1 : 0.75))
+            Badge(on: on) { Image(systemName: symbol).font(.system(size: 12, weight: .medium)) }
+            Text(title).font(.system(size: 13)).foregroundStyle(.primary.opacity(on ? 1 : 0.75))
             Spacer(minLength: 4)
-            if let hint = setting.hint {
+            if let hint {
                 Text(hint).font(.system(size: 10)).foregroundStyle(.tertiary)
             }
         }
         .padding(.horizontal, 8)
         .padding(.vertical, 5)
         .modifier(HoverBackground(radius: 8))
-        .onTapGesture { engine.toggle(setting) }
+        .onTapGesture(perform: action)
+    }
+}
+
+struct SettingRow: View {
+    let setting: Setting
+    @ObservedObject var engine = Engine.shared
+
+    var body: some View {
+        let scrollHint = setting == .reverseMouse || setting == .reverseTrackpad
+            ? ScrollReverser.hint(mouse: setting == .reverseMouse) : nil
+        ToggleRow(symbol: setting.symbol, title: setting.title, hint: scrollHint ?? setting.hint,
+                  on: engine.isOn(setting)) { engine.toggle(setting) }
     }
 }
 
@@ -2321,11 +2673,172 @@ struct PlainRow: View {
     }
 }
 
+struct Chip<Label: View>: View {
+    let selected: Bool
+    let action: () -> Void
+    @ViewBuilder let label: Label
+    @State private var hover = false
+
+    var body: some View {
+        label
+            .foregroundStyle(selected ? Color.white : Color.primary)
+            .frame(width: 24, height: 24)
+            .background(Circle().fill(selected ? Color.claude : Color.primary.opacity(hover ? 0.2 : 0.12)))
+            .contentShape(Circle())
+            .onHover { hover = $0 }
+            .onTapGesture(perform: action)
+    }
+}
+
+struct Dot: View {
+    var body: some View { Circle().fill(Color.primary.opacity(0.25)).frame(width: 4, height: 4) }
+}
+
+// Duration chips: ∞, 15/30/45 min, 1/2/4/8 h, and a gear that opens a 5 min to 24 h slider.
+struct DurationRow: View {
+    @ObservedObject var awake = Awake.shared
+    @AppStorage("awake.sliderOpen") private var sliderOpen = false
+
+    private func chip(_ m: Int) -> some View {
+        Chip(selected: !sliderOpen && awake.active && awake.minutes == m, action: {
+            sliderOpen = false
+            awake.activate(minutes: m)
+        }) {
+            if m == 0 {
+                Image(systemName: "infinity").font(.system(size: 12, weight: .bold))
+            } else {
+                Text(m < 60 ? "\(m)" : String(format: "%02d", m / 60))
+                    .font(.system(size: 13, weight: .semibold)).fontWidth(.condensed).monospacedDigit()
+            }
+        }
+        .help(m == 0 ? "Until turned off" : m < 60 ? "\(m) minutes" : "\(m / 60) hour\(m == 60 ? "" : "s")")
+    }
+
+    var body: some View {
+        VStack(spacing: 10) {
+            HStack(spacing: 0) {
+                chip(0)
+                Spacer(minLength: 3); Dot(); Spacer(minLength: 3)
+                HStack(spacing: 3) { chip(15); chip(30); chip(45) }
+                Spacer(minLength: 3); Dot(); Spacer(minLength: 3)
+                HStack(spacing: 3) { chip(60); chip(120); chip(240); chip(480) }
+                Spacer(minLength: 3); Dot(); Spacer(minLength: 3)
+                Chip(selected: sliderOpen, action: {
+                    withAnimation(.easeOut(duration: 0.18)) { sliderOpen.toggle() }
+                }) {
+                    Image(systemName: "gearshape.fill").font(.system(size: 12, weight: .semibold))
+                }
+                .help("Custom duration")
+            }
+            if sliderOpen {
+                DurationSlider(minutes: awake.minutes == 0 ? 60 : awake.minutes,
+                               onChange: { awake.setMinutes($0) },
+                               onCommit: { awake.activate(minutes: $0) })
+            }
+        }
+    }
+}
+
+// Custom duration, 5 min to 24 h in 5 min steps. Drag updates the header live, release starts the timer.
+struct DurationSlider: View {
+    static let range = 5...1440
+    let minutes: Int
+    let onChange: (Int) -> Void
+    let onCommit: (Int) -> Void
+
+    private let thumb = CGSize(width: 26, height: 16)
+
+    var body: some View {
+        GeometryReader { g in
+            let w = g.size.width
+            let span = CGFloat(Self.range.upperBound - Self.range.lowerBound)
+            let frac = CGFloat(min(max(minutes, Self.range.lowerBound), Self.range.upperBound) - Self.range.lowerBound) / span
+            let x = frac * (w - thumb.width)
+            ZStack(alignment: .leading) {
+                Capsule().fill(Color.primary.opacity(0.14)).frame(height: 4)
+                Capsule().fill(Color.claude).frame(width: x + thumb.width / 2, height: 4)
+                Capsule().fill(.white)
+                    .frame(width: thumb.width, height: thumb.height)
+                    .shadow(color: .black.opacity(0.3), radius: 1.5, y: 0.5)
+                    .offset(x: x)
+            }
+            .frame(height: 20)
+            .overlay(alignment: .bottom) {
+                Canvas { ctx, size in
+                    var px: CGFloat = thumb.width / 2
+                    while px <= size.width - thumb.width / 2 {
+                        ctx.fill(Path(ellipseIn: CGRect(x: px - 0.75, y: 0, width: 1.5, height: 1.5)),
+                                 with: .color(.primary.opacity(0.25)))
+                        px += 4
+                    }
+                }
+                .frame(height: 2)
+                .offset(y: 1)
+            }
+            .contentShape(Rectangle())
+            .gesture(DragGesture(minimumDistance: 0)
+                .onChanged { v in onChange(value(at: v.location.x, width: w)) }
+                .onEnded { v in onCommit(value(at: v.location.x, width: w)) })
+        }
+        .frame(height: 20)
+        .padding(.bottom, 2)
+    }
+
+    private func value(at x: CGFloat, width w: CGFloat) -> Int {
+        let f = min(max((x - thumb.width / 2) / (w - thumb.width), 0), 1)
+        let steps = Int((f * CGFloat(Self.range.upperBound - Self.range.lowerBound) / 5).rounded())
+        return Self.range.lowerBound + steps * 5
+    }
+}
+
+// The Keep Awake section: a switch, the duration chips, and its own options folded underneath.
+struct AwakeSection: View {
+    @ObservedObject var awake = Awake.shared
+    @AppStorage("awake.optionsOpen") private var optionsOpen = false
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack(spacing: 9) {
+                Badge(on: awake.active) {
+                    Image(systemName: awake.active ? "bolt.fill" : "bolt").font(.system(size: 12, weight: .medium))
+                }
+                Text(awake.active ? "Keeping Your Mac Awake" : "Keep Your Mac Awake").font(.system(size: 13))
+                Spacer(minLength: 4)
+                Toggle("", isOn: Binding(get: { awake.active },
+                                         set: { $0 ? awake.activate() : awake.deactivate() }))
+                    .toggleStyle(.switch).controlSize(.mini).labelsHidden().tint(.claude)
+            }
+            .padding(.horizontal, 8)
+            .padding(.vertical, 5)
+            DurationRow().padding(.horizontal, 8).padding(.top, 4).padding(.bottom, 8)
+            HStack(spacing: 6) {
+                Text("Options").font(.system(size: 12, weight: .medium)).foregroundStyle(.secondary)
+                Image(systemName: "chevron.right")
+                    .font(.system(size: 10, weight: .semibold))
+                    .foregroundStyle(.secondary)
+                    .rotationEffect(.degrees(optionsOpen ? 90 : 0))
+                Spacer()
+            }
+            .padding(.horizontal, 8)
+            .padding(.vertical, 4)
+            .modifier(HoverBackground(radius: 6))
+            .onTapGesture { withAnimation(.easeOut(duration: 0.18)) { optionsOpen.toggle() } }
+            if optionsOpen {
+                ForEach(AwakeSetting.allCases) { s in
+                    ToggleRow(symbol: s.symbol, title: s.title, hint: s.hint, on: awake.isOn(s)) { awake.toggle(s) }
+                }
+            }
+        }
+    }
+}
+
 struct MenuView: View {
     @ObservedObject var engine = Engine.shared
     @ObservedObject var panel = PanelController.shared
     @AppStorage("profilesOpen") private var profilesOpen = true
     @AppStorage("settingsOpen") private var settingsOpen = false
+    @AppStorage("awakeOpen") private var awakeOpen = true
+    @ObservedObject var awake = Awake.shared
     @State private var editing: UUID?
 
     var body: some View {
@@ -2375,6 +2888,12 @@ struct MenuView: View {
                 }
                 .padding(.horizontal, 6)
                 .padding(.bottom, 5)
+            }
+
+            Divider().padding(.horizontal, 14)
+            SectionHeader(title: "Keep Awake (\(awake.durationLabel))", trailing: awake.remainingText, open: $awakeOpen)
+            if awakeOpen {
+                AwakeSection().padding(.horizontal, 6).padding(.bottom, 5)
             }
 
             Divider().padding(.horizontal, 14)
@@ -2578,6 +3097,40 @@ enum AboutWindow {
     }
 }
 
+// The menu bar image: Claude's asterisk, plus a bolt while keep-awake is on. With no color it is a template
+// image, so macOS draws it in the menu bar's own color; with any color both marks are drawn as given.
+@MainActor
+enum MenuBarIcon {
+    static func symbol(_ name: String, _ color: NSColor?) -> NSImage? {
+        let img = NSImage(systemSymbolName: name, accessibilityDescription: nil)
+        guard let color else { return img }
+        return img?.withSymbolConfiguration(.init(paletteColors: [color]))
+    }
+
+    static func make(tint: NSColor?, bolt: NSColor??) -> NSImage? {
+        guard let bolt else {
+            let img = symbol("asterisk", tint)
+            img?.isTemplate = tint == nil
+            img?.accessibilityDescription = "MultiClaude"
+            return img
+        }
+        let template = tint == nil && bolt == nil
+        let colored = !template
+        guard let a = symbol("asterisk", colored ? tint ?? .labelColor : nil),
+              let z = symbol("bolt.fill", colored ? bolt ?? .labelColor : nil) else { return nil }
+        let gap: CGFloat = 2
+        let size = NSSize(width: a.size.width + gap + z.size.width, height: max(a.size.height, z.size.height))
+        let img = NSImage(size: size, flipped: false) { _ in
+            a.draw(in: NSRect(x: 0, y: (size.height - a.size.height) / 2, width: a.size.width, height: a.size.height))
+            z.draw(in: NSRect(x: a.size.width + gap, y: (size.height - z.size.height) / 2, width: z.size.width, height: z.size.height))
+            return true
+        }
+        img.isTemplate = template
+        img.accessibilityDescription = "MultiClaude, keeping your Mac awake"
+        return img
+    }
+}
+
 // MARK: - App
 
 @MainActor
@@ -2615,8 +3168,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             if let b = self?.item.button { PanelController.shared.toggle(below: b) }
         }
         engine.boot()
+        engine.updateScroll()
+        if !isDemo { Awake.shared.boot() }
         refreshIcon()
-        // Preview hook for screenshots: MULTICLAUDE_PREVIEW=panel|settings|about
+        // Preview hook for screenshots: MULTICLAUDE_PREVIEW=panel|settings|awake|about
         switch ProcessInfo.processInfo.environment["MULTICLAUDE_PREVIEW"] {
         case "panel", "settings":
             UserDefaults.standard.set(ProcessInfo.processInfo.environment["MULTICLAUDE_PREVIEW"] == "settings", forKey: "settingsOpen")
@@ -2628,6 +3183,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
                 if let p = Engine.shared.profiles.first(where: { $0.name == name }) { Engine.shared.beginSignIn(p) }
             }
+        case "awake":   // a 1 minute keep-awake with its options open, to check the timer ends on its own
+            UserDefaults.standard.set(true, forKey: "awake.optionsOpen")
+            Awake.shared.activate(minutes: 1)
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+                if let b = self?.item.button { PanelController.shared.open(below: b) }
+            }
         case "about": AboutWindow.show()
         default: break
         }
@@ -2637,30 +3198,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         Dock.pendingRestore?()
         LinkRelay.giveBack()
         if Engine.shared.isOn(.quitWithApp) && !Updater.relaunching { Engine.shared.quitAll() }
+        Awake.shared.deactivate()
     }
 
     @objc private func clicked() {
         guard let button = item.button else { return }
-        PanelController.shared.toggle(below: button)
+        let right = NSApp.currentEvent?.type == .rightMouseUp
+        if Awake.shared.isOn(.leftClick) && !right {
+            Awake.shared.toggleActive()
+        } else {
+            PanelController.shared.toggle(below: button)
+        }
     }
 
     private func refreshIcon() {
         guard let b = item.button else { return }
         let engine = Engine.shared
         let count = engine.runningCount
-        let img = NSImage(systemSymbolName: "asterisk", accessibilityDescription: "MultiClaude")
         // While a Claude window is in front, the menu bar names its account in the profile's color.
         let front = engine.isOn(.showActive) ? engine.profiles.first { $0.id == engine.frontID } : nil
-        if let front {
-            b.image = img?.withSymbolConfiguration(.init(paletteColors: [front.nsTint]))
-            b.image?.isTemplate = false
-        } else if count > 0 && engine.isOn(.coloredIcon) {
-            b.image = img?.withSymbolConfiguration(.init(paletteColors: [.claude]))
-            b.image?.isTemplate = false
-        } else {
-            b.image = img
-            b.image?.isTemplate = true
-        }
+        let tint: NSColor? = front?.nsTint ?? (count > 0 && engine.isOn(.coloredIcon) ? .claude : nil)
+        // Keep-awake adds a bolt next to the asterisk, orange with Colored Menu Bar Icon on.
+        let bolt: NSColor?? = Awake.shared.active ? .some(engine.isOn(.coloredIcon) ? .claude : nil) : .none
+        b.image = MenuBarIcon.make(tint: tint, bolt: bolt)
         if let front {
             b.title = " " + (front.name.count > 18 ? front.name.prefix(17) + "…" : front.name)
         } else {
@@ -3002,6 +3562,43 @@ if args.count == 3, args[1] == "--export-profile-icon" {   // --export-profile-i
         try? rep.representation(using: .png, properties: [:])?.write(to: URL(fileURLWithPath: args[2]))
     }
     exit(0)
+}
+if args.count == 2, args[1] == "--selftest-awake" {
+    // Scroll flip on synthetic wheel (line) and trackpad (continuous) events, and the keep-awake labels.
+    var ok = true
+    func check(_ name: String, _ cond: Bool) { print(cond ? "PASS" : "FAIL", name); ok = ok && cond }
+    func make(_ unit: CGScrollEventUnit, continuous: Bool) -> CGEvent {
+        let e = CGEvent(scrollWheelEvent2Source: nil, units: unit, wheelCount: 2, wheel1: 3, wheel2: -2, wheel3: 0)!
+        e.setIntegerValueField(.scrollWheelEventIsContinuous, value: continuous ? 1 : 0)
+        return e
+    }
+    func y(_ e: CGEvent) -> Int64 { e.getIntegerValueField(.scrollWheelEventDeltaAxis1) }
+    func x(_ e: CGEvent) -> Int64 { e.getIntegerValueField(.scrollWheelEventDeltaAxis2) }
+    func fy(_ e: CGEvent) -> Double { e.getDoubleValueField(.scrollWheelEventFixedPtDeltaAxis1) }
+    for (mouse, pad) in [(true, false), (false, true), (true, true), (false, false)] {
+        ScrollReverser.reverseMouse = mouse
+        ScrollReverser.reverseTrackpad = pad
+        let wheel = make(.line, continuous: false), track = make(.pixel, continuous: true)
+        let (wy, wx, wf, ty, tx) = (y(wheel), x(wheel), fy(wheel), y(track), x(track))
+        ScrollReverser.flip(wheel)
+        ScrollReverser.flip(track)
+        let tag = "mouse=\(mouse) trackpad=\(pad)"
+        check("\(tag): wheel \(mouse ? "flipped" : "kept")", y(wheel) == (mouse ? -wy : wy) && x(wheel) == (mouse ? -wx : wx)
+              && fy(wheel) == (mouse ? -wf : wf))
+        check("\(tag): trackpad \(pad ? "flipped" : "kept")", y(track) == (pad ? -ty : ty) && x(track) == (pad ? -tx : tx))
+    }
+    MainActor.assumeIsolated {
+        let a = Awake.shared
+        let saved = a.minutes
+        for (m, want) in [(0, "∞"), (15, "15min"), (60, "1hr"), (135, "2hr 15min"), (1440, "24hr")] {
+            a.setMinutes(m)
+            check("duration label \(m) = \(want)", a.durationLabel == want)
+        }
+        a.setMinutes(saved)
+        check("not active at start", !a.active && a.remainingText == nil)
+        check("shortcut keys apart from MultiClaude's", Set(AwakeSetting.allCases.map(\.key)).isDisjoint(with: Setting.allCases.map(\.rawValue)))
+    }
+    exit(ok ? 0 : 1)
 }
 if args.count == 2, args[1] == "--selftest-version" {
     let cases = [("1.2", "1.1", true), ("1.10", "1.9", true), ("1.2", "1.2", false), ("1.2", "1.2.1", false), ("2.0", "1.9.9", true),

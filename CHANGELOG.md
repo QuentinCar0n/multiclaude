@@ -1,5 +1,13 @@
 # MultiClaude release notes
 
+## 1.5 (build 10), 2026-10-14
+
+### New
+- **Keep your Mac awake.** A new **Keep Awake** section in the panel holds off sleep until you turn it off, or for 15, 30 or 45 minutes, 1, 2, 4 or 8 hours, or any time from 5 minutes to 24 hours with the slider under the gear. The section header counts down, and a bolt joins the asterisk in the menu bar while it's on. A restart for a MultiClaude update keeps it going. Its **Options**: activate at launch, activate with a left click on the menu bar icon (right-click still opens the panel), a ⌃⌥⌘A shortcut, let the display sleep, stay awake with the lid closed (macOS asks for your password, since it takes `pmset disablesleep`), a notification when it turns off, turn on when power is connected, turn off when it's disconnected or the battery drops below 20%.
+- **Reverse scroll direction**, for a mouse and a trackpad separately, in Settings. A wheel mouse and a trackpad can then each scroll the way you like, which macOS can't do on its own. It needs Accessibility permission (MultiClaude asks the first time, and the setting shows "needs Accessibility" until it's granted). A Magic Mouse follows the trackpad setting.
+
+Both come from Cocaine, our keep-awake app. If Cocaine runs too and already reverses a direction, MultiClaude leaves that direction alone (the setting says "on in Cocaine") so scrolling isn't flipped twice.
+
 ## 1.4.1 (build 9), 2026-10-11
 
 A robustness release: no new features, many ways things could quietly go wrong now can't, or say so.
