@@ -157,15 +157,18 @@ enum Seed {
 // MARK: - Settings
 
 enum Setting: String, CaseIterable, Identifiable {
-    case launchAtLogin, autoUpdate, routeSignIn, reopenAfterUpdate, shortcut, profileShortcuts, showActive, showCount, coloredIcon, dockApps, quitWithApp
+    case manageClaude, launchAtLogin, autoUpdate, routeSignIn, reopenAfterUpdate, shortcut, profileShortcuts, showActive, showCount, coloredIcon, dockApps, quitWithApp
     case reverseMouse, reverseTrackpad
 
-    static let onByDefault: Set<Setting> = [.autoUpdate, .routeSignIn, .reopenAfterUpdate, .showActive, .showCount]
+    static let onByDefault: Set<Setting> = [.manageClaude, .autoUpdate, .routeSignIn, .reopenAfterUpdate, .showActive, .showCount]
+    // Settings that only mean something while MultiClaude manages Claude accounts; hidden when it doesn't.
+    static let claudeOnly: Set<Setting> = [.routeSignIn, .reopenAfterUpdate, .profileShortcuts, .showActive, .showCount, .dockApps, .quitWithApp]
 
     var id: String { rawValue }
 
     var title: String {
         switch self {
+        case .manageClaude: "Manage Claude Accounts"
         case .launchAtLogin: "Launch at Login"
         case .autoUpdate: "Update MultiClaude Automatically"
         case .routeSignIn: "Sign In in Each Account's Window"
@@ -184,6 +187,7 @@ enum Setting: String, CaseIterable, Identifiable {
 
     var symbol: String {
         switch self {
+        case .manageClaude: "person.2"
         case .launchAtLogin: "power"
         case .autoUpdate: "arrow.down.circle"
         case .routeSignIn: "person.badge.key"
@@ -288,7 +292,7 @@ final class Engine: ObservableObject {
                 let launchedClaude = name == NSWorkspace.didLaunchApplicationNotification && launched?.bundleIdentifier == claudeBundleID
                 MainActor.assumeIsolated {
                     // A bare copy can hand off to the default window and quit before refresh() looks.
-                    if launchedClaude, let app = launched, let owner = Engine.shared.runtimeOwner(app), !owner.isDefault,
+                    if launchedClaude, Engine.shared.managing, let app = launched, let owner = Engine.shared.runtimeOwner(app), !owner.isDefault,
                        let args = ProcArgs.of(app.processIdentifier), !args.contains(where: { $0.hasPrefix("--user-data-dir=") }) {
                         Engine.shared.reopenBareCopy(app, of: owner)
                     }
@@ -314,7 +318,7 @@ final class Engine: ObservableObject {
         }, forMode: .common)
         refresh()
         // A restart after a self-update keeps whatever is open; it does not reopen startup profiles.
-        if !isDemo && !afterSelfUpdate {
+        if !isDemo && !afterSelfUpdate && managing {
             DispatchQueue.main.asyncAfter(deadline: .now() + 1) {
                 let e = Engine.shared
                 e.profiles.filter { $0.openAtLaunch == true && !e.isRunning($0) }.forEach(e.open)
@@ -343,7 +347,26 @@ final class Engine: ObservableObject {
         if s == .routeSignIn { on ? holdLinks() : LinkRelay.giveBack() }
         if s == .dockApps { syncLaunchers() }
         if s == .reverseMouse || s == .reverseTrackpad { updateScroll() }
+        if s == .manageClaude { setManaging(on) }
         onChange?()
+    }
+
+    // Off, MultiClaude is a keep-awake and scroll app only: it stops watching Claude, gives the claude://
+    // links back, leaves Claude's windows and folders alone, and hides the profiles. Nothing is deleted.
+    var managing: Bool { isOn(.manageClaude) }
+
+    private func setManaging(_ on: Bool) {
+        Log.write(on ? "managing Claude accounts again" : "stopped managing Claude accounts (keep-awake only)")
+        if on {
+            discoverFolders()
+            holdLinks()
+        } else {
+            if signIn != nil { finishSignIn(cancelled: true) }
+            LinkRelay.giveBack()
+            pending = [:]
+        }
+        updateHotKeys()
+        refresh()
     }
 
     func updateScroll() { ScrollReverser.update(mouse: isOn(.reverseMouse), trackpad: isOn(.reverseTrackpad)) }
@@ -357,7 +380,7 @@ final class Engine: ObservableObject {
         if Awake.shared.isOn(.shortcut) {
             keys.append(.init(key: kVK_ANSI_A, mods: cmdKey | optionKey | controlKey) { Awake.shared.toggleActive() })
         }
-        if isOn(.profileShortcuts) {
+        if managing && isOn(.profileShortcuts) {
             for (i, p) in profiles.prefix(9).enumerated() {
                 let id = p.id
                 keys.append(.init(key: HotKey.digits[i], mods: optionKey | controlKey) {
@@ -400,7 +423,7 @@ final class Engine: ObservableObject {
     // ASWebAuthenticationSession instead of the browser, so every account signs in in its own window.
     // (Claude: "[Auth] Not the claude:// handler; keeping ASWebAuth".)
     func holdLinks() {
-        guard !isDemo, !isCLI, isOn(.routeSignIn) || signIn != nil, !LinkRelay.isOurs() else { return }
+        guard !isDemo, !isCLI, managing, isOn(.routeSignIn) || signIn != nil, !LinkRelay.isOurs() else { return }
         LinkRelay.take { _ in }
     }
 
@@ -467,6 +490,11 @@ final class Engine: ObservableObject {
     func relay(_ link: String) {
         Log.write("link in: \(Log.redact(link)) front=\(NSWorkspace.shared.frontmostApplication?.bundleIdentifier ?? "-") last=\(lastClaudePid.map(String.init) ?? "-")")
         guard link.lowercased().hasPrefix("claude:") else { Log.write("ignored a link that isn't claude://"); return }
+        if !managing, let url = URL(string: link) {
+            LinkRelay.giveBack()
+            NSWorkspace.shared.open([url], withApplicationAt: realClaudeApp(), configuration: NSWorkspace.OpenConfiguration())
+            return
+        }
         if let s = signIn, s.routing, let app = running[s.target], !app.isTerminated, LinkRelay.send(link, to: app.processIdentifier) {
             signIn?.sawBrowser = true
             LinkRelay.bringForward(app)
@@ -525,6 +553,10 @@ final class Engine: ObservableObject {
             let before = (ScrollReverser.cocaineMouse, ScrollReverser.cocaineTrackpad)
             updateScroll()
             if before != (ScrollReverser.cocaineMouse, ScrollReverser.cocaineTrackpad) { objectWillChange.send() }
+        }
+        guard managing else {
+            if !running.isEmpty || frontID != nil { running = [:]; frontID = nil; onChange?() }
+            return
         }
         var found: [UUID: NSRunningApplication] = [:]
         for app in NSWorkspace.shared.runningApplications where app.bundleIdentifier == claudeBundleID && !app.isTerminated {
@@ -2791,26 +2823,15 @@ struct DurationSlider: View {
     }
 }
 
-// The Keep Awake section: a switch, the duration chips, and its own options folded underneath.
+// The Keep Awake section: the duration chips and its own options folded underneath. The bolt in the
+// panel header turns it on and off.
 struct AwakeSection: View {
     @ObservedObject var awake = Awake.shared
     @AppStorage("awake.optionsOpen") private var optionsOpen = false
 
     var body: some View {
         VStack(spacing: 0) {
-            HStack(spacing: 9) {
-                Badge(on: awake.active) {
-                    Image(systemName: awake.active ? "bolt.fill" : "bolt").font(.system(size: 12, weight: .medium))
-                }
-                Text(awake.active ? "Keeping Your Mac Awake" : "Keep Your Mac Awake").font(.system(size: 13))
-                Spacer(minLength: 4)
-                Toggle("", isOn: Binding(get: { awake.active },
-                                         set: { $0 ? awake.activate() : awake.deactivate() }))
-                    .toggleStyle(.switch).controlSize(.mini).labelsHidden().tint(.claude)
-            }
-            .padding(.horizontal, 8)
-            .padding(.vertical, 5)
-            DurationRow().padding(.horizontal, 8).padding(.top, 4).padding(.bottom, 8)
+            DurationRow().padding(.horizontal, 8).padding(.top, 2).padding(.bottom, 8)
             HStack(spacing: 6) {
                 Text("Options").font(.system(size: 12, weight: .medium)).foregroundStyle(.secondary)
                 Image(systemName: "chevron.right")
@@ -2837,7 +2858,7 @@ struct MenuView: View {
     @ObservedObject var panel = PanelController.shared
     @AppStorage("profilesOpen") private var profilesOpen = true
     @AppStorage("settingsOpen") private var settingsOpen = false
-    @AppStorage("awakeOpen") private var awakeOpen = true
+    @AppStorage("awakeOpen") private var awakeOpen = false
     @ObservedObject var awake = Awake.shared
     @State private var editing: UUID?
 
@@ -2847,10 +2868,18 @@ struct MenuView: View {
             HStack {
                 Text("MultiClaude").font(.system(size: 13, weight: .bold))
                 Spacer()
-                Toggle("", isOn: Binding(get: { engine.runningCount > 0 },
-                                         set: { $0 ? engine.openAll() : engine.quitAll() }))
-                    .toggleStyle(.switch).controlSize(.regular).labelsHidden().tint(.claude)
-                    .help("On opens every profile, off quits them all")
+                // Keep-awake on or off at a glance; durations and options are in the section below.
+                Chip(selected: awake.active, action: { awake.toggleActive() }) {
+                    Image(systemName: awake.active ? "bolt.fill" : "bolt").font(.system(size: 12, weight: .semibold))
+                }
+                .help(awake.active ? "Stop keeping your Mac awake" : "Keep your Mac awake")
+                .padding(.trailing, engine.managing ? 6 : 0)
+                if engine.managing {
+                    Toggle("", isOn: Binding(get: { engine.runningCount > 0 },
+                                             set: { $0 ? engine.openAll() : engine.quitAll() }))
+                        .toggleStyle(.switch).controlSize(.regular).labelsHidden().tint(.claude)
+                        .help("On opens every profile, off quits them all")
+                }
             }
             .padding(.horizontal, 14)
             .padding(.top, 10)
@@ -2878,29 +2907,31 @@ struct MenuView: View {
             }
 
             Divider().padding(.horizontal, 14)
-            SectionHeader(title: "Profiles (\(engine.profiles.count))",
-                          trailing: engine.runningCount > 0 ? "\(engine.runningCount) running" : "None running",
-                          open: $profilesOpen)
-            if profilesOpen {
-                VStack(spacing: 0) {
-                    ForEach(engine.profiles) { ProfileRow(profile: $0, editing: $editing) }
-                    NewProfileRow().id(panel.closed)
-                }
-                .padding(.horizontal, 6)
-                .padding(.bottom, 5)
-            }
-
-            Divider().padding(.horizontal, 14)
             SectionHeader(title: "Keep Awake (\(awake.durationLabel))", trailing: awake.remainingText, open: $awakeOpen)
             if awakeOpen {
                 AwakeSection().padding(.horizontal, 6).padding(.bottom, 5)
+            }
+
+            if engine.managing {
+                Divider().padding(.horizontal, 14)
+                SectionHeader(title: "Profiles (\(engine.profiles.count))",
+                              trailing: engine.runningCount > 0 ? "\(engine.runningCount) running" : "None running",
+                              open: $profilesOpen)
+                if profilesOpen {
+                    VStack(spacing: 0) {
+                        ForEach(engine.profiles) { ProfileRow(profile: $0, editing: $editing) }
+                        NewProfileRow().id(panel.closed)
+                    }
+                    .padding(.horizontal, 6)
+                    .padding(.bottom, 5)
+                }
             }
 
             Divider().padding(.horizontal, 14)
             SectionHeader(title: "Settings", open: $settingsOpen)
             if settingsOpen {
                 VStack(spacing: 0) {
-                    ForEach(Setting.allCases) { SettingRow(setting: $0) }
+                    ForEach(Setting.allCases.filter { engine.managing || !Setting.claudeOnly.contains($0) }) { SettingRow(setting: $0) }
                 }
                 .padding(.horizontal, 6)
                 .padding(.bottom, 5)
@@ -2953,7 +2984,7 @@ final class PanelController: ObservableObject {
         let x = min(max(b.minX - 12, screen.visibleFrame.minX + 6), screen.visibleFrame.maxX - width - 6)
         anchor = NSPoint(x: x, y: b.minY - 6)
         resize(to: host?.fittingSize ?? NSSize(width: width, height: 300))
-        Engine.shared.discoverFolders()
+        if Engine.shared.managing { Engine.shared.discoverFolders() }
         Engine.shared.refresh()
         p.makeKeyAndOrderFront(nil)
         monitor = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown]) { _ in
@@ -3197,7 +3228,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationWillTerminate(_ n: Notification) {
         Dock.pendingRestore?()
         LinkRelay.giveBack()
-        if Engine.shared.isOn(.quitWithApp) && !Updater.relaunching { Engine.shared.quitAll() }
+        if Engine.shared.managing && Engine.shared.isOn(.quitWithApp) && !Updater.relaunching { Engine.shared.quitAll() }
         Awake.shared.deactivate()
     }
 
@@ -3596,6 +3627,9 @@ if args.count == 2, args[1] == "--selftest-awake" {
         }
         a.setMinutes(saved)
         check("not active at start", !a.active && a.remainingText == nil)
+        check("keep-awake-only mode keeps its way back and the scroll settings",
+              Setting.claudeOnly.isDisjoint(with: [.manageClaude, .reverseMouse, .reverseTrackpad, .launchAtLogin, .autoUpdate]))
+        check("managing Claude is on by default", Setting.onByDefault.contains(.manageClaude))
         check("shortcut keys apart from MultiClaude's", Set(AwakeSetting.allCases.map(\.key)).isDisjoint(with: Setting.allCases.map(\.rawValue)))
     }
     exit(ok ? 0 : 1)

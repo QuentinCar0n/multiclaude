@@ -76,6 +76,7 @@ MultiClaude is that trick with a proper interface.
 - **Folders follow names.** Rename a profile and its folder becomes `Claude-<Name>` the next time that account is closed. A link stays at the old path, so old aliases and Claude's own saved paths keep working.
 - **Sign-in that lands in the right window.** Claude's Google and SSO sign-in normally comes back to whichever Claude window opened first. MultiClaude makes each account sign in inside its own window, with nothing to click first.
 - **Keep your Mac awake.** The **Keep Awake** section holds off sleep until you turn it off or for a set time (15 minutes to 8 hours, or anything up to 24 hours on the slider), with a countdown and a bolt in the menu bar. Options cover the display, a closed lid, power and battery triggers, a left-click toggle and ⌃⌥⌘A. Handy for long Claude Code runs.
+- **Keep-awake only, if you like.** Turn off **Manage Claude Accounts** and MultiClaude leaves Claude alone and keeps just the keep-awake and scroll features. Your profiles wait for you to turn it back on.
 - **Scroll your own way.** Reverse the scroll direction of a mouse and a trackpad separately, in Settings (needs Accessibility permission).
 - **Global shortcuts.** ⌃⌥⌘M opens the panel; turn on Profile Shortcuts and ⌃⌥1 to ⌃⌥9 jump straight to each account.
 - **Updates itself.** Once a day MultiClaude checks for a new release, installs it in the background and restarts while the panel is closed. Your Claude windows stay open.
