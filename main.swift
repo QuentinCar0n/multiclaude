@@ -2217,7 +2217,32 @@ final class Usage: ObservableObject {
     private var timer: Timer?
     private var limitsAt: Date?
 
+    // Sample numbers for README and website screenshots (MULTICLAUDE_DEMO=1): six months, busier on weekdays.
+    func loadDemo() {
+        let cal = Calendar.current
+        var rng: UInt64 = 42
+        func next() -> Double { rng = rng &* 6364136223846793005 &+ 1442695040888963407; return Double(rng >> 33) / Double(1 << 31) }
+        var out: [String: [String: [String: UsageTotals]]] = [:]
+        let profiles = Engine.shared.profiles
+        for back in 0..<180 {
+            guard let day = cal.date(byAdding: .day, value: -back, to: Date()) else { continue }
+            let weekend = cal.isDateInWeekend(day)
+            for (i, p) in profiles.enumerated() {
+                let r = next()
+                guard r > (weekend ? 0.6 : 0.15) + Double(i) * 0.12 else { continue }
+                let scale = (1.0 - Double(i) * 0.22) * (0.3 + r) * (back < 90 ? 1.0 : 0.55)
+                let o = Int(160_000 * scale)
+                let model = r > 0.8 ? "claude-sonnet-5-5" : "claude-opus-5-5"
+                out[UsageScan.dayFormat.string(from: day), default: [:]][p.id.uuidString] =
+                    [model: UsageTotals(input: o / 30, output: o, cacheWrite: o * 6, cacheRead: o * 90, messages: max(1, o / 420))]
+            }
+        }
+        days = out
+        lastScan = Date()
+    }
+
     func start() {
+        if isDemo { loadDemo(); return }
         guard timer == nil else { return }
         timer = Timer(timeInterval: 120, repeats: true) { _ in MainActor.assumeIsolated { Usage.shared.refresh() } }
         RunLoop.main.add(timer!, forMode: .common)
@@ -2230,6 +2255,7 @@ final class Usage: ObservableObject {
     }
 
     func refresh(force: Bool = false) {
+        guard !isDemo else { return }
         let e = Engine.shared
         if e.isOn(.trackUsage) && !scanning {
             scanning = true
@@ -3593,7 +3619,7 @@ struct UsageStatsView: View {
 
                 VStack(alignment: .leading, spacing: 10) {
                     HStack {
-                        Text("Last 6 months").font(.headline)
+                        Text("Activity").font(.headline)
                         Spacer()
                         Picker("", selection: $heatOwner) {
                             Text("All accounts").tag("")
@@ -3602,8 +3628,12 @@ struct UsageStatsView: View {
                         }
                         .labelsHidden().frame(width: 150)
                     }
-                    Heatmap(values: usage.perDay(owner: heatOwner.isEmpty ? nil : heatOwner).mapValues(metric.value),
-                            tint: heatOwner.isEmpty ? .claude : Usage.ownerTint(heatOwner), unit: metric.unit)
+                    GeometryReader { g in
+                        Heatmap(values: usage.perDay(owner: heatOwner.isEmpty ? nil : heatOwner).mapValues(metric.value),
+                                tint: heatOwner.isEmpty ? .claude : Usage.ownerTint(heatOwner), unit: metric.unit,
+                                weeks: max(8, min(53, Int(g.size.width / 15))))
+                    }
+                    .frame(height: 150)
                 }
 
                 Text("By model").font(.headline)
@@ -3643,7 +3673,7 @@ struct UsageStatsView: View {
 }
 
 // GitHub-style calendar: one square per day, weeks as columns, darker for busier days.
-// Levels follow the busiest days on a log scale, so one huge day doesn't wash the rest out.
+// Levels are quartiles of the active days, so one huge day doesn't wash the rest out.
 struct Heatmap: View {
     let values: [String: Int]   // yyyy-MM-dd -> value
     let tint: Color
@@ -3657,7 +3687,8 @@ struct Heatmap: View {
         let today = cal.startOfDay(for: Date())
         let thisWeek = cal.dateInterval(of: .weekOfYear, for: today)?.start ?? today
         let start = cal.date(byAdding: .weekOfYear, value: -(weeks - 1), to: thisWeek) ?? today
-        let peak = log1p(Double(values.values.max() ?? 0))
+        let active = values.values.filter { $0 > 0 }.sorted()
+        let cuts = [0.25, 0.5, 0.75].map { q in active.isEmpty ? 0 : active[min(active.count - 1, Int(Double(active.count) * q))] }
         VStack(alignment: .leading, spacing: 6) {
             HStack(alignment: .top, spacing: gap) {
                 ForEach(0..<weeks, id: \.self) { w in
@@ -3671,7 +3702,7 @@ struct Heatmap: View {
                             let key = UsageScan.dayFormat.string(from: day)
                             let v = values[key] ?? 0
                             RoundedRectangle(cornerRadius: 2.5)
-                                .fill(day > today ? Color.clear : color(v, peak: peak))
+                                .fill(day > today ? Color.clear : color(v, cuts: cuts))
                                 .frame(width: cell, height: cell)
                                 .help(day > today ? "" : "\(day.formatted(date: .abbreviated, time: .omitted)): \(v == 0 ? "nothing" : v.formatted() + " " + unit)")
                         }
@@ -3692,10 +3723,9 @@ struct Heatmap: View {
 
     private func level(_ i: Int) -> Color { i == 0 ? Color.primary.opacity(0.07) : tint.opacity([0, 0.3, 0.5, 0.75, 1][i]) }
 
-    private func color(_ v: Int, peak: Double) -> Color {
-        guard v > 0, peak > 0 else { return level(0) }
-        let f = log1p(Double(v)) / peak
-        return level(f > 0.9 ? 4 : f > 0.75 ? 3 : f > 0.55 ? 2 : 1)
+    private func color(_ v: Int, cuts: [Int]) -> Color {
+        guard v > 0 else { return level(0) }
+        return level(1 + cuts.filter { v > $0 }.count)
     }
 }
 
@@ -4187,7 +4217,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         engine.boot()
         engine.updateScroll()
         if !isDemo { Awake.shared.boot() }
-        if !isDemo { Usage.shared.start() }
+        Usage.shared.start()
         refreshIcon()
         // Preview hook for screenshots: MULTICLAUDE_PREVIEW=panel|settings|awake|about
         switch ProcessInfo.processInfo.environment["MULTICLAUDE_PREVIEW"] {

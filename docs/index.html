@@ -1,0 +1,212 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MultiClaude: all your Claude accounts, open at once</title>
+<meta name="description" content="A free, open source menu bar app for macOS that runs several Claude desktop accounts side by side, tracks token usage per account, keeps your Claude Code conversations and keeps your Mac awake.">
+<meta property="og:title" content="MultiClaude">
+<meta property="og:description" content="All your Claude accounts, open at once. Free and open source, for macOS.">
+<meta property="og:image" content="https://quentincar0n.github.io/multiclaude/img/social.png">
+<meta property="og:url" content="https://quentincar0n.github.io/multiclaude/">
+<meta name="twitter:card" content="summary_large_image">
+<link rel="icon" href="img/icon.png">
+<style>
+  :root {
+    --bg: #fbfaf8; --fg: #1d1c1a; --muted: #6b6862; --line: #e7e3dc; --card: #ffffff;
+    --accent: #d97757; --accent-ink: #b85a3b; --code: #f2efe9;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #0f0f0e; --fg: #f1efea; --muted: #a29e96; --line: #272623; --card: #171715; --accent: #d97757; --accent-ink: #e8906f; --code: #1e1d1b; }
+  }
+  * { box-sizing: border-box; }
+  html { -webkit-text-size-adjust: 100%; }
+  body { margin: 0; background: var(--bg); color: var(--fg); font: 17px/1.55 -apple-system, BlinkMacSystemFont, "SF Pro Text", "Helvetica Neue", Arial, sans-serif; -webkit-font-smoothing: antialiased; }
+  a { color: var(--accent-ink); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  .wrap { max-width: 1080px; margin: 0 auto; padding: 0 24px; }
+  nav { display: flex; align-items: center; justify-content: space-between; padding: 18px 0; }
+  nav .brand { display: flex; align-items: center; gap: 10px; font-weight: 650; color: var(--fg); }
+  nav .brand img { width: 28px; height: 28px; }
+  nav .links { display: flex; gap: 22px; font-size: 15px; }
+  nav .links a { color: var(--muted); }
+  header.hero { text-align: center; padding: 56px 0 24px; }
+  h1 { font-size: clamp(40px, 7vw, 72px); line-height: 1.04; letter-spacing: -0.03em; margin: 0 0 18px; font-weight: 700; }
+  h1 span { color: var(--accent); }
+  .lede { font-size: clamp(18px, 2.3vw, 22px); color: var(--muted); max-width: 640px; margin: 0 auto 30px; }
+  .cta { display: flex; flex-wrap: wrap; gap: 12px; justify-content: center; align-items: center; }
+  .btn { display: inline-flex; align-items: center; gap: 8px; padding: 12px 22px; border-radius: 999px; font-weight: 600; font-size: 16px; }
+  .btn.primary { background: var(--accent); color: #fff; }
+  .btn.primary:hover { text-decoration: none; filter: brightness(1.05); }
+  .btn.ghost { border: 1px solid var(--line); color: var(--fg); }
+  .btn.ghost:hover { text-decoration: none; background: var(--code); }
+  .brew { display: inline-flex; align-items: center; gap: 10px; margin-top: 18px; background: var(--code); border: 1px solid var(--line); border-radius: 12px; padding: 10px 10px 10px 16px; font: 14px/1.4 ui-monospace, "SF Mono", Menlo, monospace; max-width: 100%; }
+  .brew code { overflow-x: auto; white-space: nowrap; }
+  .brew button { border: 0; background: var(--card); color: var(--fg); border-radius: 8px; padding: 6px 10px; font: 600 13px -apple-system, sans-serif; cursor: pointer; border: 1px solid var(--line); }
+  .meta { color: var(--muted); font-size: 14px; margin-top: 14px; }
+  .shot { margin: 44px auto 0; }
+  .shot img { width: 100%; height: auto; display: block; border-radius: 14px; }
+  section { padding: 72px 0; border-top: 1px solid var(--line); }
+  h2 { font-size: clamp(28px, 4vw, 40px); letter-spacing: -0.02em; line-height: 1.1; margin: 0 0 14px; }
+  .sub { color: var(--muted); max-width: 680px; margin: 0 0 36px; font-size: 18px; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 16px; }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 16px; padding: 22px; }
+  .card h3 { margin: 0 0 6px; font-size: 18px; }
+  .card p { margin: 0; color: var(--muted); font-size: 15.5px; }
+  .card .dot { display: inline-block; width: 10px; height: 10px; border-radius: 50%; background: var(--accent); margin-right: 8px; vertical-align: 1px; }
+  .split { display: grid; grid-template-columns: 1fr 1fr; gap: 48px; align-items: center; }
+  .split img { width: 100%; height: auto; border-radius: 14px; display: block; }
+  .split.narrow-img { grid-template-columns: 1.3fr 1fr; }
+  .split.narrow-img img { max-width: 340px; margin: 0 auto; }
+  ul.plain { padding-left: 1.1em; margin: 0; color: var(--muted); }
+  ul.plain li { margin: 6px 0; }
+  ul.plain strong { color: var(--fg); font-weight: 600; }
+  table { width: 100%; border-collapse: collapse; font-size: 15px; }
+  th, td { text-align: left; padding: 10px 12px; border-bottom: 1px solid var(--line); vertical-align: top; }
+  th { color: var(--muted); font-weight: 600; }
+  td:first-child { color: var(--muted); }
+  .steps { counter-reset: s; display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 16px; }
+  .steps .card::before { counter-increment: s; content: counter(s); display: inline-grid; place-items: center; width: 28px; height: 28px; border-radius: 50%; background: var(--accent); color: #fff; font-weight: 700; font-size: 14px; margin-bottom: 10px; }
+  pre { background: var(--code); border: 1px solid var(--line); border-radius: 10px; padding: 12px 14px; overflow-x: auto; font: 13.5px/1.5 ui-monospace, "SF Mono", Menlo, monospace; margin: 10px 0 0; }
+  footer { border-top: 1px solid var(--line); padding: 36px 0 60px; color: var(--muted); font-size: 14px; }
+  footer .row { display: flex; flex-wrap: wrap; gap: 18px; justify-content: space-between; }
+  @media (max-width: 760px) {
+    .split, .split.narrow-img { grid-template-columns: 1fr; gap: 28px; }
+    nav .links { display: none; }
+    section { padding: 56px 0; }
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <nav>
+    <a class="brand" href="./"><img src="img/icon.png" alt="">MultiClaude</a>
+    <div class="links">
+      <a href="#features">Features</a>
+      <a href="#usage">Usage</a>
+      <a href="#install">Install</a>
+      <a href="#privacy">Privacy</a>
+      <a href="https://github.com/QuentinCar0n/multiclaude">GitHub</a>
+    </div>
+  </nav>
+
+  <header class="hero">
+    <h1>All your Claude accounts,<br><span>open at once.</span></h1>
+    <p class="lede">A free menu bar app for macOS. Run your personal, work and client Claude accounts side by side, see what each one uses, and keep every Claude Code conversation.</p>
+    <div class="cta">
+      <a class="btn primary" href="https://github.com/QuentinCar0n/multiclaude/releases/latest">Download for macOS</a>
+      <a class="btn ghost" href="https://github.com/QuentinCar0n/multiclaude">View on GitHub</a>
+    </div>
+    <div class="brew"><code id="brew">brew install --cask quentincar0n/tap/multiclaude</code><button type="button" id="copy">Copy</button></div>
+    <p class="meta">macOS 15 or later · Apple silicon and Intel · Apache 2.0</p>
+    <div class="shot">
+      <picture>
+        <source media="(prefers-color-scheme: dark)" srcset="img/hero-dark.png">
+        <img src="img/hero-light.png" alt="The MultiClaude panel dropping from the menu bar, listing Personal, Work, Client and Research accounts, with their Claude windows open behind it." width="1600" height="900">
+      </picture>
+    </div>
+  </header>
+
+  <section>
+    <h2>Claude signs in to one account at a time.</h2>
+    <p class="sub">Plenty of people have more than one: a personal plan and a work seat, one organization per client, a test account. Switching means signing out, waiting for the email code and losing your place. Claude does accept a separate data folder per copy, and power users wire that into shell aliases. MultiClaude is that trick with a proper interface.</p>
+    <table>
+      <tr><th></th><th>Shell aliases</th><th>MultiClaude</th></tr>
+      <tr><td>Open an account</td><td>type its alias in a terminal</td><td>one click in the menu bar</td></tr>
+      <tr><td>See which accounts are open</td><td>no</td><td>yes, live</td></tr>
+      <tr><td>Tell accounts apart</td><td>every window has the same icon</td><td>a color and an app icon per account</td></tr>
+      <tr><td>Sign in with Google or SSO</td><td>lands in whichever window opened first</td><td>lands in the right window</td></tr>
+      <tr><td>After Claude updates itself</td><td>windows come back on the default account</td><td>each account reopens on its own</td></tr>
+      <tr><td>See what each account uses</td><td>no</td><td>per account and in all</td></tr>
+    </table>
+  </section>
+
+  <section id="features">
+    <h2>Everything in the menu bar.</h2>
+    <p class="sub">One panel to open, focus, quit and add accounts, plus a few things a Claude power user ends up wanting.</p>
+    <div class="grid">
+      <div class="card"><h3><span class="dot"></span>One profile per account</h3><p>Each profile is its own Claude data folder, so sign-ins and chats never leak between accounts. New Profile is one line: type a name, press Return.</p></div>
+      <div class="card"><h3><span class="dot"></span>An app and an icon per account</h3><p>"Claude Work", "Claude Client" in Spotlight, Launchpad and the Dock, with Claude's icon in each profile's color. Open windows wear it too, in ⌘-Tab and Mission Control.</p></div>
+      <div class="card"><h3><span class="dot"></span>Sign-in that lands right</h3><p>Google and SSO sign-in come back to the account that asked, with nothing to click first.</p></div>
+      <div class="card"><h3><span class="dot"></span>Survives Claude updates</h3><p>When Claude updates itself it relaunches on the default account. MultiClaude reopens each profile on its own.</p></div>
+      <div class="card"><h3><span class="dot"></span>Claude Code per account</h3><p>Open Claude Code in Terminal signed in as that account, with its own config folder. Copy MCP servers from one account to another.</p></div>
+      <div class="card"><h3><span class="dot"></span>Keep your Mac awake</h3><p>One bolt next to the switch. Until you turn it off or for 15 minutes to 24 hours, with lid-closed, power and battery options. Handy for long agent runs.</p></div>
+      <div class="card"><h3><span class="dot"></span>Scroll your own way</h3><p>Reverse a mouse and a trackpad separately, which macOS can't do on its own.</p></div>
+      <div class="card"><h3><span class="dot"></span>Shortcuts</h3><p>⌃⌥⌘M opens the panel, ⌃⌥1 to 9 jump to each account, ⌃⌥⌘A keeps the Mac awake.</p></div>
+      <div class="card"><h3><span class="dot"></span>Updates itself</h3><p>Signed releases, checked daily, installed in the background. Your Claude windows stay open.</p></div>
+    </div>
+  </section>
+
+  <section id="usage">
+    <div class="split">
+      <div>
+        <h2>See what each account uses.</h2>
+        <p class="sub" style="margin-bottom:18px">Claude Code logs every reply's tokens on your Mac. MultiClaude credits each session to the account it ran in, from the Code tab, Cowork or the terminal.</p>
+        <ul class="plain">
+          <li><strong>Today in the panel</strong>, per account.</li>
+          <li><strong>A usage window</strong> for today, 7 or 30 days or all time: each account's share, output per reply, cache hit rate, a by-model table.</li>
+          <li><strong>An activity heatmap</strong> for all accounts or one.</li>
+          <li><strong>Output by default.</strong> Cache reads are most of the raw total, so the numbers show what Claude actually wrote.</li>
+          <li><strong>Chat limits</strong>, if you turn them on: each account's 5-hour and weekly limits from claude.ai.</li>
+        </ul>
+      </div>
+      <picture>
+        <source media="(prefers-color-scheme: dark)" srcset="img/panel-dark.png">
+        <img src="img/panel-light.png" alt="The MultiClaude panel with Usage Today: output tokens for Personal, Work, Client and Research." style="max-width:340px;margin:0 auto" loading="lazy">
+      </picture>
+    </div>
+    <div class="shot">
+      <picture>
+        <source media="(prefers-color-scheme: dark)" srcset="img/usage-dark.png">
+        <img src="img/usage-light.png" alt="The usage window: output, replies, output per reply and cache hit tiles, each account's share, and a year-long activity heatmap." loading="lazy">
+      </picture>
+    </div>
+  </section>
+
+  <section>
+    <h2>Keep every Claude Code conversation.</h2>
+    <p class="sub">Claude Code deletes transcripts after 30 days by default. MultiClaude keeps a copy of each one under its account, as an APFS clone that takes no extra space while the original exists. Browse them with Claude's own titles, search, read any one and export it to Markdown. Repeated automated runs, like hooks calling <code>claude -p</code>, are hidden by default.</p>
+  </section>
+
+  <section id="install">
+    <h2>Install</h2>
+    <div class="steps">
+      <div class="card"><h3>With Homebrew</h3><pre>brew install --cask quentincar0n/tap/multiclaude</pre></div>
+      <div class="card"><h3>Or download</h3><p>Get the zip from <a href="https://github.com/QuentinCar0n/multiclaude/releases/latest">the latest release</a>, unzip and move MultiClaude to Applications. It isn't notarized yet, so the first time, right-click it and choose Open.</p></div>
+      <div class="card"><h3>Open it</h3><p>MultiClaude picks up your default Claude account, your <code>--user-data-dir</code> aliases and any Claude-* folder. Click the ✳ in the menu bar.</p></div>
+    </div>
+  </section>
+
+  <section id="privacy">
+    <div class="split">
+      <div>
+        <h2>Private by design.</h2>
+        <p class="sub" style="margin-bottom:0">No analytics, no account, nothing leaves your Mac except the daily update check from GitHub. Usage numbers and conversation copies stay on your Mac, readable only by you. It never modifies the Claude app.</p>
+      </div>
+      <ul class="plain">
+        <li><strong>Updates</strong> are signed with a key kept outside the repository; MultiClaude refuses any other.</li>
+        <li><strong>Chat limits</strong> are off until you turn them on and confirm. They send each account's claude.ai sign-in cookie to claude.ai only, keep it in memory and never write or log it.</li>
+        <li><strong>Removing a profile</strong> only takes it off the list. Its folder stays until you delete it.</li>
+        <li><strong>Open source</strong> under Apache 2.0, one Swift file you can read in an afternoon.</li>
+      </ul>
+    </div>
+  </section>
+
+  <footer>
+    <div class="row">
+      <span>MultiClaude by <a href="https://somalabs.me">Soma Labs</a>, Palo Alto. Apache 2.0.</span>
+      <span><a href="https://github.com/QuentinCar0n/multiclaude">GitHub</a> · <a href="https://github.com/QuentinCar0n/multiclaude/blob/main/CHANGELOG.md">Release notes</a> · <a href="https://github.com/QuentinCar0n/multiclaude/issues">Report an issue</a></span>
+    </div>
+    <p>Claude is a trademark of Anthropic, PBC. MultiClaude is not affiliated with or endorsed by Anthropic.</p>
+  </footer>
+</div>
+<script>
+  document.getElementById('copy').addEventListener('click', function () {
+    var b = this;
+    navigator.clipboard.writeText(document.getElementById('brew').textContent).then(function () {
+      b.textContent = 'Copied'; setTimeout(function () { b.textContent = 'Copy'; }, 1500);
+    });
+  });
+</script>
+</body>
+</html>

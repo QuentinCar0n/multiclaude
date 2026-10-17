@@ -21,7 +21,7 @@
 brew install --cask quentincar0n/tap/multiclaude
 ```
 
-[**Download the latest release**](https://github.com/QuentinCar0n/multiclaude/releases/latest) &nbsp;&middot;&nbsp; [Why](#why) &nbsp;&middot;&nbsp; [Features](#features) &nbsp;&middot;&nbsp; [How it works](#how-it-works) &nbsp;&middot;&nbsp; [FAQ](#faq)
+[**Download the latest release**](https://github.com/QuentinCar0n/multiclaude/releases/latest) &nbsp;&middot;&nbsp; [Website](https://quentincar0n.github.io/multiclaude/) &nbsp;&middot;&nbsp; [Why](#why) &nbsp;&middot;&nbsp; [Features](#features) &nbsp;&middot;&nbsp; [How it works](#how-it-works) &nbsp;&middot;&nbsp; [FAQ](#faq)
 
 </div>
 
