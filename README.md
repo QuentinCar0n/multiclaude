@@ -21,7 +21,7 @@
 brew install --cask quentincar0n/tap/multiclaude
 ```
 
-[**Download the latest release**](https://github.com/QuentinCar0n/multiclaude/releases/latest) &nbsp;&middot;&nbsp; [Why](#why) &nbsp;&middot;&nbsp; [Features](#features) &nbsp;&middot;&nbsp; [How it works](#how-it-works) &nbsp;&middot;&nbsp; [FAQ](#faq)
+[**Download the latest release**](https://github.com/QuentinCar0n/multiclaude/releases/latest) &nbsp;&middot;&nbsp; [Website](https://quentincar0n.github.io/multiclaude/) &nbsp;&middot;&nbsp; [Why](#why) &nbsp;&middot;&nbsp; [Features](#features) &nbsp;&middot;&nbsp; [How it works](#how-it-works) &nbsp;&middot;&nbsp; [FAQ](#faq)
 
 </div>
 
@@ -75,6 +75,11 @@ MultiClaude is that trick with a proper interface.
 - **Imports your setup.** First launch picks up your default Claude account, any `--user-data-dir` aliases in `~/.zshrc`, and any `Claude-*` folder in Application Support. A `Claude-*` folder created later, by an alias for example, joins the list on its own.
 - **Folders follow names.** Rename a profile and its folder becomes `Claude-<Name>` the next time that account is closed. A link stays at the old path, so old aliases and Claude's own saved paths keep working.
 - **Sign-in that lands in the right window.** Claude's Google and SSO sign-in normally comes back to whichever Claude window opened first. MultiClaude makes each account sign in inside its own window, with nothing to click first.
+- **Keep your Mac awake.** The **Keep Awake** section holds off sleep until you turn it off or for a set time (15 minutes to 8 hours, or anything up to 24 hours on the slider), with a countdown and a bolt in the menu bar. Options cover the display, a closed lid, power and battery triggers, a left-click toggle and ⌃⌥⌘A. Handy for long Claude Code runs.
+- **Keep-awake only, if you like.** Turn off **Manage Claude Accounts** and MultiClaude leaves Claude alone and keeps just the keep-awake and scroll features. Your profiles wait for you to turn it back on.
+- **Token usage per account and in all.** Claude Code logs every reply's tokens on your Mac (Code tab, Cowork and terminal). MultiClaude credits each session to the account it ran in and shows today's output per account in the panel, plus a window with a 6-month heatmap, each account's share, and a by-model table. Regular chats keep no token counts on the Mac; turn on **Show Chat Limits** for each account's 5-hour and weekly limits from claude.ai.
+- **Keeps your Claude Code conversations.** Claude Code deletes transcripts after 30 days by default. MultiClaude keeps a copy of each one per account (an APFS clone, so no extra space while the original exists), lists them with search, shows them, and exports any one to Markdown.
+- **Scroll your own way.** Reverse the scroll direction of a mouse and a trackpad separately, in Settings (needs Accessibility permission).
 - **Global shortcuts.** ⌃⌥⌘M opens the panel; turn on Profile Shortcuts and ⌃⌥1 to ⌃⌥9 jump straight to each account.
 - **Updates itself.** Once a day MultiClaude checks for a new release, installs it in the background and restarts while the panel is closed. Your Claude windows stay open.
 - **Launch at login**, light and dark mode, colored menu bar icon.
@@ -126,7 +131,7 @@ Your default Claude account is always the first profile. It uses the app's norma
 
 ### Privacy
 
-MultiClaude has **no analytics**. Its only network request is the daily update check: it asks GitHub for this repo's latest release, and downloads it from GitHub when it's newer. Every release is signed with a private key kept outside this repository, and MultiClaude refuses any update whose signature doesn't match the public key built into the app. It also checks the bundle identifier, the version and the code signature before swapping itself. Turn off **Update MultiClaude Automatically** in Settings to stop it. It never opens Claude's data folders, so it never sees your chats, files or sign-in tokens. It does not modify the Claude app. Removing a profile only takes it off the list: the folder stays on disk until you delete it yourself.
+MultiClaude has **no analytics**. Its only network requests are the daily update check and, if you turn on **Show Chat Limits**, claude.ai's usage numbers. The update check: it asks GitHub for this repo's latest release, and downloads it from GitHub when it's newer. Every release is signed with a private key kept outside this repository, and MultiClaude refuses any update whose signature doesn't match the public key built into the app. It also checks the bundle identifier, the version and the code signature before swapping itself. Turn off **Update MultiClaude Automatically** in Settings to stop it. **Usage and conversations** are read and kept on your Mac only: MultiClaude reads Claude Code's transcripts (in `~/.claude` and each account's folder) to count tokens, and keeps copies in `~/Library/Application Support/MultiClaude/Archive`, readable only by you. Turn off **Track Token Usage** and **Keep Claude Code Conversations** to stop both; delete that folder to remove the copies. **Show Chat Limits** is off until you turn it on and confirm: it then reads each account's claude.ai sign-in cookie (macOS asks you to allow "Claude Safe Storage" in the Keychain) and sends it to claude.ai only, never anywhere else; it is kept in memory and never written or logged. It does not modify the Claude app. The scroll reverser, when you turn it on, flips the direction of scroll events as they pass and keeps nothing. Removing a profile only takes it off the list: the folder stays on disk until you delete it yourself.
 
 ## FAQ
 

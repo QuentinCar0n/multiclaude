@@ -1,5 +1,42 @@
 # MultiClaude release notes
 
+## 1.5 (build 10), 2026-10-16
+
+### New
+- **Keep your Mac awake.** The bolt next to the switch at the top of the panel turns it on and off. The **Keep Awake** section just below it holds off sleep until you turn it off, or for 15, 30 or 45 minutes, 1, 2, 4 or 8 hours, or any time from 5 minutes to 24 hours with the slider under the gear. The section header counts down, and a bolt joins the asterisk in the menu bar while it's on. A restart for a MultiClaude update keeps it going. Its **Options**: activate at launch, activate with a left click on the menu bar icon (right-click still opens the panel), a ⌃⌥⌘A shortcut, let the display sleep, stay awake with the lid closed (macOS asks for your password, since it takes `pmset disablesleep`), a notification when it turns off, turn on when power is connected, turn off when it's disconnected or the battery drops below 20%.
+- **Reverse scroll direction**, for a mouse and a trackpad separately, in Settings. A wheel mouse and a trackpad can then each scroll the way you like, which macOS can't do on its own. It needs Accessibility permission (MultiClaude asks the first time, and the setting shows "needs Accessibility" until it's granted). A Magic Mouse follows the trackpad setting.
+
+- **Keep-awake only.** Turn off **Manage Claude Accounts** in Settings and MultiClaude becomes a keep-awake and scroll app: the profiles and their settings leave the panel, the `claude://` links go back to Claude, and MultiClaude stops watching, reopening, renaming or quitting Claude windows. Your profiles and folders stay as they are; turn the setting back on to pick up where you were.
+
+- **Token usage, per account and in all.** MultiClaude reads the token counts Claude Code logs for every reply (Code tab, Cowork and terminal) and credits each session to the account it ran in. The panel's **Usage Today** shows each account's output; **Open Usage and Conversations…** opens a window with totals for today, 7 or 30 days or all time, each account's share, a 6-month heatmap (all accounts or one), output per reply, cache hit rate and a by-model table. Output is the default measure, since cache reads (the same context read again every turn) are most of the raw total; New Tokens and All Tokens are one click away. The first count reads every transcript once (about a minute for 16 GB), then only what was added.
+- **Chat limits** (off by default). Regular chats keep no token counts on the Mac, so **Show Chat Limits** asks claude.ai for each account's 5-hour and weekly limits, using that account's sign-in cookie. MultiClaude asks before turning it on, macOS asks for Keychain access, and the cookie only goes to claude.ai. It uses an endpoint claude.ai doesn't document, so it may stop working.
+- **Your Claude Code conversations, kept.** Claude Code deletes transcripts after 30 days by default. **Keep Claude Code Conversations** (on) keeps an APFS clone of every transcript under its account in `~/Library/Application Support/MultiClaude/Archive`, readable only by you. The window's **Conversations** tab lists them by account with Claude's own titles, searches them, shows each one and exports it to Markdown. Repeated automated runs (hooks that call `claude -p`) are hidden by default.
+
+Both keep-awake and the scroll reverser come from Cocaine, our keep-awake app. If Cocaine runs too and already reverses a direction, MultiClaude leaves that direction alone (the setting says "on in Cocaine") so scrolling isn't flipped twice.
+
+## 1.4.1 (build 9), 2026-10-11
+
+A robustness release: no new features, many ways things could quietly go wrong now can't, or say so.
+
+### Fixed
+- **No more crash reports from profile icons.** Setting a profile copy's icon made macOS log an IconServices fault (and write an `ExcUserFault_MultiClaude` report) every time. Icons are now handed over at every standard size, which macOS takes without complaint.
+- **A transient read of a Claude process no longer closes it.** When macOS couldn't read a Claude process's arguments for a moment, MultiClaude took it for a profile copy started without its folder and closed it. Now it waits for a clean read, and folder renames wait too.
+- **Your profiles survive a saved list that can't be read.** A list from another version now loads field by field, and a list that still can't be read is kept aside (`profiles-unreadable-<date>` in MultiClaude's preferences) with a note in the panel, instead of being replaced.
+- **Duplicate never copies an account that is still open.** If the account doesn't quit (a quit dialog, a hang), nothing is copied. The copy is made under a hidden name and only takes its real name once complete, so a copy cut short is never picked up as a profile, and duplicating a renamed profile copies its folder, not the link left at the old name.
+- **Open tells you when Claude doesn't start**, for example when Claude.app is missing, instead of showing "starting" and then nothing. Pressing a profile again while it starts no longer starts a second copy, and opening the default account right after another one now works.
+- **Folder renames that fail are logged and retried at the next launch**, not every 3 seconds, and a folder moved without its link back is followed to where it is. A `SingletonLock` left by a crash no longer blocks renames forever, and folder names are compared without regard to case.
+- **Profile apps can swap names.** Two profiles with the same app name that swap places in the list used to fail to rewrite their apps on every save. Very long or multi-line names make valid app names, and half-written apps left by an interrupted run are cleaned up.
+- **The Dock is safer to edit.** MultiClaude never writes the Dock's app list when it can't read it, keeps changes you make while it refreshes a tile, and puts a tile it took off back before quitting. **Add to Dock** reports a failure instead of claiming success.
+- **Copy MCP Servers From** refuses a source whose config isn't valid JSON (it used to report "Copied 0" and rewrite the target), leaves the target untouched when there's nothing to copy, and no longer fails when run twice in the same second.
+- **Updates** give up on a stalled download instead of blocking later checks, retry within the hour after a failure (logged), unpack exactly the bytes whose signature was checked, never replace a test build (1.5-rc1) with an older release, and don't restart MultiClaude during a sign-in. If the relaunch can't start, MultiClaude stays open.
+- `claude://` links only go to Claude processes, and other kinds of links are ignored.
+- Aliases copied from a profile work for folder names with quotes or `$`, and a profile whose name has no letters still gets one.
+- The panel forgets a half-typed rename when it closes, Esc closes it, and the account name in the menu bar is shortened past 18 characters. MultiClaude keeps tracking Claude windows while an alert is open.
+
+### Changed
+- `~/Library/Logs/MultiClaude.log` is readable only by you, starts over past 1 MB (the previous one is kept as `MultiClaude.log.1`), and logs only the first part of a link's path. Failures that used to be silent (folder renames, profile copies, profile apps, the Dock, updates, links) now leave a line there.
+- Release builds check the tag's version format, give the Homebrew token only to the step that uses it, and don't mark a fix for an older line as the latest release.
+
 ## 1.4 (build 8), 2026-10-10
 
 ### New

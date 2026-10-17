@@ -6,6 +6,11 @@ import SwiftUI
 import ServiceManagement
 import Carbon.HIToolbox
 import CryptoKit
+import IOKit.pwr_mgt
+import IOKit.ps
+import UserNotifications
+import CommonCrypto
+import SQLite3
 
 let appVersion = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "1.0"
 let websiteURL = URL(string: "https://somalabs.me")!
@@ -25,7 +30,8 @@ let isPreview = ProcessInfo.processInfo.environment["MULTICLAUDE_PREVIEW"] != ni
 // Releases are signed in CI with the matching private key (repo secret UPDATE_SIGNING_KEY).
 let updatePublicKey = "ovYVjB5Bst53pHaSwbk7KKX+JRAqv7zuponiduhHa+w="
 // Command-line modes (--list, --selftest-*, ...) only read; the menu bar app owns the profile list.
-let isCLI = CommandLine.arguments.count > 1
+// Only a --flag counts: macOS and Xcode can pass other arguments (-NSDocumentRevisionsDebugMode ...) to the app.
+let isCLI = CommandLine.arguments.count > 1 && CommandLine.arguments[1].hasPrefix("--")
 let isDemo = ProcessInfo.processInfo.environment["MULTICLAUDE_DEMO"] != nil   // sample profiles for README screenshots
 
 extension Color {
@@ -47,6 +53,26 @@ struct Profile: Codable, Identifiable, Hashable {
     var codeDir: String?   // pinned Claude Code folder, kept when the data folder is renamed
     var appName: String?   // name of this profile's Dock app; nil = "Claude <name>"
 
+    init(id: UUID = UUID(), name: String, dir: String?, color: Int? = nil, openAtLaunch: Bool? = nil,
+         codeDir: String? = nil, appName: String? = nil) {
+        (self.id, self.name, self.dir, self.color) = (id, name, dir, color)
+        (self.openAtLaunch, self.codeDir, self.appName) = (openAtLaunch, codeDir, appName)
+    }
+
+    // Lenient, so a list saved by another version still loads: a missing field falls back instead of
+    // failing the whole list (which would lose every profile's id, color and settings).
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = (try? c.decodeIfPresent(UUID.self, forKey: .id)) ?? UUID()
+        dir = try c.decodeIfPresent(String.self, forKey: .dir)   // a wrong dir would make it the default profile: fail
+        name = (try? c.decodeIfPresent(String.self, forKey: .name))
+            ?? dir.map { String(URL(fileURLWithPath: $0).lastPathComponent.replacingOccurrences(of: "Claude-", with: "")) } ?? "Claude"
+        color = try? c.decodeIfPresent(Int.self, forKey: .color)
+        openAtLaunch = try? c.decodeIfPresent(Bool.self, forKey: .openAtLaunch)
+        codeDir = try? c.decodeIfPresent(String.self, forKey: .codeDir)
+        appName = try? c.decodeIfPresent(String.self, forKey: .appName)
+    }
+
     var isDefault: Bool { dir == nil }
     var initial: String { String(name.prefix(1)).uppercased() }
     var dockAppName: String {
@@ -61,9 +87,15 @@ struct Profile: Codable, Identifiable, Hashable {
     var nsTint: NSColor { Palette.colors[(color ?? 0) % Palette.colors.count].color }
     private var key: String { name.lowercased().filter { $0.isLetter || $0.isNumber } }
 
+    private var aliasKey: String { key.isEmpty ? "claude" + id.uuidString.prefix(4).lowercased() : key }
+
     var shellAlias: String {
-        guard let dir else { return "alias \(key)='open -a \"Claude\"'" }
-        return "alias \(key)='open -n -a \"Claude\" --args --user-data-dir=\"\(dir)\"'"
+        guard let dir else { return "alias \(aliasKey)='open -a \"Claude\"'" }
+        // The readable form when the path has nothing a shell would expand or that would end the quotes.
+        if !dir.contains(where: { "'\"$`\\".contains($0) }) {
+            return "alias \(aliasKey)='open -n -a \"Claude\" --args --user-data-dir=\"\(dir)\"'"
+        }
+        return "alias \(aliasKey)=" + shellQuote("open -n -a Claude --args " + shellQuote("--user-data-dir=" + dir))
     }
 
     // Claude Code keeps its sign-in per config folder (and per Keychain entry on macOS),
@@ -76,8 +108,11 @@ struct Profile: Codable, Identifiable, Hashable {
     }
 
     var codeAlias: String {
-        guard let codeConfigDir else { return "alias claude-\(key)='claude'" }
-        return "alias claude-\(key)='CLAUDE_CONFIG_DIR=\"\(codeConfigDir)\" claude'"
+        guard let codeConfigDir else { return "alias claude-\(aliasKey)='claude'" }
+        if !codeConfigDir.contains(where: { "'\"$`\\".contains($0) }) {
+            return "alias claude-\(aliasKey)='CLAUDE_CONFIG_DIR=\"\(codeConfigDir)\" claude'"
+        }
+        return "alias claude-\(aliasKey)=" + shellQuote("CLAUDE_CONFIG_DIR=" + shellQuote(codeConfigDir) + " claude")
     }
 }
 
@@ -103,10 +138,12 @@ enum Seed {
         var seen = Set<String>()
         let home = FileManager.default.homeDirectoryForCurrentUser.path
         let rc = (try? String(contentsOfFile: home + "/.zshrc", encoding: .utf8)) ?? ""
-        let re = try! NSRegularExpression(pattern: #"alias\s+(\w+)=['"]open -n -a "?Claude"? --args --user-data-dir="?([^"']+)"?['"]"#)
+        let re = try! NSRegularExpression(pattern: #"(?m)^\s*alias\s+(\w+)=['"]open -n -a "?Claude"? --args --user-data-dir="?([^"']+)"?['"]"#)
         for m in re.matches(in: rc, range: NSRange(rc.startIndex..., in: rc)) {
             guard let n = Range(m.range(at: 1), in: rc), let d = Range(m.range(at: 2), in: rc) else { continue }
-            let dir = String(rc[d]).replacingOccurrences(of: "$HOME", with: home)
+            let dir = (String(rc[d]).replacingOccurrences(of: "${HOME}", with: home)
+                .replacingOccurrences(of: "$HOME", with: home) as NSString).expandingTildeInPath
+            guard dir.hasPrefix("/"), !seen.contains(dir) else { continue }
             list.append(Profile(name: String(rc[n]).capitalized, dir: dir))
             seen.insert(dir)
         }
@@ -122,14 +159,20 @@ enum Seed {
 // MARK: - Settings
 
 enum Setting: String, CaseIterable, Identifiable {
-    case launchAtLogin, autoUpdate, routeSignIn, reopenAfterUpdate, shortcut, profileShortcuts, showActive, showCount, coloredIcon, dockApps, quitWithApp
+    case manageClaude, launchAtLogin, autoUpdate, routeSignIn, reopenAfterUpdate, shortcut, profileShortcuts, showActive, showCount, coloredIcon, dockApps, quitWithApp
+    case trackUsage, archiveCode, chatLimits
+    case reverseMouse, reverseTrackpad
 
-    static let onByDefault: Set<Setting> = [.autoUpdate, .routeSignIn, .reopenAfterUpdate, .showActive, .showCount]
+    static let onByDefault: Set<Setting> = [.manageClaude, .trackUsage, .archiveCode, .autoUpdate, .routeSignIn, .reopenAfterUpdate, .showActive, .showCount]
+    // Settings that only mean something while MultiClaude manages Claude accounts; hidden when it doesn't.
+    static let claudeOnly: Set<Setting> = [.routeSignIn, .reopenAfterUpdate, .profileShortcuts, .showActive, .showCount, .dockApps, .quitWithApp,
+                                         .trackUsage, .archiveCode, .chatLimits]
 
     var id: String { rawValue }
 
     var title: String {
         switch self {
+        case .manageClaude: "Manage Claude Accounts"
         case .launchAtLogin: "Launch at Login"
         case .autoUpdate: "Update MultiClaude Automatically"
         case .routeSignIn: "Sign In in Each Account's Window"
@@ -141,11 +184,17 @@ enum Setting: String, CaseIterable, Identifiable {
         case .coloredIcon: "Colored Menu Bar Icon"
         case .dockApps: "App for Each Profile"
         case .quitWithApp: "Quit Profiles with MultiClaude"
+        case .trackUsage: "Track Token Usage"
+        case .archiveCode: "Keep Claude Code Conversations"
+        case .chatLimits: "Show Chat Limits"
+        case .reverseMouse: "Reverse Mouse Scroll"
+        case .reverseTrackpad: "Reverse Trackpad Scroll"
         }
     }
 
     var symbol: String {
         switch self {
+        case .manageClaude: "person.2"
         case .launchAtLogin: "power"
         case .autoUpdate: "arrow.down.circle"
         case .routeSignIn: "person.badge.key"
@@ -157,6 +206,11 @@ enum Setting: String, CaseIterable, Identifiable {
         case .coloredIcon: "paintpalette"
         case .dockApps: "dock.rectangle"
         case .quitWithApp: "xmark.circle"
+        case .trackUsage: "chart.bar"
+        case .archiveCode: "archivebox"
+        case .chatLimits: "gauge.with.dots.needle.33percent"
+        case .reverseMouse: "computermouse"
+        case .reverseTrackpad: "rectangle.and.hand.point.up.left"
         }
     }
 
@@ -189,10 +243,13 @@ final class Engine: ObservableObject {
     private var claudeVersion = UpdateWatch.installedVersion()
     private var updatedAt: Date?
     private var quitAt: [UUID: Date] = [:]    // profiles that stopped without MultiClaude quitting them
-    private var userQuit: Set<UUID> = []
+    private var userQuit: [UUID: Date] = [:]   // quits MultiClaude asked for; Claude may still refuse (quit dialog)
     private var stopLog: [UUID: Date] = [:]   // last unrequested stop per profile, kept after it relaunches
     private var strayHandled: Date?           // the update whose stray default window was already closed
     private var bareHandled: [UUID: Date] = [:]   // profile copies last reopened after a bare start
+    private var busy: Set<UUID> = []          // profiles being duplicated: their folder must stay put
+    private var inFlight: Set<String> = []    // folders being written by a duplicate, not to be adopted
+    private var failedMoves: Set<String> = []
 
     private init() {
         if isDemo {
@@ -204,12 +261,29 @@ final class Engine: ObservableObject {
             frontID = profiles[1].id
             return
         }
-        if let data = defaults.data(forKey: "profiles"), let list = try? JSONDecoder().decode([Profile].self, from: data) {
+        let data = defaults.data(forKey: "profiles")
+        var unreadable = false
+        if let data, let list = try? JSONDecoder().decode([Profile].self, from: data) {
             profiles = list
         } else {
+            // A list that can't be read is kept aside, never just written over by the fresh one.
+            if let data, !isCLI {
+                let stamp = ISO8601DateFormatter().string(from: Date()).replacingOccurrences(of: ":", with: "")
+                defaults.set(data, forKey: "profiles-unreadable-\(stamp)")
+                Log.write("saved profile list could not be read; kept as profiles-unreadable-\(stamp), starting from the Claude folders")
+                unreadable = true
+            }
             profiles = Seed.profiles()
         }
+        if unreadable { notice = "MultiClaude couldn't read its saved profiles and rebuilt the list from your Claude folders." }
         for i in profiles.indices where profiles[i].color == nil { profiles[i].color = nextColor() }
+        if !isCLI {
+            // Copies cut short by a quit or crash during Duplicate (see Duplicate.clone).
+            for n in (try? FileManager.default.contentsOfDirectory(atPath: supportDir.path)) ?? [] where n.hasPrefix(".partial-") {
+                try? FileManager.default.removeItem(at: supportDir.appendingPathComponent(n))
+                Log.write("removed \(n), a duplicate cut short")
+            }
+        }
         discoverFolders()
     }
 
@@ -228,8 +302,8 @@ final class Engine: ObservableObject {
                 let launchedClaude = name == NSWorkspace.didLaunchApplicationNotification && launched?.bundleIdentifier == claudeBundleID
                 MainActor.assumeIsolated {
                     // A bare copy can hand off to the default window and quit before refresh() looks.
-                    if launchedClaude, let app = launched, let owner = Engine.shared.runtimeOwner(app), !owner.isDefault,
-                       !ProcArgs.of(app.processIdentifier).contains(where: { $0.hasPrefix("--user-data-dir=") }) {
+                    if launchedClaude, Engine.shared.managing, let app = launched, let owner = Engine.shared.runtimeOwner(app), !owner.isDefault,
+                       let args = ProcArgs.of(app.processIdentifier), !args.contains(where: { $0.hasPrefix("--user-data-dir=") }) {
                         Engine.shared.reopenBareCopy(app, of: owner)
                     }
                     Engine.shared.refresh()
@@ -248,12 +322,13 @@ final class Engine: ObservableObject {
         }
         if !isDemo { Updater.start() }
         // Electron instances launched with `open -n` sometimes skip the launch notification; poll as a backstop.
-        Timer.scheduledTimer(withTimeInterval: 3, repeats: true) { _ in
+        // In the common modes, so it keeps running while an alert or menu is up.
+        RunLoop.main.add(Timer(timeInterval: 3, repeats: true) { _ in
             MainActor.assumeIsolated { Engine.shared.refresh() }
-        }
+        }, forMode: .common)
         refresh()
         // A restart after a self-update keeps whatever is open; it does not reopen startup profiles.
-        if !isDemo && !afterSelfUpdate {
+        if !isDemo && !afterSelfUpdate && managing {
             DispatchQueue.main.asyncAfter(deadline: .now() + 1) {
                 let e = Engine.shared
                 e.profiles.filter { $0.openAtLaunch == true && !e.isRunning($0) }.forEach(e.open)
@@ -271,6 +346,7 @@ final class Engine: ObservableObject {
 
     func toggle(_ s: Setting) {
         let on = !isOn(s)
+        if s == .chatLimits && on && !Dialogs.confirmChatLimits() { return }
         objectWillChange.send()
         if s == .launchAtLogin {
             do { on ? try SMAppService.mainApp.register() : try SMAppService.mainApp.unregister() }
@@ -281,16 +357,42 @@ final class Engine: ObservableObject {
         if s == .shortcut || s == .profileShortcuts { updateHotKeys() }
         if s == .routeSignIn { on ? holdLinks() : LinkRelay.giveBack() }
         if s == .dockApps { syncLaunchers() }
+        if s == .reverseMouse || s == .reverseTrackpad { updateScroll() }
+        if s == .manageClaude { setManaging(on) }
+        if s == .trackUsage || s == .archiveCode || s == .chatLimits { Usage.shared.refresh(force: true) }
         onChange?()
     }
 
-    // ⌃⌥⌘M opens the panel; ⌃⌥1 to ⌃⌥9 open or focus the profiles in list order.
+    // Off, MultiClaude is a keep-awake and scroll app only: it stops watching Claude, gives the claude://
+    // links back, leaves Claude's windows and folders alone, and hides the profiles. Nothing is deleted.
+    var managing: Bool { isOn(.manageClaude) }
+
+    private func setManaging(_ on: Bool) {
+        Log.write(on ? "managing Claude accounts again" : "stopped managing Claude accounts (keep-awake only)")
+        if on {
+            discoverFolders()
+            holdLinks()
+        } else {
+            if signIn != nil { finishSignIn(cancelled: true) }
+            LinkRelay.giveBack()
+            pending = [:]
+        }
+        updateHotKeys()
+        refresh()
+    }
+
+    func updateScroll() { ScrollReverser.update(mouse: isOn(.reverseMouse), trackpad: isOn(.reverseTrackpad)) }
+
+    // ⌃⌥⌘M opens the panel; ⌃⌥⌘A turns keep-awake on or off; ⌃⌥1 to ⌃⌥9 open or focus the profiles in list order.
     func updateHotKeys() {
         var keys: [HotKey.Binding] = []
         if isOn(.shortcut) {
             keys.append(.init(key: kVK_ANSI_M, mods: cmdKey | optionKey | controlKey) { Engine.shared.onPanelHotKey?() })
         }
-        if isOn(.profileShortcuts) {
+        if Awake.shared.isOn(.shortcut) {
+            keys.append(.init(key: kVK_ANSI_A, mods: cmdKey | optionKey | controlKey) { Awake.shared.toggleActive() })
+        }
+        if managing && isOn(.profileShortcuts) {
             for (i, p) in profiles.prefix(9).enumerated() {
                 let id = p.id
                 keys.append(.init(key: HotKey.digits[i], mods: optionKey | controlKey) {
@@ -302,7 +404,7 @@ final class Engine: ObservableObject {
     }
 
     func shortcutHint(for p: Profile) -> String? {
-        guard isOn(.profileShortcuts), let i = profiles.firstIndex(of: p), i < 9 else { return nil }
+        guard isOn(.profileShortcuts), let i = profiles.firstIndex(where: { $0.id == p.id }), i < 9 else { return nil }
         return "⌃⌥\(i + 1)"
     }
 
@@ -333,7 +435,7 @@ final class Engine: ObservableObject {
     // ASWebAuthenticationSession instead of the browser, so every account signs in in its own window.
     // (Claude: "[Auth] Not the claude:// handler; keeping ASWebAuth".)
     func holdLinks() {
-        guard !isDemo, !isCLI, isOn(.routeSignIn) || signIn != nil, !LinkRelay.isOurs() else { return }
+        guard !isDemo, !isCLI, managing, isOn(.routeSignIn) || signIn != nil, !LinkRelay.isOurs() else { return }
         LinkRelay.take { _ in }
     }
 
@@ -387,8 +489,10 @@ final class Engine: ObservableObject {
         notice = others.isEmpty ? "Sign in to \(p.name) in its window."
             : "Sign in to \(p.name) in its window. \(names) reopen\(others.count == 1 ? "s" : "") once you're signed in."
         func next(_ rest: [Profile]) {
+            // Stop quitting accounts once the sign-in is over or cancelled; finishSignIn reopens the ones already closed.
+            guard Engine.shared.signIn?.target == p.id else { return }
             guard let first = rest.first else { Engine.shared.open(p); return }
-            Engine.shared.quitAndWait(first) { next(Array(rest.dropFirst())) }
+            Engine.shared.quitAndWait(first) { _ in next(Array(rest.dropFirst())) }
         }
         next(others)
     }
@@ -397,7 +501,13 @@ final class Engine: ObservableObject {
     // otherwise to Claude as usual.
     func relay(_ link: String) {
         Log.write("link in: \(Log.redact(link)) front=\(NSWorkspace.shared.frontmostApplication?.bundleIdentifier ?? "-") last=\(lastClaudePid.map(String.init) ?? "-")")
-        if let s = signIn, s.routing, let app = running[s.target], LinkRelay.send(link, to: app.processIdentifier) {
+        guard link.lowercased().hasPrefix("claude:") else { Log.write("ignored a link that isn't claude://"); return }
+        if !managing, let url = URL(string: link) {
+            LinkRelay.giveBack()
+            NSWorkspace.shared.open([url], withApplicationAt: realClaudeApp(), configuration: NSWorkspace.OpenConfiguration())
+            return
+        }
+        if let s = signIn, s.routing, let app = running[s.target], !app.isTerminated, LinkRelay.send(link, to: app.processIdentifier) {
             signIn?.sawBrowser = true
             LinkRelay.bringForward(app)
             return
@@ -405,14 +515,18 @@ final class Engine: ObservableObject {
         // Otherwise the Claude window in front, or the one used last.
         let front = NSWorkspace.shared.frontmostApplication
         let pid = front?.bundleIdentifier == claudeBundleID ? front?.processIdentifier : lastClaudePid
-        if let pid, let app = NSRunningApplication(processIdentifier: pid), !app.isTerminated, LinkRelay.send(link, to: pid) {
+        // The pid must still be a Claude: a pid can be reused by another app, and links can carry sign-in codes.
+        if let pid, let app = NSRunningApplication(processIdentifier: pid), !app.isTerminated,
+           app.bundleIdentifier == claudeBundleID, LinkRelay.send(link, to: pid) {
             Log.write("link sent to pid \(pid)")
             LinkRelay.bringForward(app)
             return
         }
+        if let pid { Log.write("link not delivered to pid \(pid); handing it to Claude") }
         if !isOn(.routeSignIn) { LinkRelay.giveBack() }
-        if let url = URL(string: link) {
-            NSWorkspace.shared.open([url], withApplicationAt: LinkRelay.claudeApp, configuration: NSWorkspace.OpenConfiguration())
+        guard let url = URL(string: link) else { Log.write("link dropped: unparseable"); return }
+        NSWorkspace.shared.open([url], withApplicationAt: LinkRelay.claudeApp, configuration: NSWorkspace.OpenConfiguration()) { _, err in
+            if let err { Log.write("link dropped: Claude didn't take it (\(err.localizedDescription))") }
         }
     }
 
@@ -447,11 +561,23 @@ final class Engine: ObservableObject {
     // Matches each Claude process to a profile through its --user-data-dir argument.
     func refresh() {
         guard !isDemo else { return }
+        if isOn(.reverseMouse) || isOn(.reverseTrackpad) {
+            let before = (ScrollReverser.cocaineMouse, ScrollReverser.cocaineTrackpad)
+            updateScroll()
+            if before != (ScrollReverser.cocaineMouse, ScrollReverser.cocaineTrackpad) { objectWillChange.send() }
+        }
+        guard managing else {
+            if !running.isEmpty || frontID != nil { running = [:]; frontID = nil; onChange?() }
+            return
+        }
         var found: [UUID: NSRunningApplication] = [:]
         for app in NSWorkspace.shared.runningApplications where app.bundleIdentifier == claudeBundleID && !app.isTerminated {
-            let dir = ProcArgs.of(app.processIdentifier)
-                .first { $0.hasPrefix("--user-data-dir=") }
-                .map { Folders.canonical(String($0.dropFirst(16))) }
+            guard let args = ProcArgs.of(app.processIdentifier) else {
+                // Unreadable for now: keep whatever this process was matched to before.
+                if let known = running.first(where: { $0.value.processIdentifier == app.processIdentifier }) { found[known.key] = app }
+                continue
+            }
+            let dir = args.first { $0.hasPrefix("--user-data-dir=") }.map { Folders.canonical(String($0.dropFirst(16))) }
             if dir == nil, let owner = runtimeOwner(app), !owner.isDefault {
                 reopenBareCopy(app, of: owner)
                 continue
@@ -465,12 +591,14 @@ final class Engine: ObservableObject {
 
         let now = Date()
         for id in running.keys where found[id] == nil {
-            if userQuit.remove(id) == nil {
+            let asked = userQuit.removeValue(forKey: id).map { now.timeIntervalSince($0) < 60 } ?? false
+            if !asked {
                 quitAt[id] = now
                 stopLog[id] = now
             }
         }
         for id in found.keys { quitAt[id] = nil }
+        userQuit = userQuit.filter { now.timeIntervalSince($0.value) < 60 }   // a quit Claude refused
         quitAt = quitAt.filter { now.timeIntervalSince($0.value) < 300 }
         stopLog = stopLog.filter { now.timeIntervalSince($0.value) < 600 }
         if let v = UpdateWatch.installedVersion(), v != claudeVersion {
@@ -481,7 +609,7 @@ final class Engine: ObservableObject {
         let front = NSWorkspace.shared.frontmostApplication?.processIdentifier
         if let front, found.values.contains(where: { $0.processIdentifier == front }) { lastClaudePid = front }
         let newFront = found.first { $0.value.processIdentifier == front }?.key
-        if Set(found.keys) != Set(running.keys) || newFront != frontID {
+        if found.mapValues(\.processIdentifier) != running.mapValues(\.processIdentifier) || newFront != frontID {
             running = found
             frontID = newFront
             onChange?()
@@ -539,15 +667,47 @@ final class Engine: ObservableObject {
             LinkRelay.bringForward(app)
             return
         }
-        if let dir = p.dir { try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true) }
-        let anyClaude = NSWorkspace.shared.runningApplications.contains { $0.bundleIdentifier == claudeBundleID && !$0.isTerminated }
+        guard pending[p.id] == nil else { return }   // already starting; a second open would start a second process
+        let claude = realClaudeApp()
+        guard FileManager.default.fileExists(atPath: claude.appendingPathComponent("Contents/Info.plist").path) else {
+            notice = "Claude isn't installed. Install it from claude.ai/download, then open \(p.name) again."
+            Log.write("open \(p.name): no Claude.app at \(claude.path)")
+            return
+        }
+        if let dir = p.dir {
+            do { try FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true) } catch {
+                notice = "Couldn't open \(p.name): its folder can't be created."
+                Log.write("open \(p.name): can't create \(dir): \(error.localizedDescription)")
+                return
+            }
+        }
+        let anyClaude = !pending.isEmpty   // one still starting counts: `open -a` without -n would just bring it forward
+            || NSWorkspace.shared.runningApplications.contains { $0.bundleIdentifier == claudeBundleID && !$0.isTerminated }
         // With profile apps on, the profile runs in its own named copy of Claude (see Runtimes).
-        let app = (isOn(.dockApps) && !isDemo ? Runtimes.ensure(p, from: realClaudeApp()) : nil) ?? realClaudeApp()
+        let app = (isOn(.dockApps) && !isDemo ? Runtimes.ensure(p, from: claude) : nil) ?? claude
         let args = Launch.openArgs(app: app.path, dir: p.dir, anyClaudeRunning: anyClaude)
         let task = Process()
         task.executableURL = URL(fileURLWithPath: "/usr/bin/open")
         task.arguments = args
-        do { try task.run() } catch { NSSound.beep(); return }
+        let id = p.id, name = p.name
+        task.terminationHandler = { t in
+            guard t.terminationStatus != 0 else { return }
+            let status = t.terminationStatus
+            DispatchQueue.main.async {
+                MainActor.assumeIsolated {
+                    let e = Engine.shared
+                    e.pending[id] = nil
+                    e.notice = "Claude didn't start for \(name)."
+                    Log.write("open \(name): /usr/bin/open exited with \(status)")
+                    e.onChange?()
+                }
+            }
+        }
+        do { try task.run() } catch {
+            notice = "Couldn't open \(p.name)."
+            Log.write("open \(p.name): \(error.localizedDescription)")
+            return
+        }
         objectWillChange.send()
         pending[p.id] = Date()
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { Engine.shared.refresh() }
@@ -562,13 +722,13 @@ final class Engine: ObservableObject {
         guard UpdateWatch.isStrayDefault(defaultLaunch: app.launchDate, defaultStop: stopLog[d.id],
                                          profileStops: others, updatedAt: updatedAt) else { return }
         strayHandled = updatedAt
-        userQuit.insert(d.id)
+        userQuit[d.id] = Date()
         app.terminate()
     }
 
     func quit(_ p: Profile) {
         guard let app = running[p.id] else { return }
-        userQuit.insert(p.id)
+        userQuit[p.id] = Date()
         app.terminate()
     }
 
@@ -595,36 +755,50 @@ final class Engine: ObservableObject {
 
     @discardableResult
     func add(name raw: String) -> Bool {
-        guard let p = newProfile(named: raw) else { NSSound.beep(); return false }
+        guard let p = newProfile(named: raw), let dir = p.dir else {
+            NSSound.beep()
+            notice = raw.trimmingCharacters(in: .whitespaces).isEmpty ? nil
+                : "Couldn't add \(raw.trimmingCharacters(in: .whitespaces)): the name needs a letter or digit and must not be taken."
+            return false
+        }
+        // The folder of a profile taken off the list earlier: it comes back with its account and chats.
+        if FileManager.default.fileExists(atPath: dir) {
+            defaults.set(ignoredFolders.filter { $0.lowercased() != Folders.canonical(dir) }, forKey: "ignoredFolders")
+            notice = "\(p.name)'s folder was already there, so it opens with the account and chats it had."
+        }
         profiles.append(p)
         save()
         return true
     }
 
-    // A profile with a fresh Claude-<name> folder, or nil when the name is empty, taken or its folder exists.
+    // A profile with a Claude-<name> folder, or nil when the name is empty or taken by another profile
+    // or its folder. The folder may already exist on disk (see add and duplicate).
     func newProfile(named raw: String) -> Profile? {
         let name = raw.trimmingCharacters(in: .whitespaces)
-        let slug = name.filter { $0.isLetter || $0.isNumber || $0 == "-" || $0 == "_" }
+        let slug = Folders.slug(name)
         let dir = supportDir.appendingPathComponent("Claude-\(slug)").path
         guard !slug.isEmpty, !profiles.contains(where: { $0.name.caseInsensitiveCompare(name) == .orderedSame }),
-              !profiles.contains(where: { $0.dir == dir }) else { return nil }
+              !profiles.contains(where: { $0.dir.map(Folders.canonical) == Folders.canonical(dir) }),
+              !inFlight.contains(dir) else { return nil }
         return Profile(name: name, dir: dir, color: nextColor())
     }
 
     func setOpenAtLaunch(_ p: Profile, _ on: Bool) {
-        guard let i = profiles.firstIndex(of: p) else { return }
+        guard let i = profiles.firstIndex(where: { $0.id == p.id }) else { return }
         profiles[i].openAtLaunch = on
         save()
     }
 
-    // Quits a running profile and calls back once its process is gone (or after 15 s).
-    func quitAndWait(_ p: Profile, then done: @escaping @Sendable @MainActor () -> Void) {
-        guard let app = running[p.id] else { done(); return }
-        userQuit.insert(p.id)
+    // Quits a running profile and calls back once its process is gone (true) or after 15 s (false: still open,
+    // for example behind a quit dialog).
+    func quitAndWait(_ p: Profile, then done: @escaping @Sendable @MainActor (Bool) -> Void) {
+        guard let app = running[p.id], !app.isTerminated else { done(true); return }
+        userQuit[p.id] = Date()
         app.terminate()
         func poll(_ n: Int) {
             if app.isTerminated || n > 60 {
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { MainActor.assumeIsolated { done() } }
+                let gone = app.isTerminated
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { MainActor.assumeIsolated { done(gone) } }
                 return
             }
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { poll(n + 1) }
@@ -635,22 +809,46 @@ final class Engine: ObservableObject {
     // Clones a profile's whole data folder, sign-in and chats included, into a new profile.
     // APFS clones make the copy instant and free until the two folders diverge.
     func duplicate(_ source: Profile, as name: String) {
-        guard let p = newProfile(named: name), let dst = p.dir else { NSSound.beep(); return }
+        guard !busy.contains(source.id) else { NSSound.beep(); return }
+        guard let p = newProfile(named: name), let dst = p.dir, !FileManager.default.fileExists(atPath: dst) else {
+            notice = "Couldn't duplicate \(source.name): pick a name that no profile or folder uses yet."
+            return
+        }
         let wasRunning = isRunning(source)
+        busy.insert(source.id)
+        inFlight.insert(dst)
         notice = "Duplicating \(source.name)…"
-        quitAndWait(source) {
+        quitAndWait(source) { quit in
+            let e = Engine.shared
+            // Copying a folder its Claude is still writing would give the copy torn databases.
+            let live = e.profiles.first { $0.id == source.id } ?? source
+            guard quit, !Folders.inUse(live.folderURL.path) else {
+                e.busy.remove(source.id)
+                e.inFlight.remove(dst)
+                e.notice = "Couldn't duplicate \(source.name): it didn't quit. Nothing was changed."
+                return
+            }
+            let src = live.folderURL.path
             Task.detached {
-                let ok = Duplicate.clone(from: source.folderURL.path, to: dst)
+                let result = Duplicate.clone(from: src, to: dst)
                 await MainActor.run {
                     let e = Engine.shared
-                    if ok {
-                        e.profiles.append(p)
+                    e.busy.remove(source.id)
+                    e.inFlight.remove(dst)
+                    switch result {
+                    case .success where !e.profiles.contains(where: { $0.dir.map(Folders.canonical) == Folders.canonical(dst) }):
+                        var added = p
+                        added.color = e.nextColor()
+                        e.profiles.append(added)
                         e.save()
                         e.notice = "Duplicated \(source.name) as \(p.name). Both are signed in to the same account until you sign one out."
-                    } else {
+                    case .success:
+                        e.notice = "Duplicated \(source.name) as \(p.name)."
+                    case .failure(let err):
+                        Log.write("duplicate \(source.name): \(err)")
                         e.notice = "Couldn't duplicate \(source.name). Nothing was changed."
                     }
-                    if wasRunning { e.open(source) }
+                    if wasRunning { e.open(live) }
                 }
             }
         }
@@ -659,18 +857,26 @@ final class Engine: ObservableObject {
     func copyMCPServers(from source: Profile, to target: Profile, restart: Bool) {
         do {
             let n = try MCP.copy(from: source, to: target)
+            guard n > 0 else { notice = "\(source.name) has no MCP servers to copy."; return }
             notice = "Copied \(n) MCP server\(n == 1 ? "" : "s") from \(source.name) to \(target.name)."
                 + (restart || !isRunning(target) ? "" : " Reopen \(target.name) to load them.")
-            if restart && isRunning(target) { quitAndWait(target) { Engine.shared.open(target) } }
+            if restart && isRunning(target) { quitAndWait(target) { _ in Engine.shared.open(target) } }
+        } catch MCP.Failure.unreadable(let who) {
+            notice = "Couldn't copy MCP servers: \(who == .source ? source.name : target.name)'s config file isn't valid JSON."
         } catch {
-            notice = "Couldn't copy MCP servers: \(target.name)'s config file isn't valid JSON."
+            notice = "Couldn't copy MCP servers: \(error.localizedDescription)"
+            Log.write("copy MCP servers \(source.name) to \(target.name): \(error)")
         }
     }
 
     // The folder follows the new name on its own (see alignFolders), once the profile is closed.
     func rename(_ p: Profile, to raw: String) {
         let name = raw.trimmingCharacters(in: .whitespaces)
-        guard !name.isEmpty, let i = profiles.firstIndex(of: p) else { return }
+        guard !name.isEmpty, let i = profiles.firstIndex(where: { $0.id == p.id }) else { return }
+        guard !profiles.contains(where: { $0.id != p.id && $0.name.caseInsensitiveCompare(name) == .orderedSame }) else {
+            notice = "Another profile is already called \(name)."
+            return
+        }
         profiles[i].name = name
         save()
         alignFolders()
@@ -679,7 +885,7 @@ final class Engine: ObservableObject {
     // Takes the profile off the list. Its data folder stays on disk and is not added back.
     func remove(_ p: Profile) {
         guard !p.isDefault, let dir = p.dir else { return }
-        defaults.set(Array(Set(ignoredFolders + [Folders.canonical(dir)])), forKey: "ignoredFolders")
+        defaults.set(Array(Set(ignoredFolders.map { $0.lowercased() } + [Folders.canonical(dir)])), forKey: "ignoredFolders")
         profiles.removeAll { $0.id == p.id }
         save()
     }
@@ -689,7 +895,8 @@ final class Engine: ObservableObject {
     // Adds every Claude-* folder in Application Support that no profile uses yet.
     func discoverFolders() {
         guard !isDemo, !isCLI else { return }
-        let known = Set(profiles.compactMap(\.dir).map(Folders.canonical) + ignoredFolders)
+        let known = Set(profiles.compactMap(\.dir).map(Folders.canonical) + ignoredFolders.map { $0.lowercased() }
+                        + inFlight.map(Folders.canonical))
         let found = Folders.candidates(in: supportDir.path).filter { !known.contains(Folders.canonical($0)) }
         guard !found.isEmpty else { return }
         for dir in found {
@@ -704,30 +911,41 @@ final class Engine: ObservableObject {
     func alignFolders() {
         guard !isDemo, !isCLI, signIn == nil else { return }
         // Read the live processes here rather than trusting `running`, which may not be filled in yet.
-        let live = Set(NSWorkspace.shared.runningApplications
-            .filter { $0.bundleIdentifier == claudeBundleID && !$0.isTerminated }
-            .compactMap { ProcArgs.of($0.processIdentifier).first { $0.hasPrefix("--user-data-dir=") } }
+        let claudes = NSWorkspace.shared.runningApplications.filter { $0.bundleIdentifier == claudeBundleID && !$0.isTerminated }
+        let argv = claudes.map { ProcArgs.of($0.processIdentifier) }
+        guard !argv.contains(where: { $0 == nil }) else { return }   // a Claude we can't read might be using any folder
+        let live = Set(argv.compactMap { $0?.first { $0.hasPrefix("--user-data-dir=") } }
             .map { Folders.canonical(String($0.dropFirst(16))) })
         var changed = false
         for i in profiles.indices {
             let p = profiles[i]
             guard let dir = p.dir, !live.contains(Folders.canonical(dir)), !isRunning(p), pending[p.id] == nil,
-                  !Folders.inUse(dir),
-                  let target = Folders.target(for: p.name, current: dir, in: supportDir.path) else { continue }
+                  !busy.contains(p.id), !Folders.inUse(dir),
+                  let target = Folders.target(for: p.name, current: dir, in: supportDir.path),
+                  !failedMoves.contains(dir + "\t" + target) else { continue }
             let oldCode = p.codeConfigDir
-            if Folders.move(dir, to: target) {
+            switch Folders.move(dir, to: target) {
+            case .moved:
                 if p.codeDir == nil, let oldCode, FileManager.default.fileExists(atPath: oldCode) {
                     profiles[i].codeDir = oldCode   // its Keychain sign-in is tied to this path
                 }
                 profiles[i].dir = target
                 changed = true
+            case .stranded:
+                // Moved, but neither the link nor the way back worked: follow the data to where it is.
+                profiles[i].dir = target
+                changed = true
+                Log.write("folder \(dir) moved to \(target) but the link back failed")
+            case .failed(let why):
+                failedMoves.insert(dir + "\t" + target)   // tried again at the next launch, not every 3 s
+                Log.write("couldn't rename \(dir) to \(target): \(why)")
             }
         }
         if changed { save() }
     }
 
     func setColor(_ p: Profile, _ c: Int) {
-        guard let i = profiles.firstIndex(of: p) else { return }
+        guard let i = profiles.firstIndex(where: { $0.id == p.id }) else { return }
         profiles[i].color = c
         save()
     }
@@ -757,7 +975,7 @@ final class Engine: ObservableObject {
     }
 
     func renameApp(_ p: Profile, to raw: String) {
-        guard let i = profiles.firstIndex(of: p) else { return }
+        guard let i = profiles.firstIndex(where: { $0.id == p.id }) else { return }
         let name = raw.trimmingCharacters(in: .whitespaces)
         profiles[i].appName = name.isEmpty || name == Profile(name: p.name, dir: p.dir).dockAppName ? nil : name
         save()
@@ -784,7 +1002,7 @@ final class Engine: ObservableObject {
     }
 
     func move(_ p: Profile, by delta: Int) {
-        guard let i = profiles.firstIndex(of: p) else { return }
+        guard let i = profiles.firstIndex(where: { $0.id == p.id }) else { return }
         let j = i + delta
         guard profiles.indices.contains(j) else { return }
         profiles.swapAt(i, j)
@@ -807,6 +1025,16 @@ enum Updater {
     static let latestURL = URL(string: "https://api.github.com/repos/QuentinCar0n/multiclaude/releases/latest")!
     nonisolated(unsafe) static var relaunching = false
     nonisolated(unsafe) static var busy = false
+    nonisolated(unsafe) static var installedPending: String?   // swapped in, waiting for the relaunch
+    static let maxZipSize = 64 << 20
+
+    // Its own session, so a stalled download gives up instead of blocking every later check.
+    static let session: URLSession = {
+        let c = URLSessionConfiguration.ephemeral
+        c.timeoutIntervalForRequest = 30
+        c.timeoutIntervalForResource = 300
+        return URLSession(configuration: c)
+    }()
 
     struct Release { let version: String; let zip: URL; let signature: URL }
 
@@ -821,18 +1049,31 @@ enum Updater {
 
     @MainActor static func checkIfDue(force: Bool) {
         let d = UserDefaults.standard
-        guard Engine.shared.isOn(.autoUpdate), !busy else { return }
+        guard Engine.shared.isOn(.autoUpdate), !busy, installedPending == nil else { return }
         if !force, let last = d.object(forKey: "lastUpdateCheck") as? Date, -last.timeIntervalSinceNow < 86_400 { return }
-        d.set(Date(), forKey: "lastUpdateCheck")
+        // A test build (1.5-rc1, 0.0.0-ci) is never replaced by a release behind the tester's back.
+        guard !currentVersion.contains("-") else { return }
         let target = Bundle.main.bundleURL
         guard target.pathExtension == "app",
-              FileManager.default.isWritableFile(atPath: target.deletingLastPathComponent().path) else { return }
+              FileManager.default.isWritableFile(atPath: target.deletingLastPathComponent().path) else {
+            if force { Log.write("update: skipped, \(target.deletingLastPathComponent().path) isn't writable") }
+            return
+        }
         busy = true
         Task.detached {
-            let installed = try? await updateIfNewer(at: target)
+            let outcome: Result<String?, Error>
+            do { outcome = .success(try await updateIfNewer(at: target)) } catch { outcome = .failure(error) }
+            let installed = try? outcome.get(), failure = { if case .failure(let e) = outcome { return "\(e)" } else { return nil } }() as String?
             await MainActor.run {
                 busy = false
-                if let installed { relaunchWhenIdle(version: installed, app: target) }
+                // A failed check is tried again in 3 hours rather than the next day (or every hour for a bad release).
+                if let failure { Log.write("update failed: \(failure)") }
+                d.set(failure == nil ? Date() : Date().addingTimeInterval(-86_400 + 3 * 3600), forKey: "lastUpdateCheck")
+                if let installed = installed ?? nil {
+                    installedPending = installed
+                    Log.write("update: installed \(installed), relaunching when idle")
+                    relaunchWhenIdle(version: installed, app: target)
+                }
             }
         }
     }
@@ -848,9 +1089,10 @@ enum Updater {
         var req = URLRequest(url: latestURL, timeoutInterval: 30)
         req.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
         req.setValue("MultiClaude/\(appVersion)", forHTTPHeaderField: "User-Agent")
-        let (data, resp) = try await URLSession.shared.data(for: req)
-        guard (resp as? HTTPURLResponse)?.statusCode == 200,
-              let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+        let (data, resp) = try await session.data(for: req)
+        let status = (resp as? HTTPURLResponse)?.statusCode ?? 0
+        guard status == 200 else { throw UpdateError.command("GitHub answered \(status)") }
+        guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
               let tag = json["tag_name"] as? String,
               let assets = json["assets"] as? [[String: Any]],
               let asset = assets.first(where: { ($0["name"] as? String)?.hasSuffix(".zip") == true }),
@@ -863,35 +1105,48 @@ enum Updater {
 
     static func trusted(_ any: Any?) -> URL? {
         guard let s = any as? String, let url = URL(string: s), url.scheme == "https", url.host == "github.com",
+              url.port == nil, url.user == nil, !url.path.contains(".."),
               url.path.hasPrefix("/QuentinCar0n/multiclaude/releases/download/") else { return nil }
         return url
     }
 
+    // Dotted numbers; a pre-release (1.5-rc1) sorts below its release (1.5) and above the one before.
     static func isNewer(_ a: String, than b: String) -> Bool {
-        let x = a.split(separator: ".").map { Int($0) ?? 0 }, y = b.split(separator: ".").map { Int($0) ?? 0 }
+        func parts(_ v: String) -> ([Int], Bool) {
+            let core = v.split(separator: "-", maxSplits: 1).first.map(String.init) ?? v
+            return (core.split(separator: ".").map { Int($0) ?? 0 }, v.contains("-"))
+        }
+        let (x, xPre) = parts(a), (y, yPre) = parts(b)
         for i in 0..<max(x.count, y.count) {
             let l = i < x.count ? x[i] : 0, r = i < y.count ? y[i] : 0
             if l != r { return l > r }
         }
-        return false
+        return yPre && !xPre
     }
 
     // Downloads the release zip, checks that it holds MultiClaude at the advertised version with an intact
     // signature, then swaps it in place of the running bundle.
     static func install(_ r: Release, at target: URL) async throws {
         let fm = FileManager.default
-        let work = fm.temporaryDirectory.appendingPathComponent("MultiClaude-update-\(UUID().uuidString)")
+        // Staged on the same volume as the app, so the final swap is a rename and never a half-done copy.
+        let work = (try? fm.url(for: .itemReplacementDirectory, in: .userDomainMask, appropriateFor: target, create: true))
+            ?? fm.temporaryDirectory.appendingPathComponent("MultiClaude-update-\(UUID().uuidString)")
         try fm.createDirectory(at: work, withIntermediateDirectories: true)
         defer { try? fm.removeItem(at: work) }
-        let (tmp, resp) = try await URLSession.shared.download(from: r.zip)
+        let (tmp, resp) = try await session.download(from: r.zip)
+        defer { try? fm.removeItem(at: tmp) }
         guard (resp as? HTTPURLResponse)?.statusCode == 200 else { throw UpdateError.download }
-        let zip = work.appendingPathComponent("update.zip")
-        try fm.moveItem(at: tmp, to: zip)
+        let size = ((try? fm.attributesOfItem(atPath: tmp.path))?[.size] as? NSNumber)?.intValue ?? Int.max
+        guard size < maxZipSize else { throw UpdateError.download }
+        let bytes = try Data(contentsOf: tmp)
         // The zip must carry a signature made with the release key; HTTPS alone would trust whoever controls the repo.
-        let (sigData, sigResp) = try await URLSession.shared.data(from: r.signature)
+        let (sigData, sigResp) = try await session.data(from: r.signature)
         guard (sigResp as? HTTPURLResponse)?.statusCode == 200,
-              UpdateSignature.verify(try Data(contentsOf: zip), signatureBase64: String(decoding: sigData, as: UTF8.self))
+              UpdateSignature.verify(bytes, signatureBase64: String(decoding: sigData, as: UTF8.self))
         else { throw UpdateError.signature }
+        // Unpack the very bytes that were verified, not the file the download left behind.
+        let zip = work.appendingPathComponent("update.zip")
+        try bytes.write(to: zip)
         try run("/usr/bin/ditto", ["-x", "-k", zip.path, work.path])
         let app = work.appendingPathComponent("MultiClaude.app")
         let info = NSDictionary(contentsOf: app.appendingPathComponent("Contents/Info.plist"))
@@ -901,27 +1156,40 @@ enum Updater {
         _ = try fm.replaceItemAt(target, withItemAt: app)
     }
 
+    // Runs a tool and throws with the first lines of its error output when it fails.
     static func run(_ tool: String, _ args: [String]) throws {
         let p = Process()
         p.executableURL = URL(fileURLWithPath: tool)
         p.arguments = args
         p.standardOutput = FileHandle.nullDevice
-        p.standardError = FileHandle.nullDevice
+        let err = Pipe()
+        p.standardError = err
         try p.run()
+        let text = String(decoding: err.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
         p.waitUntilExit()
-        if p.terminationStatus != 0 { throw UpdateError.command(tool) }
+        if p.terminationStatus != 0 {
+            let first = text.split(separator: "\n").prefix(3).joined(separator: " | ")
+            throw UpdateError.command("\(URL(fileURLWithPath: tool).lastPathComponent) exited \(p.terminationStatus)\(first.isEmpty ? "" : ": " + first)")
+        }
     }
 
+    // Waits while the panel is open or a sign-in is relaying links (a restart would drop it). The new copy
+    // starts once this process is gone, so `open` can't just bring the old one forward.
     @MainActor static func relaunchWhenIdle(version: String, app: URL) {
-        guard !PanelController.shared.isOpen else {
+        guard !PanelController.shared.isOpen, Engine.shared.signIn == nil, !Awake.shared.lidApplied else {
             DispatchQueue.main.asyncAfter(deadline: .now() + 30) { relaunchWhenIdle(version: version, app: app) }
             return
         }
-        UserDefaults.standard.set(version, forKey: "updatedTo")
         let sh = Process()
         sh.executableURL = URL(fileURLWithPath: "/bin/sh")
-        sh.arguments = ["-c", "sleep 1; /usr/bin/open \"$0\"", app.path]
-        try? sh.run()
+        sh.arguments = ["-c", "i=0; while kill -0 \"$1\" 2>/dev/null && [ $i -lt 100 ]; do sleep 0.1; i=$((i+1)); done; /usr/bin/open \"$0\"",
+                        app.path, String(ProcessInfo.processInfo.processIdentifier)]
+        do { try sh.run() } catch {
+            Log.write("update: can't relaunch (\(error.localizedDescription)); \(version) starts next time")
+            return
+        }
+        UserDefaults.standard.set(version, forKey: "updatedTo")
+        Awake.shared.saveForRelaunch()
         relaunching = true
         NSApp.terminate(nil)
     }
@@ -932,20 +1200,31 @@ enum Updater {
 // ~/Library/Logs/MultiClaude.log: link relays and sign-ins, for support. Links are logged without their query.
 enum Log {
     static let url = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Logs/MultiClaude.log")
+    static let maxSize: UInt64 = 1 << 20   // past 1 MB the log moves to MultiClaude.log.1 and starts over
+
     static func write(_ line: String) {
         guard !isCLI else { return }
-        let text = ISO8601DateFormatter().string(from: Date()) + " " + line + "\n"
+        let text = ISO8601DateFormatter().string(from: Date()) + " " + String(line.prefix(400)) + "\n"
+        let fm = FileManager.default
+        if ((try? fm.attributesOfItem(atPath: url.path))?[.size] as? NSNumber)?.uint64Value ?? 0 > maxSize {
+            let old = url.appendingPathExtension("1")
+            try? fm.removeItem(at: old)
+            try? fm.moveItem(at: url, to: old)
+        }
         if let h = try? FileHandle(forWritingTo: url) {
             _ = try? h.seekToEnd(); try? h.write(contentsOf: Data(text.utf8)); try? h.close()
         } else {
-            try? Data(text.utf8).write(to: url)
+            // Only the user reads it: links and folder names are private.
+            fm.createFile(atPath: url.path, contents: Data(text.utf8), attributes: [.posixPermissions: 0o600])
         }
     }
+    // Scheme, host and the first path segment: enough to tell a sign-in from a chat link, and no codes,
+    // ids or tokens, wherever in the link they sit.
     static func redact(_ link: String) -> String {
-        guard var c = URLComponents(string: link) else { return "<unparseable>" }
-        if c.query != nil { c.query = "…" }
-        c.fragment = nil
-        return c.string ?? "<unparseable>"
+        guard let c = URLComponents(string: link), let scheme = c.scheme else { return "<unparseable>" }
+        let first = c.path.split(separator: "/").first.map { "/" + $0 } ?? ""
+        let more = c.path.split(separator: "/").count > 1 || c.query != nil || c.fragment != nil
+        return "\(scheme)://\(c.host ?? "")\(first)\(more ? "/…" : "")"
     }
 }
 
@@ -1023,13 +1302,18 @@ enum SignInLog {
 }
 
 enum Folders {
+    // A folder's identity for comparisons only (never for file operations): symlinks resolved, and lowercased
+    // because the Mac's volumes ignore case, so "claude-work" typed in an alias is the same folder.
     static func canonical(_ path: String) -> String {
-        URL(fileURLWithPath: path).standardizedFileURL.resolvingSymlinksInPath().path
+        URL(fileURLWithPath: (path as NSString).expandingTildeInPath).standardizedFileURL.resolvingSymlinksInPath().path.lowercased()
     }
 
-    // Electron keeps a SingletonLock link in the folder while an instance uses it.
+    // Electron keeps a SingletonLock link ("<host>-<pid>") in the folder while an instance uses it.
+    // A lock left by a crash names a process that is gone, and doesn't count.
     static func inUse(_ dir: String) -> Bool {
-        (try? FileManager.default.destinationOfSymbolicLink(atPath: dir + "/SingletonLock")) != nil
+        guard let lock = try? FileManager.default.destinationOfSymbolicLink(atPath: dir + "/SingletonLock") else { return false }
+        guard let pid = lock.split(separator: "-").last.flatMap({ pid_t($0) }), pid > 0 else { return true }
+        return kill(pid, 0) == 0 || errno == EPERM
     }
 
     static func slug(_ name: String) -> String {
@@ -1061,25 +1345,34 @@ enum Folders {
         return target
     }
 
-    static func move(_ from: String, to: String) -> Bool {
+    enum MoveResult: Equatable { case moved, failed(String), stranded }
+
+    static func move(_ from: String, to: String) -> MoveResult {
         let fm = FileManager.default
+        do { try fm.moveItem(atPath: from, toPath: to) } catch { return .failed(error.localizedDescription) }
         do {
-            try fm.moveItem(atPath: from, toPath: to)
             try fm.createSymbolicLink(atPath: from, withDestinationPath: to)
-            return true
+            return .moved
         } catch {
-            if !fm.fileExists(atPath: from), fm.fileExists(atPath: to) { try? fm.moveItem(atPath: to, toPath: from) }
-            return false
+            // No link means old paths inside Claude's data would break; put the folder back.
+            if (try? fm.moveItem(atPath: to, toPath: from)) != nil { return .failed(error.localizedDescription) }
+            return .stranded
         }
     }
 }
 
 enum MCP {
+    enum Side { case source, target }
+    enum Failure: Error { case unreadable(Side) }
+
     static func configURL(_ p: Profile) -> URL { p.folderURL.appendingPathComponent("claude_desktop_config.json") }
 
+    // A missing or empty file is an empty config; a file that exists but isn't a JSON object throws.
     static func read(_ url: URL) throws -> [String: Any] {
-        guard let data = try? Data(contentsOf: url), !data.isEmpty else { return [:] }
-        guard let obj = try JSONSerialization.jsonObject(with: data) as? [String: Any] else { throw CocoaError(.fileReadCorruptFile) }
+        guard FileManager.default.fileExists(atPath: url.path) else { return [:] }
+        let data = try Data(contentsOf: url)
+        guard !data.isEmpty else { return [:] }
+        guard let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { throw CocoaError(.fileReadCorruptFile) }
         return obj
     }
 
@@ -1098,14 +1391,21 @@ enum MCP {
 
     @discardableResult
     static func copy(from source: Profile, to target: Profile) throws -> Int {
-        let servers = self.servers(source)
+        guard let src = try? read(configURL(source)) else { throw Failure.unreadable(.source) }
+        let servers = src["mcpServers"] as? [String: Any] ?? [:]
+        guard !servers.isEmpty else { return 0 }   // nothing to add: the target file isn't touched
         let url = configURL(target)
-        let merged = merge(try read(url), adding: servers)
+        guard let current = try? read(url) else { throw Failure.unreadable(.target) }
+        let merged = merge(current, adding: servers)
         let fm = FileManager.default
         if fm.fileExists(atPath: url.path) {
             let f = DateFormatter()
+            f.locale = Locale(identifier: "en_US_POSIX")
             f.dateFormat = "yyyyMMdd-HHmmss"
-            try fm.copyItem(at: url, to: url.appendingPathExtension("bak-" + f.string(from: Date())))
+            var backup = url.appendingPathExtension("bak-" + f.string(from: Date()))
+            var n = 2
+            while fm.fileExists(atPath: backup.path) { backup = url.appendingPathExtension("bak-" + f.string(from: Date()) + "-\(n)"); n += 1 }
+            try fm.copyItem(at: url, to: backup)
         } else {
             try fm.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
         }
@@ -1116,19 +1416,28 @@ enum MCP {
 }
 
 enum Duplicate {
-    // `cp -c` clones on APFS. The destination must not exist yet.
-    static func clone(from src: String, to dst: String) -> Bool {
+    // `cp -c` clones on APFS. The destination must not exist yet. The copy is made under a hidden name and
+    // renamed at the end, so a copy cut short (quit, crash, full disk) is never taken for a profile folder.
+    static func clone(from source: String, to dst: String) -> Result<Void, UpdateError> {
         let fm = FileManager.default
-        guard fm.fileExists(atPath: src), !fm.fileExists(atPath: dst) else { return false }
-        do { try Updater.run("/bin/cp", ["-cR", src, dst]) } catch {
-            try? fm.removeItem(atPath: dst)
-            return false
+        // The source may be the link left by a folder rename; copy the folder it points to.
+        let src = URL(fileURLWithPath: source).resolvingSymlinksInPath().path
+        guard fm.fileExists(atPath: src), !fm.fileExists(atPath: dst) else { return .failure(.command("source missing or destination taken")) }
+        let parent = URL(fileURLWithPath: dst).deletingLastPathComponent().path
+        let partial = parent + "/.partial-" + UUID().uuidString
+        do { try Updater.run("/bin/cp", ["-cR", src, partial]) } catch {
+            try? fm.removeItem(atPath: partial)
+            return .failure(error as? UpdateError ?? .command("\(error)"))
         }
         // Electron's single-instance lock files belong to the source process.
         for lock in ["SingletonLock", "SingletonSocket", "SingletonCookie"] {
-            try? fm.removeItem(atPath: dst + "/" + lock)
+            try? fm.removeItem(atPath: partial + "/" + lock)
         }
-        return true
+        do { try fm.moveItem(atPath: partial, toPath: dst) } catch {
+            try? fm.removeItem(atPath: partial)
+            return .failure(.command(error.localizedDescription))
+        }
+        return .success(())
     }
 }
 
@@ -1187,12 +1496,14 @@ enum UpdateWatch {
 
 // Reads a process's argv through sysctl, so no `ps` has to run.
 enum ProcArgs {
-    static func of(_ pid: pid_t) -> [String] {
+    // nil when the arguments can't be read (the process is exiting, or belongs to someone else), which
+    // callers must not take for "started without --user-data-dir".
+    static func of(_ pid: pid_t) -> [String]? {
         var mib = [CTL_KERN, KERN_PROCARGS2, pid]
         var size = 0
-        guard sysctl(&mib, 3, nil, &size, nil, 0) == 0, size > 4 else { return [] }
+        guard sysctl(&mib, 3, nil, &size, nil, 0) == 0, size > 4 else { return nil }
         var buf = [UInt8](repeating: 0, count: size)
-        guard sysctl(&mib, 3, &buf, &size, nil, 0) == 0 else { return [] }
+        guard sysctl(&mib, 3, &buf, &size, nil, 0) == 0, size > 4 else { return nil }
         let argc = buf.withUnsafeBytes { $0.load(as: Int32.self) }
         var i = 4
         while i < size && buf[i] != 0 { i += 1 }   // executable path
@@ -1249,6 +1560,883 @@ enum HotKey {
     }
 }
 
+// MARK: - Keep awake and scroll direction (ported from Cocaine)
+
+enum AwakeSetting: String, CaseIterable, Identifiable {
+    case activateAtLaunch, leftClick, shortcut, allowDisplaySleep, lidClosed
+    case notifications, powerConnect, powerDisconnect, lowBattery
+
+    var id: String { rawValue }
+    var key: String { "awake." + rawValue }   // apart from MultiClaude's own settings of the same name
+
+    var title: String {
+        switch self {
+        case .activateAtLaunch: "Activate at Launch"
+        case .leftClick: "Activate with Left Click"
+        case .shortcut: "Keyboard Shortcut"
+        case .allowDisplaySleep: "Allow Display Sleep"
+        case .lidClosed: "Keep Awake with Lid Closed"
+        case .notifications: "Notify When It Turns Off"
+        case .powerConnect: "Activate on Power Connect"
+        case .powerDisconnect: "Deactivate on Power Disconnect"
+        case .lowBattery: "Deactivate When Below 20%"
+        }
+    }
+
+    var symbol: String {
+        switch self {
+        case .activateAtLaunch: "switch.2"
+        case .leftClick: "cursorarrow.click"
+        case .shortcut: "command"
+        case .allowDisplaySleep: "moon"
+        case .lidClosed: "laptopcomputer.and.arrow.down"
+        case .notifications: "bell"
+        case .powerConnect: "bolt"
+        case .powerDisconnect: "bolt.slash"
+        case .lowBattery: "battery.25"
+        }
+    }
+
+    var hint: String? {
+        switch self {
+        case .shortcut: "⌃⌥⌘A"
+        default: nil
+        }
+    }
+}
+
+// Holds an IOKit power assertion for a chosen duration or until turned off, like `caffeinate`.
+@MainActor
+final class Awake: ObservableObject {
+    static let shared = Awake()
+
+    @Published private(set) var active = false
+    @Published private(set) var minutes: Int
+    @Published private(set) var endDate: Date?
+    @Published private(set) var tick = Date()
+
+    private let defaults = UserDefaults.standard
+    private var assertion: IOPMAssertionID = 0
+    private var holding = false
+    private(set) var lidApplied = false
+    private var timer: Timer?
+    private var powerSource: CFRunLoopSource?
+    private var lastOnAC = true
+
+    private init() {
+        minutes = defaults.object(forKey: "awake.minutes") as? Int ?? 0
+    }
+
+    func boot() {
+        lastOnAC = Power.snapshot().onAC
+        powerSource = IOPSNotificationCreateRunLoopSource({ _ in
+            MainActor.assumeIsolated { Awake.shared.powerChanged() }
+        }, nil)?.takeRetainedValue()
+        if let powerSource { CFRunLoopAddSource(CFRunLoopGetMain(), powerSource, .defaultMode) }
+        // A self-update restart picks the keep-awake back up where it was.
+        if let resume = defaults.object(forKey: "awake.resume") as? Double {
+            defaults.removeObject(forKey: "awake.resume")
+            if resume == 0 { start(until: nil) }
+            else if resume > Date().timeIntervalSince1970 { start(until: Date(timeIntervalSince1970: resume)) }
+        } else if isOn(.activateAtLaunch) {
+            activate()
+        }
+    }
+
+    // Called just before a self-update restart.
+    func saveForRelaunch() {
+        guard active else { return }
+        defaults.set(endDate?.timeIntervalSince1970 ?? 0, forKey: "awake.resume")
+    }
+
+    func isOn(_ s: AwakeSetting) -> Bool { defaults.bool(forKey: s.key) }
+
+    func toggle(_ s: AwakeSetting) {
+        let on = !isOn(s)
+        objectWillChange.send()
+        if s == .notifications && on {
+            UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { _, _ in }
+        }
+        defaults.set(on, forKey: s.key)
+        if s == .shortcut { Engine.shared.updateHotKeys() }
+        if s == .allowDisplaySleep && holding { takeAssertion() }
+        if s == .lidClosed && active { setLid(on) }
+        Engine.shared.onChange?()
+    }
+
+    func activate(minutes m: Int? = nil) {
+        if let m { setMinutes(m) }
+        start(until: minutes == 0 ? nil : Date().addingTimeInterval(TimeInterval(minutes * 60)))
+    }
+
+    private func start(until end: Date?) {
+        guard takeAssertion() else { return }
+        if isOn(.lidClosed) && !lidApplied { setLid(true) }
+        active = true
+        endDate = end
+        timer?.invalidate()
+        timer = Timer(timeInterval: 1, repeats: true) { _ in
+            MainActor.assumeIsolated { Awake.shared.onTick() }
+        }
+        RunLoop.main.add(timer!, forMode: .common)
+        Engine.shared.onChange?()
+    }
+
+    func deactivate(reason: String? = nil) {
+        guard active || holding || lidApplied else { return }
+        if holding { IOPMAssertionRelease(assertion) }
+        holding = false
+        if lidApplied { setLid(false) }
+        active = false
+        endDate = nil
+        timer?.invalidate()
+        timer = nil
+        if let reason, isOn(.notifications) { notify(reason) }
+        Engine.shared.onChange?()
+    }
+
+    func toggleActive() { active ? deactivate() : activate() }
+
+    func setMinutes(_ m: Int) {
+        minutes = m
+        defaults.set(m, forKey: "awake.minutes")
+    }
+
+    var durationLabel: String {
+        if minutes == 0 { return "∞" }
+        let h = minutes / 60, m = minutes % 60
+        if h == 0 { return "\(m)min" }
+        return m == 0 ? "\(h)hr" : "\(h)hr \(m)min"
+    }
+
+    var remainingText: String? {
+        guard active else { return nil }
+        guard let endDate else { return "Until turned off" }
+        let s = max(0, Int(endDate.timeIntervalSince(tick)))
+        let h = s / 3600, m = (s % 3600) / 60, sec = s % 60
+        return h > 0 ? String(format: "%d:%02d:%02d left", h, m, sec) : String(format: "%d:%02d left", m, sec)
+    }
+
+    @discardableResult
+    private func takeAssertion() -> Bool {
+        if holding { IOPMAssertionRelease(assertion) }
+        let type = (isOn(.allowDisplaySleep)
+            ? kIOPMAssertionTypePreventUserIdleSystemSleep
+            : kIOPMAssertionTypePreventUserIdleDisplaySleep) as CFString
+        holding = IOPMAssertionCreateWithName(type, IOPMAssertionLevel(kIOPMAssertionLevelOn),
+                                              "MultiClaude keep-awake" as CFString, &assertion) == kIOReturnSuccess
+        if !holding { NSSound.beep(); Log.write("keep-awake: power assertion refused") }
+        return holding
+    }
+
+    private func onTick() {
+        tick = Date()
+        if let endDate, tick >= endDate { deactivate(reason: "Time is up, your Mac can sleep again.") }
+    }
+
+    // Lid-closed awake needs `pmset disablesleep`, which only root can set. macOS asks for the password.
+    private func setLid(_ on: Bool) {
+        let src = "do shell script \"/usr/bin/pmset -a disablesleep \(on ? 1 : 0)\" with administrator privileges"
+        var err: NSDictionary?
+        NSAppleScript(source: src)?.executeAndReturnError(&err)
+        if err == nil { lidApplied = on }
+    }
+
+    private func powerChanged() {
+        let p = Power.snapshot()
+        if p.onAC != lastOnAC {
+            lastOnAC = p.onAC
+            if p.onAC && isOn(.powerConnect) && !active { activate() }
+            if !p.onAC && isOn(.powerDisconnect) && active { deactivate(reason: "Power disconnected.") }
+        }
+        if !p.onAC, active, isOn(.lowBattery), let pct = p.percent, pct < 20 {
+            deactivate(reason: "Battery below 20%.")
+        }
+    }
+
+    private func notify(_ body: String) {
+        let c = UNMutableNotificationContent()
+        c.title = "Keep Awake is off"
+        c.body = body
+        UNUserNotificationCenter.current().add(UNNotificationRequest(identifier: UUID().uuidString, content: c, trigger: nil))
+    }
+}
+
+enum Power {
+    static func snapshot() -> (onAC: Bool, percent: Int?) {
+        guard let info = IOPSCopyPowerSourcesInfo()?.takeRetainedValue() else { return (true, nil) }
+        let type = IOPSGetProvidingPowerSourceType(info)?.takeUnretainedValue() as String?
+        var pct: Int?
+        if let list = IOPSCopyPowerSourcesList(info)?.takeRetainedValue() as? [CFTypeRef] {
+            for ps in list {
+                guard let d = IOPSGetPowerSourceDescription(info, ps)?.takeUnretainedValue() as? [String: Any],
+                      let cur = d[kIOPSCurrentCapacityKey] as? Int, let max = d[kIOPSMaxCapacityKey] as? Int, max > 0
+                else { continue }
+                pct = cur * 100 / max
+            }
+        }
+        return (type == kIOPMACPowerKey, pct)
+    }
+}
+
+// Cocaine, the keep-awake app this part comes from, may run next to MultiClaude. Two scroll reversers
+// would flip each event twice, so MultiClaude leaves a direction alone while Cocaine already reverses it.
+enum Cocaine {
+    static let bundleID = "me.somalabs.cocaine"
+
+    static func reverses(mouse: Bool) -> Bool {
+        guard !NSRunningApplication.runningApplications(withBundleIdentifier: bundleID).isEmpty else { return false }
+        CFPreferencesAppSynchronize(bundleID as CFString)
+        return CFPreferencesGetAppBooleanValue((mouse ? "reverseMouse" : "reverseTrackpad") as CFString, bundleID as CFString, nil)
+    }
+}
+
+// Flips scroll direction through a session event tap, which needs Accessibility permission.
+// Wheel mice send line-based (non-continuous) events; trackpads send continuous ones.
+// A Magic Mouse also sends continuous events, so it follows the trackpad switch.
+@MainActor
+enum ScrollReverser {
+    // What the flip applies: the setting, minus any direction Cocaine already reverses.
+    nonisolated(unsafe) static var reverseMouse = false
+    nonisolated(unsafe) static var reverseTrackpad = false
+    nonisolated(unsafe) static var tap: CFMachPort?
+    static var source: CFRunLoopSource?
+    static var waitTimer: Timer?
+    static var cocaineMouse = false
+    static var cocaineTrackpad = false
+
+    static func update(mouse: Bool, trackpad: Bool) {
+        cocaineMouse = mouse && Cocaine.reverses(mouse: true)
+        cocaineTrackpad = trackpad && Cocaine.reverses(mouse: false)
+        reverseMouse = mouse && !cocaineMouse
+        reverseTrackpad = trackpad && !cocaineTrackpad
+        guard reverseMouse || reverseTrackpad else { stop(); return }
+        guard tap == nil else { return }
+        let prompt = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
+        if AXIsProcessTrustedWithOptions(prompt) {
+            start()
+        } else if waitTimer == nil {
+            // Install the tap as soon as the person grants access in System Settings.
+            waitTimer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { _ in
+                MainActor.assumeIsolated {
+                    guard AXIsProcessTrusted() else { return }
+                    waitTimer?.invalidate()
+                    waitTimer = nil
+                    if reverseMouse || reverseTrackpad { start() }
+                    Engine.shared.objectWillChange.send()
+                }
+            }
+        }
+    }
+
+    // Shown next to the setting when it can't act yet.
+    static func hint(mouse: Bool) -> String? {
+        if mouse ? cocaineMouse : cocaineTrackpad { return "on in Cocaine" }
+        if (mouse ? reverseMouse : reverseTrackpad) && tap == nil { return "needs Accessibility" }
+        return nil
+    }
+
+    private static func start() {
+        let mask = CGEventMask(1) << CGEventType.scrollWheel.rawValue
+        tap = CGEvent.tapCreate(tap: .cgSessionEventTap, place: .headInsertEventTap, options: .defaultTap,
+                                eventsOfInterest: mask, callback: { _, type, event, _ in
+            if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
+                if let t = ScrollReverser.tap { CGEvent.tapEnable(tap: t, enable: true) }
+            } else if type == .scrollWheel {
+                ScrollReverser.flip(event)
+            }
+            return Unmanaged.passUnretained(event)
+        }, userInfo: nil)
+        guard let tap else { NSSound.beep(); Log.write("scroll: event tap refused"); return }
+        source = CFMachPortCreateRunLoopSource(nil, tap, 0)
+        CFRunLoopAddSource(CFRunLoopGetMain(), source, .commonModes)
+        CGEvent.tapEnable(tap: tap, enable: true)
+    }
+
+    private static func stop() {
+        waitTimer?.invalidate()
+        waitTimer = nil
+        if let tap { CGEvent.tapEnable(tap: tap, enable: false) }
+        if let source { CFRunLoopRemoveSource(CFRunLoopGetMain(), source, .commonModes) }
+        tap = nil
+        source = nil
+    }
+
+    nonisolated static func flip(_ e: CGEvent) {
+        let continuous = e.getIntegerValueField(.scrollWheelEventIsContinuous) != 0
+        guard continuous ? reverseTrackpad : reverseMouse else { return }
+        let axes: [(CGEventField, CGEventField, CGEventField)] = [
+            (.scrollWheelEventDeltaAxis1, .scrollWheelEventFixedPtDeltaAxis1, .scrollWheelEventPointDeltaAxis1),
+            (.scrollWheelEventDeltaAxis2, .scrollWheelEventFixedPtDeltaAxis2, .scrollWheelEventPointDeltaAxis2),
+        ]
+        for (line, fixed, point) in axes {
+            let l = e.getIntegerValueField(line), f = e.getDoubleValueField(fixed), p = e.getIntegerValueField(point)
+            e.setIntegerValueField(line, value: -l)
+            e.setDoubleValueField(fixed, value: -f)
+            e.setIntegerValueField(point, value: -p)
+        }
+    }
+}
+
+// MARK: - Usage and conversation archive
+
+// Claude Code (the Code tab, Cowork and the terminal) logs every reply with its token counts in JSONL
+// transcripts on this Mac. MultiClaude reads them, credits each session to the account whose folder lists
+// it, and keeps a copy of every transcript, since Claude Code deletes old ones (30 days by default).
+// Regular chats keep no token counts on the Mac; their usage limits come from claude.ai (see ChatLimits).
+
+struct UsageTotals: Codable, Equatable {
+    var input = 0, output = 0, cacheWrite = 0, cacheRead = 0, messages = 0
+    var total: Int { input + output + cacheWrite + cacheRead }
+    static func + (a: Self, b: Self) -> Self {
+        Self(input: a.input + b.input, output: a.output + b.output, cacheWrite: a.cacheWrite + b.cacheWrite,
+             cacheRead: a.cacheRead + b.cacheRead, messages: a.messages + b.messages)
+    }
+}
+
+// One transcript source: a folder of JSONL files, and whose files they are.
+struct UsageSource {
+    let root: URL
+    let archiveName: String       // folder under Archive/<owner>/
+    let owner: (_ file: URL) -> String   // profile id, or UsageScan.terminal
+}
+
+final class UsageScan: @unchecked Sendable {
+    static let shared = UsageScan()
+    static let terminal = "terminal"   // ~/.claude sessions no account folder lists: the CLI's own sign-in
+    static let home = FileManager.default.homeDirectoryForCurrentUser
+
+    struct FileMark: Codable { var offset: UInt64; var owner: String }
+    struct State: Codable {
+        var version = 1
+        var files: [String: FileMark] = [:]
+        var days: [String: [String: [String: UsageTotals]]] = [:]   // day -> owner -> model -> totals
+    }
+
+    let queue = DispatchQueue(label: "me.somalabs.multiclaude.usage", qos: .utility)
+    var folder = supportDir.appendingPathComponent("MultiClaude")
+    var archiveEnabled = true
+    private var state = State()
+    private var seen = Set<UInt64>()   // message ids already counted, so a reply copied into two files counts once
+    private var loaded = false
+
+    var stateURL: URL { folder.appendingPathComponent("usage.json") }
+    var seenURL: URL { folder.appendingPathComponent("usage-seen.bin") }
+    var archiveURL: URL { folder.appendingPathComponent("Archive") }
+
+    // FNV-1a, stable across launches (Swift's own hash is not).
+    static func fnv(_ s: String) -> UInt64 {
+        var h: UInt64 = 0xcbf2_9ce4_8422_2325
+        for b in s.utf8 { h = (h ^ UInt64(b)) &* 0x100_0000_01b3 }
+        return h
+    }
+
+    private func load() {
+        guard !loaded else { return }
+        loaded = true
+        if let d = try? Data(contentsOf: stateURL), let s = try? JSONDecoder().decode(State.self, from: d) { state = s }
+        if let d = try? Data(contentsOf: seenURL) {
+            d.withUnsafeBytes { raw in
+                for i in 0..<(d.count / 8) { seen.insert(raw.loadUnaligned(fromByteOffset: i * 8, as: UInt64.self)) }
+            }
+        }
+    }
+
+    private func save() {
+        try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        if let d = try? JSONEncoder().encode(state) { try? d.write(to: stateURL, options: .atomic) }
+        try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: stateURL.path)
+        var ids = Array(seen)
+        try? Data(bytes: &ids, count: ids.count * 8).write(to: seenURL, options: .atomic)
+    }
+
+    // Session id -> profile id, from each account's own list of Code and Cowork sessions.
+    static func sessionOwners(_ profiles: [Profile]) -> [String: String] { sessionIndex(profiles).owners }
+
+    // Also the titles Claude gave the sessions, for the conversation list.
+    static func sessionIndex(_ profiles: [Profile]) -> (owners: [String: String], titles: [String: String]) {
+        var map: [String: String] = [:], titles: [String: String] = [:]
+        let fm = FileManager.default
+        for p in profiles {
+            let root = p.folderURL.appendingPathComponent("claude-code-sessions")
+            guard let e = fm.enumerator(at: root, includingPropertiesForKeys: nil) else { continue }
+            for case let f as URL in e where f.lastPathComponent.hasPrefix("local_") && f.pathExtension == "json" {
+                guard let d = try? Data(contentsOf: f),
+                      let j = try? JSONSerialization.jsonObject(with: d) as? [String: Any],
+                      let sid = j["cliSessionId"] as? String else { continue }
+                map[sid] = p.id.uuidString
+                if let title = j["title"] as? String, !title.isEmpty { titles[sid] = title }
+            }
+        }
+        return (map, titles)
+    }
+
+    // The session a transcript belongs to: <id>.jsonl, or <id>/subagents/agent-*.jsonl.
+    static func sessionID(of file: URL) -> String {
+        let parent = file.deletingLastPathComponent()
+        if parent.lastPathComponent == "subagents" { return parent.deletingLastPathComponent().lastPathComponent }
+        return file.deletingPathExtension().lastPathComponent
+    }
+
+    static func sources(_ profiles: [Profile]) -> [UsageSource] {
+        let owners = sessionOwners(profiles)
+        var list = [UsageSource(root: home.appendingPathComponent(".claude/projects"), archiveName: "code") { f in
+            owners[sessionID(of: f)] ?? terminal
+        }]
+        for p in profiles {
+            let id = p.id.uuidString
+            if let cfg = p.codeConfigDir {
+                list.append(UsageSource(root: URL(fileURLWithPath: cfg).appendingPathComponent("projects"),
+                                        archiveName: "code-" + URL(fileURLWithPath: cfg).lastPathComponent) { _ in id })
+            }
+            list.append(UsageSource(root: p.folderURL.appendingPathComponent("local-agent-mode-sessions"),
+                                    archiveName: "cowork") { _ in id })
+        }
+        return list
+    }
+
+    // Reads what was added to each transcript since the last scan. Returns the totals for the panel.
+    func scan(profiles: [Profile]) -> State { scan(sources: Self.sources(profiles)) }
+
+    func scan(sources: [UsageSource]) -> State {
+        load()
+        let fm = FileManager.default
+        var changed = false
+        for src in sources {
+            guard let e = fm.enumerator(at: src.root, includingPropertiesForKeys: [.fileSizeKey, .isRegularFileKey]) else { continue }
+            for case let f as URL in e where f.pathExtension == "jsonl" {
+                let path = f.path
+                guard let size = (try? f.resourceValues(forKeys: [.fileSizeKey]))?.fileSize.map(UInt64.init) else { continue }
+                var mark = state.files[path] ?? FileMark(offset: 0, owner: src.owner(f))
+                if size < mark.offset { mark.offset = 0 }   // rewritten: counted ids are skipped anyway
+                guard size > mark.offset else { continue }
+                mark.offset = autoreleasepool { read(f, from: mark.offset, owner: mark.owner) }
+                state.files[path] = mark
+                changed = true
+                if archiveEnabled { archive(f, root: src.root, as: src.archiveName, owner: mark.owner) }
+            }
+        }
+        if changed { save() }
+        return state
+    }
+
+    // Parses complete lines from `offset`; returns the offset after the last complete line.
+    private func read(_ f: URL, from offset: UInt64, owner: String) -> UInt64 {
+        guard let h = try? FileHandle(forReadingFrom: f) else { return offset }
+        defer { try? h.close() }
+        try? h.seek(toOffset: offset)
+        var pos = offset
+        var carry = Data()
+        let marker = Data("\"usage\"".utf8)
+        while let chunk = try? h.read(upToCount: 4 << 20), !chunk.isEmpty {
+            carry.append(chunk)
+            var start = carry.startIndex
+            while let nl = carry[start...].firstIndex(of: 0x0A) {
+                let line = carry[start..<nl]
+                if line.range(of: marker) != nil { autoreleasepool { count(line, owner: owner) } }
+                pos += UInt64(nl - start + 1)
+                start = carry.index(after: nl)
+            }
+            carry = Data(carry[start...])
+        }
+        return pos
+    }
+
+    static let dayFormat: DateFormatter = {
+        let f = DateFormatter()
+        f.locale = Locale(identifier: "en_US_POSIX")
+        f.dateFormat = "yyyy-MM-dd"
+        return f
+    }()
+
+    private func count(_ line: Data, owner: String) {
+        guard let j = try? JSONSerialization.jsonObject(with: line) as? [String: Any],
+              let m = j["message"] as? [String: Any], let u = m["usage"] as? [String: Any],
+              let model = m["model"] as? String, model != "<synthetic>" else { return }
+        let key = (m["id"] as? String ?? "") + "|" + (j["requestId"] as? String ?? "")
+        if key != "|" {
+            guard seen.insert(Self.fnv(key)).inserted else { return }
+        }
+        let stamp = (j["timestamp"] as? String).flatMap { try? Date($0, strategy: .iso8601) } ?? Date()
+        let day = Self.dayFormat.string(from: stamp)
+        var t = UsageTotals()
+        t.input = u["input_tokens"] as? Int ?? 0
+        t.output = u["output_tokens"] as? Int ?? 0
+        t.cacheWrite = u["cache_creation_input_tokens"] as? Int ?? 0
+        t.cacheRead = u["cache_read_input_tokens"] as? Int ?? 0
+        t.messages = 1
+        state.days[day, default: [:]][owner, default: [:]][model, default: UsageTotals()] =
+            (state.days[day]?[owner]?[model] ?? UsageTotals()) + t
+    }
+
+    // APFS clone of the transcript under Archive/<owner>/<source>/<path>: takes no space while Claude
+    // keeps the original, and survives Claude Code's cleanup.
+    private func archive(_ f: URL, root: URL, as name: String, owner: String) {
+        let rel = String(f.standardizedFileURL.path.dropFirst(root.standardizedFileURL.path.count)).trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+        let dest = archiveURL.appendingPathComponent(owner).appendingPathComponent(name).appendingPathComponent(rel)
+        let fm = FileManager.default
+        // Transcripts hold whole conversations: only this user may open the archive.
+        if !fm.fileExists(atPath: archiveURL.path) {
+            try? fm.createDirectory(at: archiveURL, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+        }
+        try? fm.createDirectory(at: dest.deletingLastPathComponent(), withIntermediateDirectories: true)
+        let tmp = dest.deletingLastPathComponent().appendingPathComponent(".partial-" + dest.lastPathComponent)
+        try? fm.removeItem(at: tmp)
+        guard copyfile(f.path, tmp.path, nil, copyfile_flags_t(COPYFILE_CLONE)) == 0 else { return }
+        _ = try? fm.replaceItemAt(dest, withItemAt: tmp)
+        if fm.fileExists(atPath: tmp.path) { try? fm.removeItem(at: tmp) }
+    }
+}
+
+// MARK: chat usage limits (opt-in)
+
+// The share of each account's 5-hour and weekly limits, as claude.ai shows them. MultiClaude reads the
+// account's claude.ai session cookie from its Claude folder (Chromium encrypts it with a key kept in the
+// Keychain as "Claude Safe Storage", so macOS asks once) and asks claude.ai for the numbers. The cookie
+// stays in memory, is only sent to claude.ai, and is never logged or written anywhere.
+enum ChatLimits {
+    struct Limit: Equatable { let percent: Double; let resetsAt: Date? }
+    struct Snapshot: Equatable { var fiveHour: Limit?; var week: Limit?; var error: String? }
+
+    nonisolated(unsafe) static var aesKey: Data?
+
+    static func safeStorageKey() -> Data? {
+        if let aesKey { return aesKey }
+        let q: [String: Any] = [kSecClass as String: kSecClassGenericPassword,
+                                kSecAttrService as String: "Claude Safe Storage",
+                                kSecReturnData as String: true, kSecMatchLimit as String: kSecMatchLimitOne]
+        var out: CFTypeRef?
+        guard SecItemCopyMatching(q as CFDictionary, &out) == errSecSuccess, let pw = out as? Data else { return nil }
+        var key = Data(count: 16)
+        let salt = Array("saltysalt".utf8)
+        let rc = key.withUnsafeMutableBytes { k in
+            pw.withUnsafeBytes { p in
+                CCKeyDerivationPBKDF(CCPBKDFAlgorithm(kCCPBKDF2), p.baseAddress?.assumingMemoryBound(to: CChar.self), pw.count,
+                                     salt, salt.count, CCPseudoRandomAlgorithm(kCCPRFHmacAlgSHA1), 1003,
+                                     k.baseAddress?.assumingMemoryBound(to: UInt8.self), 16)
+            }
+        }
+        guard rc == kCCSuccess else { return nil }
+        aesKey = key
+        return key
+    }
+
+    // Chromium's v10 cookie format: "v10" + AES-128-CBC (IV of 16 spaces). Since cookie DB version 24 the
+    // plaintext starts with a 32-byte hash of the domain.
+    static func decrypt(_ blob: Data, key: Data, dbVersion: Int) -> String? {
+        guard blob.count > 3, blob.prefix(3) == Data("v10".utf8) else { return nil }
+        let body = blob.dropFirst(3)
+        let iv = [UInt8](repeating: 0x20, count: 16)
+        var out = Data(count: body.count + 16)
+        var moved = 0
+        let outCount = out.count
+        let rc = out.withUnsafeMutableBytes { o in
+            body.withUnsafeBytes { b in
+                key.withUnsafeBytes { k in
+                    CCCrypt(CCOperation(kCCDecrypt), CCAlgorithm(kCCAlgorithmAES128), CCOptions(kCCOptionPKCS7Padding),
+                            k.baseAddress, 16, iv, b.baseAddress, body.count, o.baseAddress, outCount, &moved)
+                }
+            }
+        }
+        guard rc == kCCSuccess else { return nil }
+        var plain = out.prefix(moved)
+        if dbVersion >= 24 && plain.count > 32 { plain = plain.dropFirst(32) }
+        return String(data: plain, encoding: .utf8)
+    }
+
+    static func sessionKey(in folder: URL, key: Data) -> String? {
+        let db = folder.appendingPathComponent("Cookies")
+        guard FileManager.default.fileExists(atPath: db.path) else { return nil }
+        var h: OpaquePointer?
+        // immutable=1 reads without taking Claude's lock.
+        guard sqlite3_open_v2("file:\(db.path.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? db.path)?immutable=1", &h,
+                              SQLITE_OPEN_READONLY | SQLITE_OPEN_URI, nil) == SQLITE_OK else { sqlite3_close(h); return nil }
+        defer { sqlite3_close(h) }
+        var version = 0
+        var st: OpaquePointer?
+        if sqlite3_prepare_v2(h, "SELECT value FROM meta WHERE key='version'", -1, &st, nil) == SQLITE_OK, sqlite3_step(st) == SQLITE_ROW {
+            version = Int(String(cString: sqlite3_column_text(st, 0))) ?? 0
+        }
+        sqlite3_finalize(st)
+        let q = "SELECT encrypted_value FROM cookies WHERE name='sessionKey' AND host_key LIKE '%claude.ai' ORDER BY expires_utc DESC LIMIT 1"
+        guard sqlite3_prepare_v2(h, q, -1, &st, nil) == SQLITE_OK else { return nil }
+        defer { sqlite3_finalize(st) }
+        guard sqlite3_step(st) == SQLITE_ROW, let p = sqlite3_column_blob(st, 0) else { return nil }
+        let blob = Data(bytes: p, count: Int(sqlite3_column_bytes(st, 0)))
+        return decrypt(blob, key: key, dbVersion: version)
+    }
+
+    static func get(_ path: String, _ cookie: String) async throws -> Any {
+        var req = URLRequest(url: URL(string: "https://claude.ai" + path)!, timeoutInterval: 20)
+        req.setValue("sessionKey=" + cookie, forHTTPHeaderField: "Cookie")
+        req.setValue("application/json", forHTTPHeaderField: "Accept")
+        req.setValue("MultiClaude/\(appVersion)", forHTTPHeaderField: "User-Agent")
+        req.httpShouldHandleCookies = false
+        let (data, resp) = try await URLSession.shared.data(for: req)
+        let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
+        guard code == 200 else { throw NSError(domain: "claude.ai", code: code) }
+        return try JSONSerialization.jsonObject(with: data)
+    }
+
+    static func parse(_ j: Any) -> Snapshot {
+        func limit(_ k: String) -> Limit? {
+            guard let d = (j as? [String: Any])?[k] as? [String: Any], let u = d["utilization"] as? Double else { return nil }
+            return Limit(percent: u, resetsAt: (d["resets_at"] as? String).flatMap { try? Date($0, strategy: .iso8601) })
+        }
+        return Snapshot(fiveHour: limit("five_hour"), week: limit("seven_day"))
+    }
+
+    static func fetch(folder: URL) async -> Snapshot {
+        guard let key = safeStorageKey() else { return Snapshot(error: "Keychain access refused") }
+        guard let cookie = sessionKey(in: folder, key: key) else { return Snapshot(error: "Not signed in") }
+        do {
+            guard let orgs = try await get("/api/organizations", cookie) as? [[String: Any]], !orgs.isEmpty else {
+                return Snapshot(error: "No organization")
+            }
+            let org = orgs.first { ($0["capabilities"] as? [String])?.contains("chat") == true } ?? orgs[0]
+            guard let uuid = org["uuid"] as? String else { return Snapshot(error: "No organization") }
+            return parse(try await get("/api/organizations/\(uuid)/usage", cookie))
+        } catch {
+            let code = (error as NSError).code
+            Log.write("chat limits: claude.ai answered \(code)")
+            return Snapshot(error: code == 401 || code == 403 ? "claude.ai refused (\(code))" : "Couldn't reach claude.ai")
+        }
+    }
+}
+
+// MARK: usage model for the panel and the window
+
+@MainActor
+final class Usage: ObservableObject {
+    static let shared = Usage()
+
+    @Published private(set) var days: [String: [String: [String: UsageTotals]]] = [:]
+    @Published private(set) var limits: [String: ChatLimits.Snapshot] = [:]   // profile id -> limits
+    @Published private(set) var scanning = false
+    @Published private(set) var lastScan: Date?
+    private var timer: Timer?
+    private var limitsAt: Date?
+
+    // Sample numbers for README and website screenshots (MULTICLAUDE_DEMO=1): six months, busier on weekdays.
+    func loadDemo() {
+        let cal = Calendar.current
+        var rng: UInt64 = 42
+        func next() -> Double { rng = rng &* 6364136223846793005 &+ 1442695040888963407; return Double(rng >> 33) / Double(1 << 31) }
+        var out: [String: [String: [String: UsageTotals]]] = [:]
+        let profiles = Engine.shared.profiles
+        for back in 0..<180 {
+            guard let day = cal.date(byAdding: .day, value: -back, to: Date()) else { continue }
+            let weekend = cal.isDateInWeekend(day)
+            for (i, p) in profiles.enumerated() {
+                let r = next()
+                guard r > (weekend ? 0.6 : 0.15) + Double(i) * 0.12 else { continue }
+                let scale = (1.0 - Double(i) * 0.22) * (0.3 + r) * (back < 90 ? 1.0 : 0.55)
+                let o = Int(160_000 * scale)
+                let model = r > 0.8 ? "claude-sonnet-5-5" : "claude-opus-5-5"
+                out[UsageScan.dayFormat.string(from: day), default: [:]][p.id.uuidString] =
+                    [model: UsageTotals(input: o / 30, output: o, cacheWrite: o * 6, cacheRead: o * 90, messages: max(1, o / 420))]
+            }
+        }
+        days = out
+        lastScan = Date()
+    }
+
+    func start() {
+        if isDemo { loadDemo(); return }
+        guard timer == nil else { return }
+        timer = Timer(timeInterval: 120, repeats: true) { _ in MainActor.assumeIsolated { Usage.shared.refresh() } }
+        RunLoop.main.add(timer!, forMode: .common)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 5) { Usage.shared.refresh() }
+    }
+
+    func stop() {
+        timer?.invalidate()
+        timer = nil
+    }
+
+    func refresh(force: Bool = false) {
+        guard !isDemo else { return }
+        let e = Engine.shared
+        if e.isOn(.trackUsage) && !scanning {
+            scanning = true
+            let profiles = e.profiles
+            let archive = e.isOn(.archiveCode)
+            UsageScan.shared.queue.async {
+                UsageScan.shared.archiveEnabled = archive
+                let s = UsageScan.shared.scan(profiles: profiles)
+                DispatchQueue.main.async {
+                    MainActor.assumeIsolated {
+                        Usage.shared.days = s.days
+                        Usage.shared.scanning = false
+                        Usage.shared.lastScan = Date()
+                    }
+                }
+            }
+        }
+        if e.isOn(.chatLimits), force || limitsAt.map({ -$0.timeIntervalSinceNow > 290 }) ?? true {
+            limitsAt = Date()
+            let folders = e.profiles.map { ($0.id.uuidString, $0.folderURL) }
+            Task.detached {
+                var out: [String: ChatLimits.Snapshot] = [:]
+                for (id, f) in folders { out[id] = await ChatLimits.fetch(folder: f) }
+                let snapshot = out
+                await MainActor.run { Usage.shared.limits = snapshot }
+            }
+        } else if !e.isOn(.chatLimits) && !limits.isEmpty {
+            limits = [:]
+            ChatLimits.aesKey = nil
+        }
+    }
+
+    // Totals per owner (profile id or "terminal") over the last `days` days, today included; 0 = all time.
+    func totals(days n: Int) -> [String: UsageTotals] {
+        var out: [String: UsageTotals] = [:]
+        for (day, owners) in days where Self.inRange(day, n) {
+            for (owner, models) in owners { out[owner] = models.values.reduce(out[owner] ?? UsageTotals(), +) }
+        }
+        return out
+    }
+
+    func byModel(days n: Int) -> [(String, UsageTotals)] {
+        var out: [String: UsageTotals] = [:]
+        for (day, owners) in days where Self.inRange(day, n) {
+            for models in owners.values { for (m, t) in models { out[m] = (out[m] ?? UsageTotals()) + t } }
+        }
+        return out.sorted { $0.value.total > $1.value.total }
+    }
+
+    // Day -> totals, for one account or all of them.
+    func perDay(owner: String?) -> [String: UsageTotals] {
+        days.mapValues { owners in
+            owners.filter { owner == nil || $0.key == owner }.values.flatMap(\.values).reduce(UsageTotals(), +)
+        }
+    }
+
+    static func inRange(_ day: String, _ n: Int) -> Bool {
+        guard n > 0, let start = Calendar.current.date(byAdding: .day, value: -(n - 1), to: Calendar.current.startOfDay(for: Date()))
+        else { return true }
+        return day >= UsageScan.dayFormat.string(from: start)
+    }
+
+    static func ownerName(_ owner: String) -> String {
+        if owner == UsageScan.terminal { return "Terminal" }
+        return Engine.shared.profiles.first { $0.id.uuidString == owner }?.name ?? "Removed profile"
+    }
+
+    static func ownerTint(_ owner: String) -> Color {
+        Engine.shared.profiles.first { $0.id.uuidString == owner }?.tint ?? .secondary
+    }
+
+    static func short(_ n: Int) -> String {
+        switch n {
+        case 1_000_000_000...: String(format: "%.1fB", Double(n) / 1e9)
+        case 1_000_000...: String(format: "%.1fM", Double(n) / 1e6)
+        case 1_000...: String(format: "%.0fK", Double(n) / 1e3)
+        default: "\(n)"
+        }
+    }
+}
+
+// MARK: archived conversations
+
+struct ArchivedSession: Identifiable, Hashable {
+    let id: String        // file path
+    let owner: String
+    let title: String
+    let project: String
+    let date: Date
+    let size: Int
+}
+
+enum ArchiveIndex {
+    // Main transcripts only (not subagents), newest first. Reads the first 256 KB of each for a title.
+    static func list(titles: [String: String] = [:]) -> [ArchivedSession] {
+        let root = UsageScan.shared.archiveURL
+        let fm = FileManager.default
+        var out: [ArchivedSession] = []
+        guard let owners = try? fm.contentsOfDirectory(atPath: root.path) else { return [] }
+        for owner in owners where !owner.hasPrefix(".") {
+            guard let e = fm.enumerator(at: root.appendingPathComponent(owner),
+                                        includingPropertiesForKeys: [.contentModificationDateKey, .fileSizeKey]) else { continue }
+            for case let f as URL in e where f.pathExtension == "jsonl" && !f.path.contains("/subagents/")
+                && !f.lastPathComponent.hasPrefix(".partial-") && f.lastPathComponent != "audit.jsonl" {
+                let v = try? f.resourceValues(forKeys: [.contentModificationDateKey, .fileSizeKey])
+                let (title, project) = summary(f)
+                guard let title else { continue }
+                out.append(ArchivedSession(id: f.path, owner: owner, title: titles[UsageScan.sessionID(of: f)] ?? title, project: project,
+                                           date: v?.contentModificationDate ?? .distantPast, size: v?.fileSize ?? 0))
+            }
+        }
+        return out.sorted { $0.date > $1.date }
+    }
+
+    static func summary(_ f: URL) -> (String?, String) {
+        guard let h = try? FileHandle(forReadingFrom: f) else { return (nil, "") }
+        defer { try? h.close() }
+        let data = (try? h.read(upToCount: 256 << 10)) ?? Data()
+        var title: String?, custom: String?, cwd = ""
+        for line in data.split(separator: 0x0A) {
+            guard let j = try? JSONSerialization.jsonObject(with: Data(line)) as? [String: Any] else { continue }
+            if let t = j["customTitle"] as? String { custom = t }
+            if cwd.isEmpty, let c = j["cwd"] as? String { cwd = c }
+            if title == nil, j["type"] as? String == "user", (j["isMeta"] as? Bool) != true,
+               let text = Transcript.text(of: j["message"]), !text.hasPrefix("<") {
+                title = String(text.prefix(90)).replacingOccurrences(of: "\n", with: " ")
+            }
+            if title != nil && custom != nil { break }
+        }
+        return (custom ?? title, URL(fileURLWithPath: cwd).lastPathComponent)
+    }
+}
+
+enum Transcript {
+    struct Turn: Identifiable { let id: Int; let role: String; let text: String }
+
+    static func text(of message: Any?) -> String? {
+        guard let m = message as? [String: Any] else { return nil }
+        if let s = m["content"] as? String { return s.trimmingCharacters(in: .whitespacesAndNewlines) }
+        guard let blocks = m["content"] as? [[String: Any]] else { return nil }
+        let parts = blocks.compactMap { b -> String? in
+            switch b["type"] as? String {
+            case "text": return b["text"] as? String
+            case "tool_use": return "_[\(b["name"] as? String ?? "tool")]_"
+            default: return nil
+            }
+        }
+        let s = parts.joined(separator: "\n\n").trimmingCharacters(in: .whitespacesAndNewlines)
+        return s.isEmpty ? nil : s
+    }
+
+    // User prompts and Claude's replies, without tool results or system lines.
+    static func turns(_ path: String) -> [Turn] {
+        guard let data = FileManager.default.contents(atPath: path) else { return [] }
+        var out: [Turn] = []
+        var lastAssistant: String?
+        for line in data.split(separator: 0x0A) {
+            guard let j = try? JSONSerialization.jsonObject(with: Data(line)) as? [String: Any],
+                  let type = j["type"] as? String, type == "user" || type == "assistant",
+                  (j["isMeta"] as? Bool) != true, (j["isSidechain"] as? Bool) != true,
+                  let text = text(of: j["message"]), !text.hasPrefix("<") else { continue }
+            // Claude Code writes one line per content block of a reply; merge them back.
+            let mid = (j["message"] as? [String: Any])?["id"] as? String
+            if type == "assistant", let mid, mid == lastAssistant, let last = out.popLast() {
+                out.append(Turn(id: last.id, role: "assistant", text: last.text + "\n\n" + text))
+                continue
+            }
+            lastAssistant = type == "assistant" ? mid : nil
+            out.append(Turn(id: out.count, role: type, text: text))
+        }
+        return out
+    }
+
+    static func markdown(_ s: ArchivedSession, account: String) -> String {
+        var md = "# \(s.title)\n\n"
+        md += "\(account) · \(s.project) · \(s.date.formatted(date: .abbreviated, time: .shortened))\n\n"
+        for t in turns(s.id) { md += "## \(t.role == "user" ? "You" : "Claude")\n\n\(t.text)\n\n" }
+        return md
+    }
+}
+
 // MARK: - App icon (drawn, so the bundle needs no image files)
 
 enum AppIcon {
@@ -1302,7 +2490,10 @@ enum AppIcon {
     }
 
     static func claudeTinted(_ side: CGFloat, color: NSColor) -> NSImage? {
-        let src = NSWorkspace.shared.icon(forFile: realClaudeApp().path)
+        // icon(forFile:) hands back a generic app icon for a missing path; the letter tile is better then.
+        let claude = realClaudeApp()
+        guard FileManager.default.fileExists(atPath: claude.appendingPathComponent("Contents/Info.plist").path) else { return nil }
+        let src = NSWorkspace.shared.icon(forFile: claude.path)
         var rect = NSRect(x: 0, y: 0, width: side, height: side)
         guard let cg = src.cgImage(forProposedRect: &rect, context: nil, hints: nil) else { return nil }
         let orange = NSColor.claude.usingColorSpace(.sRGB)!, target = color.usingColorSpace(.sRGB) ?? color
@@ -1320,10 +2511,32 @@ enum AppIcon {
         return NSImage(cgImage: out, size: NSSize(width: side, height: side))
     }
 
+    // The profile icon as a Finder custom icon: one 8-bit sRGB bitmap per icns size. NSWorkspace.setIcon
+    // faults inside IconServices when given a single large rep (seen on macOS 27), so every size is explicit.
+    static func finderIcon(color: NSColor, letter: String) -> NSImage {
+        let art = claudeTinted(1024, color: color)
+        let icon = NSImage(size: NSSize(width: 512, height: 512))
+        for (pt, scale) in [16, 32, 128, 256, 512].flatMap({ pt in [(pt, 1), (pt, 2)] }) {
+            let px = pt * scale
+            guard let rep = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: px, pixelsHigh: px, bitsPerSample: 8,
+                                             samplesPerPixel: 4, hasAlpha: true, isPlanar: false, colorSpaceName: .calibratedRGB,
+                                             bytesPerRow: 0, bitsPerPixel: 0)?.retagging(with: .sRGB) else { continue }
+            NSGraphicsContext.saveGraphicsState()
+            NSGraphicsContext.current = NSGraphicsContext(bitmapImageRep: rep)
+            NSGraphicsContext.current?.imageInterpolation = .high
+            (art ?? tile(CGFloat(px), color: color, letter: letter)).draw(in: NSRect(x: 0, y: 0, width: px, height: px))
+            NSGraphicsContext.restoreGraphicsState()
+            rep.size = NSSize(width: pt, height: pt)
+            icon.addRepresentation(rep)
+        }
+        return icon
+    }
+
     static func png(_ image: NSImage, pixels px: Int) -> Data? {
-        let rep = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: px, pixelsHigh: px,
-                                   bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false,
-                                   colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0)!
+        guard let rep = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: px, pixelsHigh: px,
+                                         bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false,
+                                         colorSpaceName: .calibratedRGB, bytesPerRow: 0, bitsPerPixel: 0)?.retagging(with: .sRGB)
+        else { return nil }
         NSGraphicsContext.saveGraphicsState()
         NSGraphicsContext.current = NSGraphicsContext(bitmapImageRep: rep)
         image.draw(in: NSRect(x: 0, y: 0, width: px, height: px))
@@ -1410,7 +2623,7 @@ enum Runtimes {
     static func ensure(_ p: Profile, from claude: URL, running: (URL) -> Bool = isRunning) -> URL? {
         let fm = FileManager.default
         let want = target(p)
-        guard let source = version(claude) else { return current(p.id) }
+        guard let sourceVersion = version(claude) else { return current(p.id) }
         if var rt = current(p.id) {
             if running(rt) {
                 // Only the icon can change under a running copy: it sits outside the bundle's code.
@@ -1424,7 +2637,7 @@ enum Runtimes {
             if rt.lastPathComponent != want.lastPathComponent, (try? fm.moveItem(at: rt, to: want)) != nil { rt = want }
             let current = version(rt) ?? ""
             let stamped = (try? String(contentsOf: stampURL(p.id), encoding: .utf8)) ?? ""
-            if stamped.hasPrefix("\(format)|"), current == source || Updater.isNewer(current, than: source) {
+            if stamped.hasPrefix("\(format)|"), current == sourceVersion || Updater.isNewer(current, than: sourceVersion) {
                 if stamped == stamp(p, version: current) && hasLook(rt) { return rt }
                 applyLook(p, to: rt, version: current)
                 return rt
@@ -1433,8 +2646,16 @@ enum Runtimes {
         }
         try? fm.createDirectory(at: dir(p.id), withIntermediateDirectories: true)
         // clonefile copies the whole bundle as one APFS clone; it fails rather than copy on other volumes.
-        guard clonefile(claude.path, want.path, 0) == 0 else { return nil }
-        applyLook(p, to: want, version: source)
+        let source = claude.resolvingSymlinksInPath()
+        guard clonefile(source.path, want.path, 0) == 0 else {
+            let why = String(cString: strerror(errno))
+            Log.write("profile copy for \(p.name) not made (\(why)); it runs from Claude.app")
+            if (try? fm.contentsOfDirectory(atPath: dir(p.id).path))?.filter({ $0 != "stamp" }).isEmpty == true {
+                try? fm.removeItem(at: dir(p.id))
+            }
+            return nil
+        }
+        applyLook(p, to: want, version: sourceVersion)
         return want
     }
 
@@ -1445,10 +2666,11 @@ enum Runtimes {
 
     static func applyLook(_ p: Profile, to app: URL, version: String, register: Bool = true) {
         let fm = FileManager.default
-        let ok = NSWorkspace.shared.setIcon(AppIcon.profile(1024, color: p.nsTint, letter: p.initial), forFile: app.path, options: [])
+        let ok = NSWorkspace.shared.setIcon(AppIcon.finderIcon(color: p.nsTint, letter: p.initial), forFile: app.path, options: [])
         Log.write("profile copy \(app.lastPathComponent): icon \(ok ? "set" : "FAILED"), Claude \(version)")
         try? fm.setAttributes([.modificationDate: Date()], ofItemAtPath: app.path)
         if register { LSRegisterURL(app as CFURL, true) }
+        // Written even when the icon failed: ensure() also checks hasLook, so a closed copy tries again.
         try? Data(stamp(p, version: version).utf8).write(to: stampURL(p.id))
     }
 
@@ -1484,8 +2706,11 @@ enum Launchers {
 
     // "Claude Work" -> "Claude Work.app", with the characters Finder can't show in a name replaced.
     static func fileName(_ name: String) -> String {
-        let clean = name.replacingOccurrences(of: "/", with: "-").replacingOccurrences(of: ":", with: "-")
+        var clean = String(String.UnicodeScalarView(name.unicodeScalars.filter { !CharacterSet.controlCharacters.contains($0) }))
+            .replacingOccurrences(of: "/", with: "-").replacingOccurrences(of: ":", with: "-")
             .trimmingCharacters(in: .whitespacesAndNewlines.union(CharacterSet(charactersIn: ".")))
+        // File names stop at 255 bytes; leave room for ".app", a " 2" and the hidden temporary names.
+        while clean.utf8.count > 200 { clean.removeLast() }
         return (clean.isEmpty ? "Claude" : clean) + ".app"
     }
 
@@ -1495,7 +2720,7 @@ enum Launchers {
             + (p.dir.map { "exec /usr/bin/open -n -a \"$app\" --args \(shellQuote("--user-data-dir=" + $0))" } ?? "exec /usr/bin/open -a \"$app\"")
         return """
         #!/bin/sh
-        # Made by MultiClaude for the profile \(shellQuote(p.name)). MultiClaude rewrites this app; edits are lost.
+        # Made by MultiClaude for the profile \(shellQuote(String(p.name.filter { !$0.isNewline }))). MultiClaude rewrites this app; edits are lost.
         /usr/bin/open -g "multiclaude://open?profile=\(p.id.uuidString)" 2>/dev/null && exit 0
         \(fallback)
 
@@ -1530,7 +2755,8 @@ enum Launchers {
 
     // The profile apps in `folder`, by profile. Other apps a user puts there are left alone.
     static func installed(in folder: URL) -> [UUID: URL] {
-        let items = (try? FileManager.default.contentsOfDirectory(at: folder, includingPropertiesForKeys: nil)) ?? []
+        let items = (try? FileManager.default.contentsOfDirectory(at: folder, includingPropertiesForKeys: nil,
+                                                                  options: [.skipsHiddenFiles])) ?? []
         var out: [UUID: URL] = [:]
         for app in items where app.pathExtension == "app" {
             guard let info = readInfo(app), (info["CFBundleIdentifier"] as? String)?.hasPrefix(idPrefix) == true,
@@ -1545,6 +2771,7 @@ enum Launchers {
         let fm = FileManager.default
         let tmp = dest.deletingLastPathComponent().appendingPathComponent(".\(p.id.uuidString).tmp.app")
         try? fm.removeItem(at: tmp)
+        defer { try? fm.removeItem(at: tmp) }   // left over only when a step below failed
         let contents = tmp.appendingPathComponent("Contents")
         try fm.createDirectory(at: contents.appendingPathComponent("MacOS"), withIntermediateDirectories: true)
         try fm.createDirectory(at: contents.appendingPathComponent("Resources"), withIntermediateDirectories: true)
@@ -1573,27 +2800,63 @@ enum Launchers {
         var have = installed(in: folder)
         for (id, url) in have where !profiles.contains(where: { $0.id == id }) {
             if (try? fm.removeItem(at: url)) != nil { result.removed.append(url) }
+            else { Log.write("profile app \(url.lastPathComponent): couldn't remove it") }
             have[id] = nil
+        }
+        // Hidden apps left by a run cut short (see write and the renames below).
+        for name in (try? fm.contentsOfDirectory(atPath: folder.path)) ?? []
+        where name.hasPrefix(".") && (name.hasSuffix(".tmp.app") || name.hasSuffix(".move.app")) {
+            guard let id = UUID(uuidString: String(name.dropFirst().prefix(36))), have[id] == nil else { continue }
+            let url = folder.appendingPathComponent(name)
+            if name.hasSuffix(".move.app"), profiles.contains(where: { $0.id == id }) { have[id] = url } else { try? fm.removeItem(at: url) }
         }
         guard !profiles.isEmpty else { return result }
         try? fm.createDirectory(at: folder, withIntermediateDirectories: true)
         var taken: Set<String> = ["claude.app"]   // never shadow Claude itself
+        var names: [UUID: String] = [:]
         for p in profiles {
             // Two profiles can't share a file name; the later one gets a number.
+            // The base is shortened first so the number survives fileName's length cap.
             var name = p.dockAppName, n = 2
-            while taken.contains(fileName(name).lowercased()) { name = "\(p.dockAppName) \(n)"; n += 1 }
+            var base = p.dockAppName
+            while base.utf8.count > 180 { base.removeLast() }
+            while taken.contains(fileName(name).lowercased()) {
+                name = n < 1000 ? "\(base) \(n)" : "\(base) \(p.id.uuidString.prefix(8))"
+                n += 1
+            }
             taken.insert(fileName(name).lowercased())
+            names[p.id] = name
+        }
+        // Apps that change name step aside under a hidden name first, so two profiles can swap names
+        // (after a reorder) without each one finding the other's app in its way.
+        var origin: [UUID: URL] = [:]
+        for p in profiles {
+            guard let current = have[p.id], let name = names[p.id],
+                  current.lastPathComponent != fileName(name) else { continue }
+            let aside = folder.appendingPathComponent(".\(p.id.uuidString).move.app")
+            if current.lastPathComponent == aside.lastPathComponent { continue }   // already aside from a cut-short run
+            try? fm.removeItem(at: aside)
+            if (try? fm.moveItem(at: current, to: aside)) != nil { origin[p.id] = current; have[p.id] = aside }
+        }
+        for p in profiles {
+            guard let name = names[p.id] else { continue }
             let dest = folder.appendingPathComponent(fileName(name))
             if let current = have[p.id] {
                 let same = current.standardizedFileURL == dest.standardizedFileURL
                 if same, readInfo(current)?["MCStamp"] as? String == stamp(for: p, name: name) { continue }
                 if !same {
-                    // Free the new name first if another profile's old app still sits there.
-                    if fm.fileExists(atPath: dest.path) && current.lastPathComponent.lowercased() != dest.lastPathComponent.lowercased() {
+                    let from = origin[p.id] ?? current
+                    if fm.fileExists(atPath: dest.path) {
+                        // Something MultiClaude didn't make holds the name: put the app back and report it.
+                        if let back = origin[p.id] { try? fm.moveItem(at: current, to: back) }
+                        Log.write("profile app \(dest.lastPathComponent): the name is taken by another file")
                         result.failed.append(p.name); continue
                     }
-                    do { try fm.moveItem(at: current, to: dest); result.moved.append((current, dest)) }
-                    catch { result.failed.append(p.name); continue }
+                    do { try fm.moveItem(at: current, to: dest); result.moved.append((from, dest)) }
+                    catch {
+                        Log.write("profile app \(dest.lastPathComponent): \(error.localizedDescription)")
+                        result.failed.append(p.name); continue
+                    }
                 }
             } else if fm.fileExists(atPath: dest.path) {
                 result.failed.append(p.name); continue   // a file MultiClaude didn't make; leave it
@@ -1601,7 +2864,10 @@ enum Launchers {
             do {
                 try write(p, name: name, to: dest)
                 if have[p.id] != nil { result.rewritten.append(dest) }
-            } catch { result.failed.append(p.name) }
+            } catch {
+                Log.write("profile app \(dest.lastPathComponent): \(error.localizedDescription)")
+                result.failed.append(p.name)
+            }
         }
         return result
     }
@@ -1611,9 +2877,13 @@ enum Launchers {
 // for its own profile apps, and only when the user pins one or one of them moves or goes away.
 enum Dock {
     static let domain = "com.apple.dock" as CFString
+    // Tiles taken off for an icon refresh and not put back yet; run at quit so they're never lost.
+    nonisolated(unsafe) static var pendingRestore: (() -> Void)?
 
-    static func entries() -> [[String: Any]] {
-        CFPreferencesCopyAppValue("persistent-apps" as CFString, domain) as? [[String: Any]] ?? []
+    // nil when the Dock's list can't be read; writing then would replace every pinned app.
+    static func entries() -> [[String: Any]]? {
+        guard let value = CFPreferencesCopyAppValue("persistent-apps" as CFString, domain) else { return [] }
+        return value as? [[String: Any]]
     }
 
     static func path(of entry: [String: Any]) -> String? {
@@ -1629,26 +2899,27 @@ enum Dock {
     }
 
     static func contains(_ app: URL) -> Bool {
-        entries().contains { path(of: $0) == app.standardizedFileURL.path }
+        (entries() ?? []).contains { path(of: $0) == app.standardizedFileURL.path }
     }
 
-    private static func write(_ list: [[String: Any]]) {
+    @discardableResult
+    private static func write(_ list: [[String: Any]]) -> Bool {
         CFPreferencesSetAppValue("persistent-apps" as CFString, list as CFArray, domain)
-        CFPreferencesAppSynchronize(domain)
+        guard CFPreferencesAppSynchronize(domain) else { Log.write("Dock: couldn't save its app list"); return false }
         // The Dock reads its tiles at start only.
         let p = Process()
         p.executableURL = URL(fileURLWithPath: "/usr/bin/killall")
         p.arguments = ["Dock"]
         try? p.run()
+        return true
     }
 
     @discardableResult
     static func add(_ app: URL) -> Bool {
-        if contains(app) { return true }
-        var list = entries()
+        guard var list = entries() else { Log.write("Dock: app list unreadable, not adding \(app.lastPathComponent)"); return false }
+        if list.contains(where: { path(of: $0) == app.standardizedFileURL.path }) { return true }
         list.append(entry(for: app))
-        write(list)
-        return true
+        return write(list)
     }
 
     // Points moved apps' tiles at their new path and drops the tiles of removed apps.
@@ -1658,9 +2929,10 @@ enum Dock {
         let gone = Set(removed.map(\.standardizedFileURL.path))
         let moves = Dictionary(moved.map { ($0.from.standardizedFileURL.path, $0.to) }, uniquingKeysWith: { a, _ in a })
         let redo = Set(refresh.map(\.standardizedFileURL.path))
+        guard let current = entries() else { Log.write("Dock: app list unreadable, left as it is"); return }
         var changed = false, refreshing = false
         var list: [[String: Any]] = [], without: [[String: Any]] = []
-        for e in entries() {
+        for e in current {
             guard let p = path(of: e) else { list.append(e); without.append(e); continue }
             if gone.contains(p) { changed = true; continue }
             let to = moves[p]
@@ -1673,7 +2945,20 @@ enum Dock {
         }
         guard refreshing else { if changed { write(list) }; return }
         write(without)
-        DispatchQueue.main.asyncAfter(deadline: .now() + 3) { write(list) }   // once the Dock is back up
+        // Once the Dock is back up, put the tiles back where they were. Re-read first so a change the user
+        // made in between stays; only our own tiles are re-inserted.
+        let back = list
+        pendingRestore = {
+            pendingRestore = nil
+            guard var now = entries() else { return }
+            let have = Set(now.compactMap(path(of:)))
+            for (i, e) in back.enumerated() {
+                guard let p = path(of: e), redo.contains(p), !have.contains(p) else { continue }
+                now.insert(e, at: min(i, now.count))
+            }
+            write(now)
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 3) { pendingRestore?() }
     }
 }
 
@@ -1860,6 +3145,13 @@ struct ProfileRow: View {
 // Confirmations for actions that quit a window or write into a profile's folder.
 @MainActor
 enum Dialogs {
+    // Chat limits read each account's claude.ai session cookie, so ask before the first time.
+    static func confirmChatLimits() -> Bool {
+        alert("Show each account's chat limits?",
+              "claude.ai keeps the 5-hour and weekly limits, not your Mac. To ask for them, MultiClaude reads each account's claude.ai sign-in cookie from its Claude folder (macOS asks you to allow \"Claude Safe Storage\" in the Keychain) and sends it to claude.ai only, every few minutes. It is kept in memory, never written or logged. This uses an endpoint claude.ai doesn't document, so it may stop working.",
+              buttons: ["Show Chat Limits", "Cancel"]).0 == 0
+    }
+
     static func alert(_ title: String, _ text: String, buttons: [String], field: String? = nil) -> (Int, String) {
         PanelController.shared.close()
         NSApp.activate()
@@ -1944,24 +3236,38 @@ struct NewProfileRow: View {
     }
 }
 
-struct SettingRow: View {
-    let setting: Setting
-    @ObservedObject var engine = Engine.shared
+struct ToggleRow: View {
+    let symbol: String
+    let title: String
+    let hint: String?
+    let on: Bool
+    let action: () -> Void
 
     var body: some View {
-        let on = engine.isOn(setting)
         HStack(spacing: 9) {
-            Badge(on: on) { Image(systemName: setting.symbol).font(.system(size: 12, weight: .medium)) }
-            Text(setting.title).font(.system(size: 13)).foregroundStyle(.primary.opacity(on ? 1 : 0.75))
+            Badge(on: on) { Image(systemName: symbol).font(.system(size: 12, weight: .medium)) }
+            Text(title).font(.system(size: 13)).foregroundStyle(.primary.opacity(on ? 1 : 0.75))
             Spacer(minLength: 4)
-            if let hint = setting.hint {
+            if let hint {
                 Text(hint).font(.system(size: 10)).foregroundStyle(.tertiary)
             }
         }
         .padding(.horizontal, 8)
         .padding(.vertical, 5)
         .modifier(HoverBackground(radius: 8))
-        .onTapGesture { engine.toggle(setting) }
+        .onTapGesture(perform: action)
+    }
+}
+
+struct SettingRow: View {
+    let setting: Setting
+    @ObservedObject var engine = Engine.shared
+
+    var body: some View {
+        let scrollHint = setting == .reverseMouse || setting == .reverseTrackpad
+            ? ScrollReverser.hint(mouse: setting == .reverseMouse) : nil
+        ToggleRow(symbol: setting.symbol, title: setting.title, hint: scrollHint ?? setting.hint,
+                  on: engine.isOn(setting)) { engine.toggle(setting) }
     }
 }
 
@@ -1977,10 +3283,592 @@ struct PlainRow: View {
     }
 }
 
+struct Chip<Label: View>: View {
+    let selected: Bool
+    let action: () -> Void
+    @ViewBuilder let label: Label
+    @State private var hover = false
+
+    var body: some View {
+        label
+            .foregroundStyle(selected ? Color.white : Color.primary)
+            .frame(width: 24, height: 24)
+            .background(Circle().fill(selected ? Color.claude : Color.primary.opacity(hover ? 0.2 : 0.12)))
+            .contentShape(Circle())
+            .onHover { hover = $0 }
+            .onTapGesture(perform: action)
+    }
+}
+
+struct Dot: View {
+    var body: some View { Circle().fill(Color.primary.opacity(0.25)).frame(width: 4, height: 4) }
+}
+
+// Duration chips: ∞, 15/30/45 min, 1/2/4/8 h, and a gear that opens a 5 min to 24 h slider.
+struct DurationRow: View {
+    @ObservedObject var awake = Awake.shared
+    @AppStorage("awake.sliderOpen") private var sliderOpen = false
+
+    private func chip(_ m: Int) -> some View {
+        Chip(selected: !sliderOpen && awake.active && awake.minutes == m, action: {
+            sliderOpen = false
+            awake.activate(minutes: m)
+        }) {
+            if m == 0 {
+                Image(systemName: "infinity").font(.system(size: 12, weight: .bold))
+            } else {
+                Text(m < 60 ? "\(m)" : String(format: "%02d", m / 60))
+                    .font(.system(size: 13, weight: .semibold)).fontWidth(.condensed).monospacedDigit()
+            }
+        }
+        .help(m == 0 ? "Until turned off" : m < 60 ? "\(m) minutes" : "\(m / 60) hour\(m == 60 ? "" : "s")")
+    }
+
+    var body: some View {
+        VStack(spacing: 10) {
+            HStack(spacing: 0) {
+                chip(0)
+                Spacer(minLength: 3); Dot(); Spacer(minLength: 3)
+                HStack(spacing: 3) { chip(15); chip(30); chip(45) }
+                Spacer(minLength: 3); Dot(); Spacer(minLength: 3)
+                HStack(spacing: 3) { chip(60); chip(120); chip(240); chip(480) }
+                Spacer(minLength: 3); Dot(); Spacer(minLength: 3)
+                Chip(selected: sliderOpen, action: {
+                    withAnimation(.easeOut(duration: 0.18)) { sliderOpen.toggle() }
+                }) {
+                    Image(systemName: "gearshape.fill").font(.system(size: 12, weight: .semibold))
+                }
+                .help("Custom duration")
+            }
+            if sliderOpen {
+                DurationSlider(minutes: awake.minutes == 0 ? 60 : awake.minutes,
+                               onChange: { awake.setMinutes($0) },
+                               onCommit: { awake.activate(minutes: $0) })
+            }
+        }
+    }
+}
+
+// Custom duration, 5 min to 24 h in 5 min steps. Drag updates the header live, release starts the timer.
+struct DurationSlider: View {
+    static let range = 5...1440
+    let minutes: Int
+    let onChange: (Int) -> Void
+    let onCommit: (Int) -> Void
+
+    private let thumb = CGSize(width: 26, height: 16)
+
+    var body: some View {
+        GeometryReader { g in
+            let w = g.size.width
+            let span = CGFloat(Self.range.upperBound - Self.range.lowerBound)
+            let frac = CGFloat(min(max(minutes, Self.range.lowerBound), Self.range.upperBound) - Self.range.lowerBound) / span
+            let x = frac * (w - thumb.width)
+            ZStack(alignment: .leading) {
+                Capsule().fill(Color.primary.opacity(0.14)).frame(height: 4)
+                Capsule().fill(Color.claude).frame(width: x + thumb.width / 2, height: 4)
+                Capsule().fill(.white)
+                    .frame(width: thumb.width, height: thumb.height)
+                    .shadow(color: .black.opacity(0.3), radius: 1.5, y: 0.5)
+                    .offset(x: x)
+            }
+            .frame(height: 20)
+            .overlay(alignment: .bottom) {
+                Canvas { ctx, size in
+                    var px: CGFloat = thumb.width / 2
+                    while px <= size.width - thumb.width / 2 {
+                        ctx.fill(Path(ellipseIn: CGRect(x: px - 0.75, y: 0, width: 1.5, height: 1.5)),
+                                 with: .color(.primary.opacity(0.25)))
+                        px += 4
+                    }
+                }
+                .frame(height: 2)
+                .offset(y: 1)
+            }
+            .contentShape(Rectangle())
+            .gesture(DragGesture(minimumDistance: 0)
+                .onChanged { v in onChange(value(at: v.location.x, width: w)) }
+                .onEnded { v in onCommit(value(at: v.location.x, width: w)) })
+        }
+        .frame(height: 20)
+        .padding(.bottom, 2)
+    }
+
+    private func value(at x: CGFloat, width w: CGFloat) -> Int {
+        let f = min(max((x - thumb.width / 2) / (w - thumb.width), 0), 1)
+        let steps = Int((f * CGFloat(Self.range.upperBound - Self.range.lowerBound) / 5).rounded())
+        return Self.range.lowerBound + steps * 5
+    }
+}
+
+// The Keep Awake section: the duration chips and its own options folded underneath. The bolt in the
+// panel header turns it on and off.
+struct AwakeSection: View {
+    @ObservedObject var awake = Awake.shared
+    @AppStorage("awake.optionsOpen") private var optionsOpen = false
+
+    var body: some View {
+        VStack(spacing: 0) {
+            DurationRow().padding(.horizontal, 8).padding(.top, 2).padding(.bottom, 8)
+            HStack(spacing: 6) {
+                Text("Options").font(.system(size: 12, weight: .medium)).foregroundStyle(.secondary)
+                Image(systemName: "chevron.right")
+                    .font(.system(size: 10, weight: .semibold))
+                    .foregroundStyle(.secondary)
+                    .rotationEffect(.degrees(optionsOpen ? 90 : 0))
+                Spacer()
+            }
+            .padding(.horizontal, 8)
+            .padding(.vertical, 4)
+            .modifier(HoverBackground(radius: 6))
+            .onTapGesture { withAnimation(.easeOut(duration: 0.18)) { optionsOpen.toggle() } }
+            if optionsOpen {
+                ForEach(AwakeSetting.allCases) { s in
+                    ToggleRow(symbol: s.symbol, title: s.title, hint: s.hint, on: awake.isOn(s)) { awake.toggle(s) }
+                }
+            }
+        }
+    }
+}
+
+// The panel's Usage section: today's Claude Code tokens per account and in all, and each account's
+// chat limits when that setting is on.
+struct UsageSection: View {
+    @ObservedObject var usage = Usage.shared
+    @ObservedObject var engine = Engine.shared
+
+    var body: some View {
+        let today = usage.totals(days: 1)
+        let owners = engine.profiles.map(\.id.uuidString) + (today[UsageScan.terminal] != nil ? [UsageScan.terminal] : [])
+        VStack(spacing: 0) {
+            ForEach(owners, id: \.self) { owner in
+                HStack(spacing: 9) {
+                    Circle().fill(Usage.ownerTint(owner)).frame(width: 8, height: 8).frame(width: 24)
+                    Text(Usage.ownerName(owner)).font(.system(size: 13)).lineLimit(1)
+                    Spacer(minLength: 4)
+                    if let l = usage.limits[owner] { LimitText(snapshot: l) }
+                    Text(Usage.short(UsageMetric.current.value(today[owner] ?? UsageTotals()))).font(.system(size: 12, weight: .medium)).monospacedDigit()
+                        .foregroundStyle(.secondary).frame(minWidth: 40, alignment: .trailing)
+                }
+                .padding(.horizontal, 8)
+                .padding(.vertical, 4)
+            }
+            HStack {
+                Text("Open Usage and Conversations…").font(.system(size: 13))
+                Spacer()
+            }
+            .padding(.horizontal, 8)
+            .padding(.vertical, 4)
+            .modifier(HoverBackground(radius: 6))
+            .onTapGesture { PanelController.shared.close(); UsageWindow.show() }
+        }
+    }
+}
+
+struct LimitText: View {
+    let snapshot: ChatLimits.Snapshot
+    var body: some View {
+        if let e = snapshot.error {
+            Text(e).font(.system(size: 10)).foregroundStyle(.tertiary).lineLimit(1)
+        } else {
+            HStack(spacing: 6) {
+                if let h = snapshot.fiveHour { Meter(label: "5h", limit: h) }
+                if let w = snapshot.week { Meter(label: "wk", limit: w) }
+            }
+        }
+    }
+}
+
+struct Meter: View {
+    let label: String
+    let limit: ChatLimits.Limit
+    var body: some View {
+        HStack(spacing: 3) {
+            Text(label).font(.system(size: 9, weight: .medium)).foregroundStyle(.tertiary)
+            ZStack(alignment: .leading) {
+                Capsule().fill(Color.primary.opacity(0.14))
+                Capsule().fill(limit.percent >= 90 ? Color.red : Color.claude)
+                    .frame(width: max(2, 26 * min(limit.percent, 100) / 100))
+            }
+            .frame(width: 26, height: 4)
+        }
+        .help("\(Int(limit.percent.rounded()))% used" + (limit.resetsAt.map { ", resets \($0.formatted(date: .omitted, time: .shortened))" } ?? ""))
+    }
+}
+
+// MARK: usage window
+
+struct UsageWindowView: View {
+    @ObservedObject var usage = Usage.shared
+    @AppStorage("usage.tab") private var tab = 0
+    var body: some View {
+        VStack(spacing: 0) {
+            Picker("", selection: $tab) {
+                Text("Usage").tag(0)
+                Text("Conversations").tag(1)
+            }
+            .pickerStyle(.segmented).labelsHidden().frame(width: 260).padding(.vertical, 10)
+            Divider()
+            if tab == 0 { UsageStatsView() } else { ConversationsView() }
+        }
+        .frame(minWidth: 760, minHeight: 520)
+    }
+}
+
+// What a number means. Cache reads are most of Claude Code's raw total (the same context read again on
+// every turn), so the default is output: what Claude actually wrote.
+enum UsageMetric: String, CaseIterable, Identifiable {
+    case output, fresh, all
+    var id: String { rawValue }
+    var title: String {
+        switch self {
+        case .output: "Output"
+        case .fresh: "New Tokens"
+        case .all: "All Tokens"
+        }
+    }
+    var unit: String {
+        switch self {
+        case .output: "out"
+        case .fresh: "new"
+        case .all: "tokens"
+        }
+    }
+    var help: String {
+        switch self {
+        case .output: "Tokens Claude wrote."
+        case .fresh: "Tokens processed for the first time: input, output and cache writes. Leaves out cache reads."
+        case .all: "Everything, cache reads included. Cache reads are cheap and repeat the same context every turn."
+        }
+    }
+    func value(_ t: UsageTotals) -> Int {
+        switch self {
+        case .output: t.output
+        case .fresh: t.input + t.output + t.cacheWrite
+        case .all: t.total
+        }
+    }
+    static var current: UsageMetric { UsageMetric(rawValue: UserDefaults.standard.string(forKey: "usage.metric") ?? "") ?? .output }
+}
+
+struct UsageStatsView: View {
+    @ObservedObject var usage = Usage.shared
+    @ObservedObject var engine = Engine.shared
+    @AppStorage("usage.range") private var range = 7
+    @AppStorage("usage.metric") private var metricRaw = UsageMetric.output.rawValue
+    @AppStorage("usage.heatOwner") private var heatOwner = ""   // "" = every account
+
+    var body: some View {
+        let metric = UsageMetric(rawValue: metricRaw) ?? .output
+        let totals = usage.totals(days: range)
+        let all = totals.values.reduce(UsageTotals(), +)
+        let owners = totals.sorted { metric.value($0.value) > metric.value($1.value) }
+        ScrollView {
+            VStack(alignment: .leading, spacing: 22) {
+                HStack(spacing: 12) {
+                    Picker("", selection: $range) {
+                        Text("Today").tag(1); Text("7 Days").tag(7); Text("30 Days").tag(30); Text("All").tag(0)
+                    }
+                    .pickerStyle(.segmented).labelsHidden().frame(width: 280)
+                    Picker("", selection: $metricRaw) {
+                        ForEach(UsageMetric.allCases) { Text($0.title).tag($0.rawValue) }
+                    }
+                    .labelsHidden().frame(width: 130)
+                    .help(metric.help)
+                    Spacer()
+                    if usage.scanning { ProgressView().controlSize(.small) }
+                    Button("Refresh") { usage.refresh(force: true) }
+                }
+
+                HStack(spacing: 10) {
+                    Tile(title: metric.title, value: Usage.short(metric.value(all)), accent: true)
+                    Tile(title: "Replies", value: Usage.short(all.messages))
+                    Tile(title: "Output per reply", value: all.messages > 0 ? Usage.short(all.output / all.messages) : "0")
+                    Tile(title: "Cache hit", value: all.input + all.cacheRead + all.cacheWrite > 0
+                         ? "\(all.cacheRead * 100 / (all.input + all.cacheRead + all.cacheWrite))%" : "–")
+                        .help("Share of input read from cache. Higher is cheaper and faster.")
+                }
+
+                // Share of the chosen metric per account, one thin bar.
+                if metric.value(all) > 0 {
+                    VStack(alignment: .leading, spacing: 8) {
+                        GeometryReader { g in
+                            HStack(spacing: 2) {
+                                ForEach(owners, id: \.key) { owner, t in
+                                    let w = g.size.width * CGFloat(metric.value(t)) / CGFloat(metric.value(all))
+                                    if w >= 1 {
+                                        RoundedRectangle(cornerRadius: 3).fill(Usage.ownerTint(owner)).frame(width: max(w - 2, 1))
+                                            .help("\(Usage.ownerName(owner)): \(metric.value(t).formatted())")
+                                    }
+                                }
+                            }
+                        }
+                        .frame(height: 8)
+                        HStack(spacing: 16) {
+                            ForEach(owners, id: \.key) { owner, t in
+                                HStack(spacing: 5) {
+                                    Circle().fill(Usage.ownerTint(owner)).frame(width: 7, height: 7)
+                                    Text(Usage.ownerName(owner)).font(.caption)
+                                    Text("\(metric.value(t) * 100 / max(metric.value(all), 1))% · \(Usage.short(metric.value(t)))")
+                                        .font(.caption).foregroundStyle(.secondary).monospacedDigit()
+                                }
+                            }
+                        }
+                    }
+                }
+
+                VStack(alignment: .leading, spacing: 10) {
+                    HStack {
+                        Text("Activity").font(.headline)
+                        Spacer()
+                        Picker("", selection: $heatOwner) {
+                            Text("All accounts").tag("")
+                            ForEach(engine.profiles) { Text($0.name).tag($0.id.uuidString) }
+                            Text("Terminal").tag(UsageScan.terminal)
+                        }
+                        .labelsHidden().frame(width: 150)
+                    }
+                    GeometryReader { g in
+                        Heatmap(values: usage.perDay(owner: heatOwner.isEmpty ? nil : heatOwner).mapValues(metric.value),
+                                tint: heatOwner.isEmpty ? .claude : Usage.ownerTint(heatOwner), unit: metric.unit,
+                                weeks: max(8, min(53, Int(g.size.width / 15))))
+                    }
+                    .frame(height: 150)
+                }
+
+                Text("By model").font(.headline)
+                Grid(alignment: .leading, horizontalSpacing: 22, verticalSpacing: 6) {
+                    GridRow { header("Model"); header(metric.title); header("Replies"); header("Output per reply") }
+                    ForEach(usage.byModel(days: range).sorted { metric.value($0.1) > metric.value($1.1) }, id: \.0) { m, t in
+                        GridRow {
+                            Text(m).font(.system(size: 12, design: .monospaced))
+                            num(metric.value(t)); num(t.messages); num(t.messages > 0 ? t.output / t.messages : 0)
+                        }
+                    }
+                }
+
+                if !usage.limits.isEmpty {
+                    Text("Chat limits").font(.headline)
+                    Grid(alignment: .leading, horizontalSpacing: 22, verticalSpacing: 6) {
+                        ForEach(engine.profiles) { p in
+                            if let l = usage.limits[p.id.uuidString] {
+                                GridRow {
+                                    HStack { Circle().fill(p.tint).frame(width: 8, height: 8); Text(p.name) }
+                                    LimitText(snapshot: l)
+                                }
+                            }
+                        }
+                    }
+                }
+
+                Text("From Claude Code's own logs on this Mac: the Code tab, Cowork and the terminal. Regular chats keep no token counts on the Mac; Show Chat Limits adds each account's 5-hour and weekly limits from claude.ai.")
+                    .font(.footnote).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+            }
+            .padding(20)
+        }
+    }
+
+    private func header(_ s: String) -> some View { Text(s).font(.caption).foregroundStyle(.secondary) }
+    private func num(_ n: Int) -> some View { Text(Usage.short(n)).monospacedDigit() }
+}
+
+// GitHub-style calendar: one square per day, weeks as columns, darker for busier days.
+// Levels are quartiles of the active days, so one huge day doesn't wash the rest out.
+struct Heatmap: View {
+    let values: [String: Int]   // yyyy-MM-dd -> value
+    let tint: Color
+    let unit: String
+    var weeks = 26
+    private let cell: CGFloat = 12
+    private let gap: CGFloat = 3
+
+    var body: some View {
+        let cal = Calendar.current
+        let today = cal.startOfDay(for: Date())
+        let thisWeek = cal.dateInterval(of: .weekOfYear, for: today)?.start ?? today
+        let start = cal.date(byAdding: .weekOfYear, value: -(weeks - 1), to: thisWeek) ?? today
+        let active = values.values.filter { $0 > 0 }.sorted()
+        let cuts = [0.25, 0.5, 0.75].map { q in active.isEmpty ? 0 : active[min(active.count - 1, Int(Double(active.count) * q))] }
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(alignment: .top, spacing: gap) {
+                ForEach(0..<weeks, id: \.self) { w in
+                    let first = cal.date(byAdding: .weekOfYear, value: w, to: start) ?? start
+                    VStack(spacing: gap) {
+                        // Month name over the first week that starts in it.
+                        Text(cal.component(.day, from: first) <= 7 ? first.formatted(.dateTime.month(.abbreviated)) : " ")
+                            .font(.system(size: 9)).foregroundStyle(.secondary).fixedSize().frame(width: cell, alignment: .leading)
+                        ForEach(0..<7, id: \.self) { d in
+                            let day = cal.date(byAdding: .day, value: d, to: first) ?? first
+                            let key = UsageScan.dayFormat.string(from: day)
+                            let v = values[key] ?? 0
+                            RoundedRectangle(cornerRadius: 2.5)
+                                .fill(day > today ? Color.clear : color(v, cuts: cuts))
+                                .frame(width: cell, height: cell)
+                                .help(day > today ? "" : "\(day.formatted(date: .abbreviated, time: .omitted)): \(v == 0 ? "nothing" : v.formatted() + " " + unit)")
+                        }
+                    }
+                }
+            }
+            HStack(spacing: 4) {
+                Spacer()
+                Text("Less").font(.system(size: 9)).foregroundStyle(.secondary)
+                ForEach(0..<5) { i in
+                    RoundedRectangle(cornerRadius: 2.5).fill(level(i)).frame(width: 10, height: 10)
+                }
+                Text("More").font(.system(size: 9)).foregroundStyle(.secondary)
+            }
+            .frame(width: CGFloat(weeks) * (cell + gap))
+        }
+    }
+
+    private func level(_ i: Int) -> Color { i == 0 ? Color.primary.opacity(0.07) : tint.opacity([0, 0.3, 0.5, 0.75, 1][i]) }
+
+    private func color(_ v: Int, cuts: [Int]) -> Color {
+        guard v > 0 else { return level(0) }
+        return level(1 + cuts.filter { v > $0 }.count)
+    }
+}
+
+struct Tile: View {
+    let title: String
+    let value: String
+    var accent = false
+    var body: some View {
+        VStack(alignment: .leading, spacing: 3) {
+            Text(title).font(.caption).foregroundStyle(.secondary)
+            Text(value).font(.system(size: 22, weight: .semibold)).monospacedDigit()
+                .foregroundStyle(accent ? Color.claude : .primary)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(10)
+        .background(RoundedRectangle(cornerRadius: 10).fill(Color.primary.opacity(0.05)))
+    }
+}
+
+struct ConversationsView: View {
+    @State private var sessions: [ArchivedSession] = []
+    @State private var query = ""
+    @State private var selection: ArchivedSession.ID?
+    @State private var loading = true
+    @AppStorage("usage.hideOneShot") private var hideOneShot = true
+
+    var body: some View {
+        // Hooks and scripts that run `claude -p` start every session with the same prompt.
+        let repeated = Dictionary(grouping: sessions, by: \.title).filter { $0.value.count >= 5 }
+        let kept = hideOneShot ? sessions.filter { repeated[$0.title] == nil } : sessions
+        let shown = query.isEmpty ? kept : kept.filter {
+            $0.title.localizedCaseInsensitiveContains(query) || $0.project.localizedCaseInsensitiveContains(query)
+                || Usage.ownerName($0.owner).localizedCaseInsensitiveContains(query)
+        }
+        HSplitView {
+            VStack(spacing: 0) {
+                TextField("Search titles, projects, accounts", text: $query).textFieldStyle(.roundedBorder).padding([.horizontal, .top], 8)
+                HStack {
+                    Toggle("Hide automated runs", isOn: $hideOneShot).toggleStyle(.checkbox).font(.caption)
+                        .help("Hides sessions that start with the same prompt 5 times or more: hooks and scripts running `claude -p`.")
+                    Spacer()
+                    Text("\(shown.count) of \(sessions.count)").font(.caption).foregroundStyle(.secondary)
+                }
+                .padding(.horizontal, 10).padding(.vertical, 6)
+                if loading { ProgressView().padding() }
+                List(shown, selection: $selection) { s in
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(s.title).lineLimit(1)
+                        HStack(spacing: 5) {
+                            Circle().fill(Usage.ownerTint(s.owner)).frame(width: 6, height: 6)
+                            Text("\(Usage.ownerName(s.owner)) · \(s.project) · \(s.date.formatted(date: .abbreviated, time: .shortened))")
+                                .font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                        }
+                    }
+                    .tag(s.id)
+                }
+            }
+            .frame(minWidth: 300, idealWidth: 340)
+            if let s = sessions.first(where: { $0.id == selection }) {
+                TranscriptView(session: s).id(s.id)
+            } else {
+                Text(sessions.isEmpty && !loading ? "No conversations kept yet." : "Pick a conversation.")
+                    .foregroundStyle(.secondary).frame(maxWidth: .infinity, maxHeight: .infinity)
+            }
+        }
+        .task {
+            let profiles = Engine.shared.profiles
+            let list = await Task.detached { ArchiveIndex.list(titles: UsageScan.sessionIndex(profiles).titles) }.value
+            sessions = list
+            loading = false
+        }
+    }
+}
+
+struct TranscriptView: View {
+    let session: ArchivedSession
+    @State private var turns: [Transcript.Turn] = []
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack {
+                Text(session.title).font(.headline).lineLimit(1)
+                Spacer()
+                Button("Show in Finder") { NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: session.id)]) }
+                Button("Export Markdown…") { export() }
+            }
+            .padding(10)
+            Divider()
+            ScrollView {
+                LazyVStack(alignment: .leading, spacing: 14) {
+                    ForEach(turns) { t in
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text(t.role == "user" ? "You" : "Claude").font(.caption.weight(.semibold))
+                                .foregroundStyle(t.role == "user" ? Color.claude : .secondary)
+                            Text(t.text.count > 6000 ? t.text.prefix(6000) + "…" : t.text).textSelection(.enabled)
+                        }
+                    }
+                }
+                .padding(16)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            }
+        }
+        .task { turns = await Task.detached { [path = session.id] in Transcript.turns(path) }.value }
+    }
+
+    private func export() {
+        let p = NSSavePanel()
+        p.nameFieldStringValue = String(session.title.prefix(60)).replacingOccurrences(of: "/", with: "-") + ".md"
+        p.allowedContentTypes = [.init(filenameExtension: "md")!]
+        guard p.runModal() == .OK, let url = p.url else { return }
+        try? Transcript.markdown(session, account: Usage.ownerName(session.owner)).write(to: url, atomically: true, encoding: .utf8)
+    }
+}
+
+@MainActor
+enum UsageWindow {
+    static var window: NSWindow?
+
+    static func show() {
+        if window == nil {
+            let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 900, height: 620),
+                             styleMask: [.titled, .closable, .miniaturizable, .resizable], backing: .buffered, defer: false)
+            w.title = "MultiClaude Usage"
+            w.isReleasedWhenClosed = false
+            w.contentView = NSHostingView(rootView: UsageWindowView())
+            w.center()
+            window = w
+        }
+        Usage.shared.refresh()
+        NSApp.activate()
+        window?.makeKeyAndOrderFront(nil)
+    }
+}
+
 struct MenuView: View {
     @ObservedObject var engine = Engine.shared
+    @ObservedObject var panel = PanelController.shared
     @AppStorage("profilesOpen") private var profilesOpen = true
     @AppStorage("settingsOpen") private var settingsOpen = false
+    @AppStorage("awakeOpen") private var awakeOpen = false
+    @ObservedObject var awake = Awake.shared
+    @ObservedObject var usage = Usage.shared
+    @AppStorage("usageOpen") private var usageOpen = true
     @State private var editing: UUID?
 
     var body: some View {
@@ -1989,10 +3877,18 @@ struct MenuView: View {
             HStack {
                 Text("MultiClaude").font(.system(size: 13, weight: .bold))
                 Spacer()
-                Toggle("", isOn: Binding(get: { engine.runningCount > 0 },
-                                         set: { $0 ? engine.openAll() : engine.quitAll() }))
-                    .toggleStyle(.switch).controlSize(.regular).labelsHidden().tint(.claude)
-                    .help("On opens every profile, off quits them all")
+                // Keep-awake on or off at a glance; durations and options are in the section below.
+                Chip(selected: awake.active, action: { awake.toggleActive() }) {
+                    Image(systemName: awake.active ? "bolt.fill" : "bolt").font(.system(size: 12, weight: .semibold))
+                }
+                .help(awake.active ? "Stop keeping your Mac awake" : "Keep your Mac awake")
+                .padding(.trailing, engine.managing ? 6 : 0)
+                if engine.managing {
+                    Toggle("", isOn: Binding(get: { engine.runningCount > 0 },
+                                             set: { $0 ? engine.openAll() : engine.quitAll() }))
+                        .toggleStyle(.switch).controlSize(.regular).labelsHidden().tint(.claude)
+                        .help("On opens every profile, off quits them all")
+                }
             }
             .padding(.horizontal, 14)
             .padding(.top, 10)
@@ -2020,23 +3916,38 @@ struct MenuView: View {
             }
 
             Divider().padding(.horizontal, 14)
-            SectionHeader(title: "Profiles (\(engine.profiles.count))",
-                          trailing: engine.runningCount > 0 ? "\(engine.runningCount) running" : "None running",
-                          open: $profilesOpen)
-            if profilesOpen {
-                VStack(spacing: 0) {
-                    ForEach(engine.profiles) { ProfileRow(profile: $0, editing: $editing) }
-                    NewProfileRow()
+            SectionHeader(title: "Keep Awake (\(awake.durationLabel))", trailing: awake.remainingText, open: $awakeOpen)
+            if awakeOpen {
+                AwakeSection().padding(.horizontal, 6).padding(.bottom, 5)
+            }
+
+            if engine.managing {
+                Divider().padding(.horizontal, 14)
+                SectionHeader(title: "Profiles (\(engine.profiles.count))",
+                              trailing: engine.runningCount > 0 ? "\(engine.runningCount) running" : "None running",
+                              open: $profilesOpen)
+                if profilesOpen {
+                    VStack(spacing: 0) {
+                        ForEach(engine.profiles) { ProfileRow(profile: $0, editing: $editing) }
+                        NewProfileRow().id(panel.closed)
+                    }
+                    .padding(.horizontal, 6)
+                    .padding(.bottom, 5)
                 }
-                .padding(.horizontal, 6)
-                .padding(.bottom, 5)
+                if engine.isOn(.trackUsage) || engine.isOn(.chatLimits) {
+                    Divider().padding(.horizontal, 14)
+                    SectionHeader(title: "Usage Today",
+                                  trailing: Usage.short(UsageMetric.current.value(usage.totals(days: 1).values.reduce(UsageTotals(), +))) + " " + UsageMetric.current.unit,
+                                  open: $usageOpen)
+                    if usageOpen { UsageSection().padding(.horizontal, 6).padding(.bottom, 5) }
+                }
             }
 
             Divider().padding(.horizontal, 14)
             SectionHeader(title: "Settings", open: $settingsOpen)
             if settingsOpen {
                 VStack(spacing: 0) {
-                    ForEach(Setting.allCases) { SettingRow(setting: $0) }
+                    ForEach(Setting.allCases.filter { engine.managing || !Setting.claudeOnly.contains($0) }) { SettingRow(setting: $0) }
                 }
                 .padding(.horizontal, 6)
                 .padding(.bottom, 5)
@@ -2051,6 +3962,8 @@ struct MenuView: View {
             .padding(.vertical, 5)
         }
         .frame(width: 300)
+        .onChange(of: panel.closed) { editing = nil }
+        .onExitCommand { PanelController.shared.close() }
         .fixedSize(horizontal: false, vertical: true)
         .onGeometryChange(for: CGSize.self, of: { $0.size }) { size in
             DispatchQueue.main.async { PanelController.shared.resize(to: size) }
@@ -2066,7 +3979,7 @@ final class KeyPanel: NSPanel {
 }
 
 @MainActor
-final class PanelController {
+final class PanelController: ObservableObject {
     static let shared = PanelController()
 
     private var panel: KeyPanel?
@@ -2087,7 +4000,7 @@ final class PanelController {
         let x = min(max(b.minX - 12, screen.visibleFrame.minX + 6), screen.visibleFrame.maxX - width - 6)
         anchor = NSPoint(x: x, y: b.minY - 6)
         resize(to: host?.fittingSize ?? NSSize(width: width, height: 300))
-        Engine.shared.discoverFolders()
+        if Engine.shared.managing { Engine.shared.discoverFolders() }
         Engine.shared.refresh()
         p.makeKeyAndOrderFront(nil)
         monitor = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown]) { _ in
@@ -2101,7 +4014,9 @@ final class PanelController {
         panel?.orderOut(nil)
         if let monitor { NSEvent.removeMonitor(monitor) }
         monitor = nil
+        closed += 1   // drops a half-typed rename or new profile, so the panel reopens clean
     }
+    @Published var closed = 0
 
     func resize(to size: CGSize) {
         guard let panel, size.height > 0 else { return }
@@ -2229,6 +4144,40 @@ enum AboutWindow {
     }
 }
 
+// The menu bar image: Claude's asterisk, plus a bolt while keep-awake is on. With no color it is a template
+// image, so macOS draws it in the menu bar's own color; with any color both marks are drawn as given.
+@MainActor
+enum MenuBarIcon {
+    static func symbol(_ name: String, _ color: NSColor?) -> NSImage? {
+        let img = NSImage(systemSymbolName: name, accessibilityDescription: nil)
+        guard let color else { return img }
+        return img?.withSymbolConfiguration(.init(paletteColors: [color]))
+    }
+
+    static func make(tint: NSColor?, bolt: NSColor??) -> NSImage? {
+        guard let bolt else {
+            let img = symbol("asterisk", tint)
+            img?.isTemplate = tint == nil
+            img?.accessibilityDescription = "MultiClaude"
+            return img
+        }
+        let template = tint == nil && bolt == nil
+        let colored = !template
+        guard let a = symbol("asterisk", colored ? tint ?? .labelColor : nil),
+              let z = symbol("bolt.fill", colored ? bolt ?? .labelColor : nil) else { return nil }
+        let gap: CGFloat = 2
+        let size = NSSize(width: a.size.width + gap + z.size.width, height: max(a.size.height, z.size.height))
+        let img = NSImage(size: size, flipped: false) { _ in
+            a.draw(in: NSRect(x: 0, y: (size.height - a.size.height) / 2, width: a.size.width, height: a.size.height))
+            z.draw(in: NSRect(x: a.size.width + gap, y: (size.height - z.size.height) / 2, width: z.size.width, height: z.size.height))
+            return true
+        }
+        img.isTemplate = template
+        img.accessibilityDescription = "MultiClaude, keeping your Mac awake"
+        return img
+    }
+}
+
 // MARK: - App
 
 @MainActor
@@ -2266,8 +4215,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             if let b = self?.item.button { PanelController.shared.toggle(below: b) }
         }
         engine.boot()
+        engine.updateScroll()
+        if !isDemo { Awake.shared.boot() }
+        Usage.shared.start()
         refreshIcon()
-        // Preview hook for screenshots: MULTICLAUDE_PREVIEW=panel|settings|about
+        // Preview hook for screenshots: MULTICLAUDE_PREVIEW=panel|settings|awake|about
         switch ProcessInfo.processInfo.environment["MULTICLAUDE_PREVIEW"] {
         case "panel", "settings":
             UserDefaults.standard.set(ProcessInfo.processInfo.environment["MULTICLAUDE_PREVIEW"] == "settings", forKey: "settingsOpen")
@@ -2279,40 +4231,52 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
                 if let p = Engine.shared.profiles.first(where: { $0.name == name }) { Engine.shared.beginSignIn(p) }
             }
+        case "awake":   // a 1 minute keep-awake with its options open, to check the timer ends on its own
+            UserDefaults.standard.set(true, forKey: "awake.optionsOpen")
+            Awake.shared.activate(minutes: 1)
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+                if let b = self?.item.button { PanelController.shared.open(below: b) }
+            }
+        case "usage":
+            UserDefaults.standard.set(0, forKey: "usage.tab")
+            UsageWindow.show()
+        case "conversations":
+            UserDefaults.standard.set(1, forKey: "usage.tab")
+            UsageWindow.show()
         case "about": AboutWindow.show()
         default: break
         }
     }
 
     func applicationWillTerminate(_ n: Notification) {
+        Dock.pendingRestore?()
         LinkRelay.giveBack()
-        if Engine.shared.isOn(.quitWithApp) && !Updater.relaunching { Engine.shared.quitAll() }
+        if Engine.shared.managing && Engine.shared.isOn(.quitWithApp) && !Updater.relaunching { Engine.shared.quitAll() }
+        Awake.shared.deactivate()
     }
 
     @objc private func clicked() {
         guard let button = item.button else { return }
-        PanelController.shared.toggle(below: button)
+        let right = NSApp.currentEvent?.type == .rightMouseUp
+        if Awake.shared.isOn(.leftClick) && !right {
+            Awake.shared.toggleActive()
+        } else {
+            PanelController.shared.toggle(below: button)
+        }
     }
 
     private func refreshIcon() {
         guard let b = item.button else { return }
         let engine = Engine.shared
         let count = engine.runningCount
-        let img = NSImage(systemSymbolName: "asterisk", accessibilityDescription: "MultiClaude")
         // While a Claude window is in front, the menu bar names its account in the profile's color.
         let front = engine.isOn(.showActive) ? engine.profiles.first { $0.id == engine.frontID } : nil
+        let tint: NSColor? = front?.nsTint ?? (count > 0 && engine.isOn(.coloredIcon) ? .claude : nil)
+        // Keep-awake adds a bolt next to the asterisk, orange with Colored Menu Bar Icon on.
+        let bolt: NSColor?? = Awake.shared.active ? .some(engine.isOn(.coloredIcon) ? .claude : nil) : .none
+        b.image = MenuBarIcon.make(tint: tint, bolt: bolt)
         if let front {
-            b.image = img?.withSymbolConfiguration(.init(paletteColors: [front.nsTint]))
-            b.image?.isTemplate = false
-        } else if count > 0 && engine.isOn(.coloredIcon) {
-            b.image = img?.withSymbolConfiguration(.init(paletteColors: [.claude]))
-            b.image?.isTemplate = false
-        } else {
-            b.image = img
-            b.image?.isTemplate = true
-        }
-        if let front {
-            b.title = " " + front.name
+            b.title = " " + (front.name.count > 18 ? front.name.prefix(17) + "…" : front.name)
         } else {
             b.title = count > 0 && engine.isOn(.showCount) ? " \(count)" : ""
         }
@@ -2424,10 +4388,11 @@ if args.count == 2, args[1] == "--selftest-profiles" {
     try? FileManager.default.createDirectory(at: src.appendingPathComponent("Local Storage"), withIntermediateDirectories: true)
     try? Data("chats".utf8).write(to: src.appendingPathComponent("Local Storage/db"))
     try? FileManager.default.createSymbolicLink(atPath: src.appendingPathComponent("SingletonLock").path, withDestinationPath: "host-123")
-    check("clone succeeds", Duplicate.clone(from: src.path, to: dst.path))
+    check("clone succeeds", (try? Duplicate.clone(from: src.path, to: dst.path).get()) != nil)
     check("clone copies data", (try? String(contentsOf: dst.appendingPathComponent("Local Storage/db"), encoding: .utf8)) == "chats")
     check("clone drops lock", (try? FileManager.default.destinationOfSymbolicLink(atPath: dst.appendingPathComponent("SingletonLock").path)) == nil)
-    check("clone refuses existing destination", !Duplicate.clone(from: src.path, to: dst.path))
+    check("clone refuses existing destination", (try? Duplicate.clone(from: src.path, to: dst.path).get()) == nil)
+    check("clone leaves no partial folder", !((try? FileManager.default.contentsOfDirectory(atPath: tmp.path)) ?? []).contains { $0.hasPrefix(".partial-") })
     let pa = Profile(name: "A", dir: tmp.appendingPathComponent("Claude-A").path)
     let pb = Profile(name: "B", dir: tmp.appendingPathComponent("Claude-B").path)
     try? FileManager.default.createDirectory(atPath: pa.dir!, withIntermediateDirectories: true)
@@ -2451,11 +4416,55 @@ if args.count == 2, args[1] == "--selftest-profiles" {
     check("target follows the name", tgt == sup + "/Claude-Augura")
     check("no target when already aligned", Folders.target(for: "Moonsun", current: sup + "/Claude-Moonsun", in: sup) == nil)
     check("no target onto another profile's folder", Folders.target(for: "Moonsun", current: sup + "/Claude-Work", in: sup) == nil)
-    check("move succeeds", Folders.move(sup + "/Claude-Work", to: sup + "/Claude-Augura"))
+    check("move succeeds", Folders.move(sup + "/Claude-Work", to: sup + "/Claude-Augura") == .moved)
     check("old path is a symlink to the new one", (try? FileManager.default.destinationOfSymbolicLink(atPath: sup + "/Claude-Work")) == sup + "/Claude-Augura")
     check("candidates skip the symlink", Folders.candidates(in: sup).map { URL(fileURLWithPath: $0).lastPathComponent } == ["Claude-Augura", "Claude-Moonsun"])
     check("canonical resolves the old path", Folders.canonical(sup + "/Claude-Work") == Folders.canonical(sup + "/Claude-Augura"))
     check("no target onto a leftover symlink", Folders.target(for: "Work", current: sup + "/Claude-Augura", in: sup) == nil)
+    check("canonical ignores case", Folders.canonical(sup + "/claude-augura") == Folders.canonical(sup + "/Claude-Augura"))
+    check("a missing move source fails cleanly", Folders.move(sup + "/Claude-Nope", to: sup + "/Claude-Nope2") != .moved
+          && !FileManager.default.fileExists(atPath: sup + "/Claude-Nope2"))
+    let lockDir = sup + "/Claude-Moonsun"
+    try? FileManager.default.createSymbolicLink(atPath: lockDir + "/SingletonLock", withDestinationPath: "host-\(ProcessInfo.processInfo.processIdentifier)")
+    check("a lock held by a live process is in use", Folders.inUse(lockDir))
+    try? FileManager.default.removeItem(atPath: lockDir + "/SingletonLock")
+    try? FileManager.default.createSymbolicLink(atPath: lockDir + "/SingletonLock", withDestinationPath: "host-99999999")
+    check("a lock left by a dead process is not", !Folders.inUse(lockDir))
+    // MCP: a broken source is refused, an empty one leaves the target alone.
+    try? Data("not json".utf8).write(to: MCP.configURL(pa))
+    let pc = Profile(name: "C", dir: tmp.appendingPathComponent("Claude-C").path)
+    try? FileManager.default.createDirectory(atPath: pc.dir!, withIntermediateDirectories: true)
+    var refusedSource = false
+    do { _ = try MCP.copy(from: pa, to: pc) } catch MCP.Failure.unreadable(.source) { refusedSource = true } catch {}
+    check("copy refuses a broken source file", refusedSource && !FileManager.default.fileExists(atPath: MCP.configURL(pc).path))
+    try? Data(#"{"preferences":{}}"#.utf8).write(to: MCP.configURL(pa))
+    check("copy with no servers writes nothing", (try? MCP.copy(from: pa, to: pc)) == 0 && !FileManager.default.fileExists(atPath: MCP.configURL(pc).path))
+    // A saved list from another version: missing fields fall back instead of losing every profile.
+    let saved = #"[{"id":"6F1C2D3E-0000-4000-8000-000000000001","name":"Work","dir":"/x/Claude-Work","color":2,"future":true},{"dir":"/x/Claude-Old"}]"#
+    let decoded = try? JSONDecoder().decode([Profile].self, from: Data(saved.utf8))
+    check("lenient decode keeps known profiles", decoded?.count == 2 && decoded?[0].name == "Work" && decoded?[0].color == 2
+          && decoded?[0].id.uuidString == "6F1C2D3E-0000-4000-8000-000000000001")
+    check("lenient decode names a profile from its folder", decoded?[1].name == "Old")
+    check("a profile with a malformed folder fails the list instead of becoming the default",
+          (try? JSONDecoder().decode([Profile].self, from: Data(#"[{"name":"X","dir":42}]"#.utf8))) == nil)
+    // The alias must give Claude the folder exactly, quotes and dollar signs included.
+    let quoted = Profile(name: "Q", dir: "/x/it's $HOME/Claude-Q")
+    let sh = Process(), out = Pipe()
+    sh.executableURL = URL(fileURLWithPath: "/bin/zsh")
+    sh.arguments = ["-fc", quoted.shellAlias + "\nfunction open { print -r -- \"${@[-1]}\" }\neval q"]
+    sh.standardOutput = out
+    try? sh.run(); sh.waitUntilExit()
+    check("alias passes an odd folder through intact",
+          String(decoding: out.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self) == "--user-data-dir=/x/it's $HOME/Claude-Q\n")
+    check("alias stays readable for a plain folder", Profile(name: "W", dir: "/x/Claude-W").shellAlias
+          == #"alias w='open -n -a "Claude" --args --user-data-dir="/x/Claude-W"'"#)
+    check("alias has a name even for a name without letters", Profile(name: "---", dir: "/x/Claude-z").shellAlias.hasPrefix("alias claude"))
+    check("log keeps only the first path segment", Log.redact("claude://claude.ai/login/SECRET?code=1#t") == "claude://claude.ai/login/…"
+          && Log.redact("claude://claude.ai/new") == "claude://claude.ai/new")
+    check("update URLs must be plain github.com release paths",
+          Updater.trusted("https://github.com/QuentinCar0n/multiclaude/releases/download/v1/x.zip") != nil
+          && Updater.trusted("https://github.com/QuentinCar0n/multiclaude/releases/download/../../../evil/x.zip") == nil
+          && Updater.trusted("https://github.com:8443/QuentinCar0n/multiclaude/releases/download/v1/x.zip") == nil)
     try? FileManager.default.removeItem(at: tmp)
     exit(ok ? 0 : 1)
 }
@@ -2575,6 +4584,22 @@ if args.count == 2, args[1] == "--selftest-launchers" {
     let ownerURL = Runtimes.dir(rp.id).appendingPathComponent("Claude X.app")
     check("a copy's bundle names its profile", Runtimes.owner(of: ownerURL) == rp.id
           && Runtimes.owner(of: URL(fileURLWithPath: "/Applications/Claude.app")) == nil)
+    // Two profiles with the same app name swap places in the list: their apps swap names instead of failing.
+    let swapDir = tmp.appendingPathComponent("swap")
+    var s1 = Profile(name: "S1", dir: "/tmp/Claude-S1", color: 1), s2 = Profile(name: "S2", dir: "/tmp/Claude-S2", color: 2)
+    s1.appName = "Claude Same"; s2.appName = "Claude Same"
+    _ = MainActor.assumeIsolated { Launchers.sync([s1, s2], in: swapDir) }
+    r = MainActor.assumeIsolated { Launchers.sync([s2, s1], in: swapDir) }
+    let swapped = Launchers.installed(in: swapDir)
+    check("reordered twins swap app names", r.failed.isEmpty && swapped[s2.id]?.lastPathComponent == "Claude Same.app"
+          && swapped[s1.id]?.lastPathComponent == "Claude Same 2.app")
+    check("no hidden leftovers after a swap", !((try? fm.contentsOfDirectory(atPath: swapDir.path)) ?? []).contains { $0.hasPrefix(".") })
+    check("a very long name still makes a valid file name", Launchers.fileName(String(repeating: "é", count: 300)).utf8.count <= 204
+          && Launchers.fileName("A\nB") == "AB.app")
+    var long1 = Profile(name: "L1", dir: "/tmp/Claude-L1", color: 1), long2 = Profile(name: "L2", dir: "/tmp/Claude-L2", color: 2)
+    long1.appName = String(repeating: "x", count: 250); long2.appName = long1.appName
+    r = MainActor.assumeIsolated { Launchers.sync([long1, long2], in: tmp.appendingPathComponent("long")) }
+    check("two identical long app names both get an app", r.failed.isEmpty && Launchers.installed(in: tmp.appendingPathComponent("long")).count == 2)
     let entry = Dock.entry(for: URL(fileURLWithPath: "/Users/x/Applications/MultiClaude Launchers/Claude Work.app"))
     check("dock entry round-trips its path", Dock.path(of: entry) == "/Users/x/Applications/MultiClaude Launchers/Claude Work.app")
     try? fm.removeItem(at: tmp)
@@ -2592,8 +4617,129 @@ if args.count == 3, args[1] == "--export-profile-icon" {   // --export-profile-i
     }
     exit(0)
 }
+if args.count == 2, args[1] == "--selftest-awake" {
+    // Scroll flip on synthetic wheel (line) and trackpad (continuous) events, and the keep-awake labels.
+    var ok = true
+    func check(_ name: String, _ cond: Bool) { print(cond ? "PASS" : "FAIL", name); ok = ok && cond }
+    func make(_ unit: CGScrollEventUnit, continuous: Bool) -> CGEvent {
+        let e = CGEvent(scrollWheelEvent2Source: nil, units: unit, wheelCount: 2, wheel1: 3, wheel2: -2, wheel3: 0)!
+        e.setIntegerValueField(.scrollWheelEventIsContinuous, value: continuous ? 1 : 0)
+        return e
+    }
+    func y(_ e: CGEvent) -> Int64 { e.getIntegerValueField(.scrollWheelEventDeltaAxis1) }
+    func x(_ e: CGEvent) -> Int64 { e.getIntegerValueField(.scrollWheelEventDeltaAxis2) }
+    func fy(_ e: CGEvent) -> Double { e.getDoubleValueField(.scrollWheelEventFixedPtDeltaAxis1) }
+    for (mouse, pad) in [(true, false), (false, true), (true, true), (false, false)] {
+        ScrollReverser.reverseMouse = mouse
+        ScrollReverser.reverseTrackpad = pad
+        let wheel = make(.line, continuous: false), track = make(.pixel, continuous: true)
+        let (wy, wx, wf, ty, tx) = (y(wheel), x(wheel), fy(wheel), y(track), x(track))
+        ScrollReverser.flip(wheel)
+        ScrollReverser.flip(track)
+        let tag = "mouse=\(mouse) trackpad=\(pad)"
+        check("\(tag): wheel \(mouse ? "flipped" : "kept")", y(wheel) == (mouse ? -wy : wy) && x(wheel) == (mouse ? -wx : wx)
+              && fy(wheel) == (mouse ? -wf : wf))
+        check("\(tag): trackpad \(pad ? "flipped" : "kept")", y(track) == (pad ? -ty : ty) && x(track) == (pad ? -tx : tx))
+    }
+    MainActor.assumeIsolated {
+        let a = Awake.shared
+        let saved = a.minutes
+        for (m, want) in [(0, "∞"), (15, "15min"), (60, "1hr"), (135, "2hr 15min"), (1440, "24hr")] {
+            a.setMinutes(m)
+            check("duration label \(m) = \(want)", a.durationLabel == want)
+        }
+        a.setMinutes(saved)
+        check("not active at start", !a.active && a.remainingText == nil)
+        check("keep-awake-only mode keeps its way back and the scroll settings",
+              Setting.claudeOnly.isDisjoint(with: [.manageClaude, .reverseMouse, .reverseTrackpad, .launchAtLogin, .autoUpdate]))
+        check("managing Claude is on by default", Setting.onByDefault.contains(.manageClaude))
+        check("shortcut keys apart from MultiClaude's", Set(AwakeSetting.allCases.map(\.key)).isDisjoint(with: Setting.allCases.map(\.rawValue)))
+    }
+    exit(ok ? 0 : 1)
+}
+if args.count == 3, args[1] == "--usage-report" {
+    // --usage-report <store folder>: scans this Mac's transcripts into that folder (no archive) and prints totals.
+    let scan = UsageScan()
+    scan.folder = URL(fileURLWithPath: args[2])
+    scan.archiveEnabled = false
+    let start = Date()
+    let s = MainActor.assumeIsolated { scan.scan(profiles: Engine.shared.profiles) }
+    print("scanned \(s.files.count) files in \(Int(-start.timeIntervalSinceNow)) s")
+    var owners: [String: UsageTotals] = [:]
+    for (_, o) in s.days { for (owner, models) in o { owners[owner] = models.values.reduce(owners[owner] ?? UsageTotals(), +) } }
+    MainActor.assumeIsolated {
+        for (o, t) in owners.sorted(by: { $0.value.total > $1.value.total }) {
+            print(Usage.ownerName(o), "total", Usage.short(t.total), "in", Usage.short(t.input), "out", Usage.short(t.output), "replies", t.messages)
+        }
+    }
+    exit(0)
+}
+if args.count == 2, args[1] == "--selftest-usage" {
+    // Token counting on synthetic transcripts, the archive copy, and the cookie decryption round trip.
+    var ok = true
+    func check(_ name: String, _ cond: Bool) { print(cond ? "PASS" : "FAIL", name); ok = ok && cond }
+    let fm = FileManager.default
+    let tmp = fm.temporaryDirectory.appendingPathComponent("mc-usage-\(UUID().uuidString)")
+    defer { try? fm.removeItem(at: tmp) }
+    let root = tmp.appendingPathComponent("projects/-p")
+    try? fm.createDirectory(at: root.appendingPathComponent("s1/subagents"), withIntermediateDirectories: true)
+    func reply(_ id: String, _ req: String, _ out: Int, day: String = "2026-10-15") -> String {
+        #"{"type":"assistant","requestId":"\#(req)","timestamp":"\#(day)T12:00:00Z","message":{"id":"\#(id)","model":"claude-test","content":[{"type":"text","text":"ok"}],"usage":{"input_tokens":10,"output_tokens":\#(out),"cache_creation_input_tokens":100,"cache_read_input_tokens":1000}}}"#
+    }
+    let user = #"{"type":"user","message":{"role":"user","content":"Hello there"},"cwd":"/tmp/proj"}"#
+    let s1 = root.appendingPathComponent("s1.jsonl"), s2 = root.appendingPathComponent("s2.jsonl")
+    // m1 appears twice in a row (one line per content block), m2 again in s2 (a copied history).
+    try? ([user, reply("m1", "r1", 5), reply("m1", "r1", 5), reply("m2", "r2", 7)].joined(separator: "\n") + "\n").write(to: s1, atomically: true, encoding: .utf8)
+    try? ([reply("m2", "r2", 7), reply("m3", "r3", 11, day: "2026-10-14")].joined(separator: "\n") + "\n").write(to: s2, atomically: true, encoding: .utf8)
+    try? (reply("m4", "r4", 13) + "\n").write(to: root.appendingPathComponent("s1/subagents/agent-a.jsonl"), atomically: true, encoding: .utf8)
+    let scan = UsageScan()
+    scan.folder = tmp.appendingPathComponent("store")
+    let src = UsageSource(root: tmp.appendingPathComponent("projects"), archiveName: "code") { f in
+        UsageScan.sessionID(of: f) == "s1" ? "A" : "B"
+    }
+    var s = scan.scan(sources: [src])
+    func out(_ o: String) -> Int { s.days.values.compactMap { $0[o]?.values.reduce(0) { $0 + $1.output } }.reduce(0, +) }
+    // Files are read in any order, so m2 goes to whichever file came first; it must count once either way.
+    check("duplicate lines and copied replies counted once", out("A") + out("B") == 5 + 7 + 11 + 13)
+    check("subagent credited to its session", out("A") >= 5 + 13 && out("B") >= 11)
+    check("days kept apart", s.days["2026-10-14"]?["B"]?["claude-test"]?.output == 11)
+    check("cache counted", s.days.values.flatMap { $0.values.flatMap(\.values) }.reduce(0) { $0 + $1.cacheRead } == 4000)
+    // A half-written line waits for the next scan.
+    if let h = try? FileHandle(forWritingTo: s1) {
+        h.seekToEndOfFile()
+        let line = reply("m5", "r5", 17)
+        h.write(Data(line.prefix(40).utf8)); s = scan.scan(sources: [src])
+        check("partial line not counted yet", out("A") + out("B") == 36)
+        h.write(Data((line.dropFirst(40) + "\n").utf8)); try? h.close()
+        s = scan.scan(sources: [src])
+        check("appended reply counted once complete", out("A") + out("B") == 53)
+    }
+    let again = UsageScan(); again.folder = scan.folder
+    s = again.scan(sources: [src])
+    check("state survives a restart without double counting", out("A") + out("B") == 53)
+    let archived = scan.archiveURL.appendingPathComponent("A/code/-p/s1.jsonl")
+    check("transcript archived under its account", (try? String(contentsOf: archived, encoding: .utf8))?.contains("m5") == true)
+    check("archive keeps a transcript Claude deleted", { try? fm.removeItem(at: s1); return fm.fileExists(atPath: archived.path) }())
+    check("transcript turns merge a reply's blocks", Transcript.turns(archived.path).map(\.role) == ["user", "assistant", "assistant", "assistant"])
+    // Cookie format: encrypt like Chromium, decrypt with ChatLimits.
+    let key = Data((0..<16).map { UInt8($0) })
+    for version in [23, 24] {
+        let plain = (version >= 24 ? Data(repeating: 7, count: 32) : Data()) + Data("sk-ant-sid01-test".utf8)
+        var enc = Data(count: plain.count + 16); var n = 0
+        let encCount = enc.count
+        _ = enc.withUnsafeMutableBytes { o in plain.withUnsafeBytes { p in key.withUnsafeBytes { k in
+            CCCrypt(CCOperation(kCCEncrypt), CCAlgorithm(kCCAlgorithmAES128), CCOptions(kCCOptionPKCS7Padding), k.baseAddress, 16,
+                    [UInt8](repeating: 0x20, count: 16), p.baseAddress, plain.count, o.baseAddress, encCount, &n) } } }
+        check("cookie decrypts (db version \(version))", ChatLimits.decrypt(Data("v10".utf8) + enc.prefix(n), key: key, dbVersion: version) == "sk-ant-sid01-test")
+    }
+    let sample = #"{"five_hour":{"utilization":42.0,"resets_at":"2026-10-15T15:00:00Z"},"seven_day":{"utilization":7.5,"resets_at":null}}"#
+    let parsed = ChatLimits.parse(try! JSONSerialization.jsonObject(with: Data(sample.utf8)))
+    check("limits parsed", parsed.fiveHour?.percent == 42 && parsed.week?.percent == 7.5 && parsed.fiveHour?.resetsAt != nil)
+    exit(ok ? 0 : 1)
+}
 if args.count == 2, args[1] == "--selftest-version" {
-    let cases = [("1.2", "1.1", true), ("1.10", "1.9", true), ("1.2", "1.2", false), ("1.2", "1.2.1", false), ("2.0", "1.9.9", true)]
+    let cases = [("1.2", "1.1", true), ("1.10", "1.9", true), ("1.2", "1.2", false), ("1.2", "1.2.1", false), ("2.0", "1.9.9", true),
+                 ("1.5", "1.5-rc1", true), ("1.5-rc1", "1.5", false), ("1.4", "1.5-rc1", false), ("1.5-rc1", "1.4", true)]
     var ok = true
     for (a, b, want) in cases {
         let got = Updater.isNewer(a, than: b)
