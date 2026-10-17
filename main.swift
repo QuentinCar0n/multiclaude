@@ -9,6 +9,8 @@ import CryptoKit
 import IOKit.pwr_mgt
 import IOKit.ps
 import UserNotifications
+import CommonCrypto
+import SQLite3
 
 let appVersion = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "1.0"
 let websiteURL = URL(string: "https://somalabs.me")!
@@ -158,11 +160,13 @@ enum Seed {
 
 enum Setting: String, CaseIterable, Identifiable {
     case manageClaude, launchAtLogin, autoUpdate, routeSignIn, reopenAfterUpdate, shortcut, profileShortcuts, showActive, showCount, coloredIcon, dockApps, quitWithApp
+    case trackUsage, archiveCode, chatLimits
     case reverseMouse, reverseTrackpad
 
-    static let onByDefault: Set<Setting> = [.manageClaude, .autoUpdate, .routeSignIn, .reopenAfterUpdate, .showActive, .showCount]
+    static let onByDefault: Set<Setting> = [.manageClaude, .trackUsage, .archiveCode, .autoUpdate, .routeSignIn, .reopenAfterUpdate, .showActive, .showCount]
     // Settings that only mean something while MultiClaude manages Claude accounts; hidden when it doesn't.
-    static let claudeOnly: Set<Setting> = [.routeSignIn, .reopenAfterUpdate, .profileShortcuts, .showActive, .showCount, .dockApps, .quitWithApp]
+    static let claudeOnly: Set<Setting> = [.routeSignIn, .reopenAfterUpdate, .profileShortcuts, .showActive, .showCount, .dockApps, .quitWithApp,
+                                         .trackUsage, .archiveCode, .chatLimits]
 
     var id: String { rawValue }
 
@@ -180,6 +184,9 @@ enum Setting: String, CaseIterable, Identifiable {
         case .coloredIcon: "Colored Menu Bar Icon"
         case .dockApps: "App for Each Profile"
         case .quitWithApp: "Quit Profiles with MultiClaude"
+        case .trackUsage: "Track Token Usage"
+        case .archiveCode: "Keep Claude Code Conversations"
+        case .chatLimits: "Show Chat Limits"
         case .reverseMouse: "Reverse Mouse Scroll"
         case .reverseTrackpad: "Reverse Trackpad Scroll"
         }
@@ -199,6 +206,9 @@ enum Setting: String, CaseIterable, Identifiable {
         case .coloredIcon: "paintpalette"
         case .dockApps: "dock.rectangle"
         case .quitWithApp: "xmark.circle"
+        case .trackUsage: "chart.bar"
+        case .archiveCode: "archivebox"
+        case .chatLimits: "gauge.with.dots.needle.33percent"
         case .reverseMouse: "computermouse"
         case .reverseTrackpad: "rectangle.and.hand.point.up.left"
         }
@@ -336,6 +346,7 @@ final class Engine: ObservableObject {
 
     func toggle(_ s: Setting) {
         let on = !isOn(s)
+        if s == .chatLimits && on && !Dialogs.confirmChatLimits() { return }
         objectWillChange.send()
         if s == .launchAtLogin {
             do { on ? try SMAppService.mainApp.register() : try SMAppService.mainApp.unregister() }
@@ -348,6 +359,7 @@ final class Engine: ObservableObject {
         if s == .dockApps { syncLaunchers() }
         if s == .reverseMouse || s == .reverseTrackpad { updateScroll() }
         if s == .manageClaude { setManaging(on) }
+        if s == .trackUsage || s == .archiveCode || s == .chatLimits { Usage.shared.refresh(force: true) }
         onChange?()
     }
 
@@ -1866,6 +1878,539 @@ enum ScrollReverser {
     }
 }
 
+// MARK: - Usage and conversation archive
+
+// Claude Code (the Code tab, Cowork and the terminal) logs every reply with its token counts in JSONL
+// transcripts on this Mac. MultiClaude reads them, credits each session to the account whose folder lists
+// it, and keeps a copy of every transcript, since Claude Code deletes old ones (30 days by default).
+// Regular chats keep no token counts on the Mac; their usage limits come from claude.ai (see ChatLimits).
+
+struct UsageTotals: Codable, Equatable {
+    var input = 0, output = 0, cacheWrite = 0, cacheRead = 0, messages = 0
+    var total: Int { input + output + cacheWrite + cacheRead }
+    static func + (a: Self, b: Self) -> Self {
+        Self(input: a.input + b.input, output: a.output + b.output, cacheWrite: a.cacheWrite + b.cacheWrite,
+             cacheRead: a.cacheRead + b.cacheRead, messages: a.messages + b.messages)
+    }
+}
+
+// One transcript source: a folder of JSONL files, and whose files they are.
+struct UsageSource {
+    let root: URL
+    let archiveName: String       // folder under Archive/<owner>/
+    let owner: (_ file: URL) -> String   // profile id, or UsageScan.terminal
+}
+
+final class UsageScan: @unchecked Sendable {
+    static let shared = UsageScan()
+    static let terminal = "terminal"   // ~/.claude sessions no account folder lists: the CLI's own sign-in
+    static let home = FileManager.default.homeDirectoryForCurrentUser
+
+    struct FileMark: Codable { var offset: UInt64; var owner: String }
+    struct State: Codable {
+        var version = 1
+        var files: [String: FileMark] = [:]
+        var days: [String: [String: [String: UsageTotals]]] = [:]   // day -> owner -> model -> totals
+    }
+
+    let queue = DispatchQueue(label: "me.somalabs.multiclaude.usage", qos: .utility)
+    var folder = supportDir.appendingPathComponent("MultiClaude")
+    var archiveEnabled = true
+    private var state = State()
+    private var seen = Set<UInt64>()   // message ids already counted, so a reply copied into two files counts once
+    private var loaded = false
+
+    var stateURL: URL { folder.appendingPathComponent("usage.json") }
+    var seenURL: URL { folder.appendingPathComponent("usage-seen.bin") }
+    var archiveURL: URL { folder.appendingPathComponent("Archive") }
+
+    // FNV-1a, stable across launches (Swift's own hash is not).
+    static func fnv(_ s: String) -> UInt64 {
+        var h: UInt64 = 0xcbf2_9ce4_8422_2325
+        for b in s.utf8 { h = (h ^ UInt64(b)) &* 0x100_0000_01b3 }
+        return h
+    }
+
+    private func load() {
+        guard !loaded else { return }
+        loaded = true
+        if let d = try? Data(contentsOf: stateURL), let s = try? JSONDecoder().decode(State.self, from: d) { state = s }
+        if let d = try? Data(contentsOf: seenURL) {
+            d.withUnsafeBytes { raw in
+                for i in 0..<(d.count / 8) { seen.insert(raw.loadUnaligned(fromByteOffset: i * 8, as: UInt64.self)) }
+            }
+        }
+    }
+
+    private func save() {
+        try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        if let d = try? JSONEncoder().encode(state) { try? d.write(to: stateURL, options: .atomic) }
+        try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: stateURL.path)
+        var ids = Array(seen)
+        try? Data(bytes: &ids, count: ids.count * 8).write(to: seenURL, options: .atomic)
+    }
+
+    // Session id -> profile id, from each account's own list of Code and Cowork sessions.
+    static func sessionOwners(_ profiles: [Profile]) -> [String: String] { sessionIndex(profiles).owners }
+
+    // Also the titles Claude gave the sessions, for the conversation list.
+    static func sessionIndex(_ profiles: [Profile]) -> (owners: [String: String], titles: [String: String]) {
+        var map: [String: String] = [:], titles: [String: String] = [:]
+        let fm = FileManager.default
+        for p in profiles {
+            let root = p.folderURL.appendingPathComponent("claude-code-sessions")
+            guard let e = fm.enumerator(at: root, includingPropertiesForKeys: nil) else { continue }
+            for case let f as URL in e where f.lastPathComponent.hasPrefix("local_") && f.pathExtension == "json" {
+                guard let d = try? Data(contentsOf: f),
+                      let j = try? JSONSerialization.jsonObject(with: d) as? [String: Any],
+                      let sid = j["cliSessionId"] as? String else { continue }
+                map[sid] = p.id.uuidString
+                if let title = j["title"] as? String, !title.isEmpty { titles[sid] = title }
+            }
+        }
+        return (map, titles)
+    }
+
+    // The session a transcript belongs to: <id>.jsonl, or <id>/subagents/agent-*.jsonl.
+    static func sessionID(of file: URL) -> String {
+        let parent = file.deletingLastPathComponent()
+        if parent.lastPathComponent == "subagents" { return parent.deletingLastPathComponent().lastPathComponent }
+        return file.deletingPathExtension().lastPathComponent
+    }
+
+    static func sources(_ profiles: [Profile]) -> [UsageSource] {
+        let owners = sessionOwners(profiles)
+        var list = [UsageSource(root: home.appendingPathComponent(".claude/projects"), archiveName: "code") { f in
+            owners[sessionID(of: f)] ?? terminal
+        }]
+        for p in profiles {
+            let id = p.id.uuidString
+            if let cfg = p.codeConfigDir {
+                list.append(UsageSource(root: URL(fileURLWithPath: cfg).appendingPathComponent("projects"),
+                                        archiveName: "code-" + URL(fileURLWithPath: cfg).lastPathComponent) { _ in id })
+            }
+            list.append(UsageSource(root: p.folderURL.appendingPathComponent("local-agent-mode-sessions"),
+                                    archiveName: "cowork") { _ in id })
+        }
+        return list
+    }
+
+    // Reads what was added to each transcript since the last scan. Returns the totals for the panel.
+    func scan(profiles: [Profile]) -> State { scan(sources: Self.sources(profiles)) }
+
+    func scan(sources: [UsageSource]) -> State {
+        load()
+        let fm = FileManager.default
+        var changed = false
+        for src in sources {
+            guard let e = fm.enumerator(at: src.root, includingPropertiesForKeys: [.fileSizeKey, .isRegularFileKey]) else { continue }
+            for case let f as URL in e where f.pathExtension == "jsonl" {
+                let path = f.path
+                guard let size = (try? f.resourceValues(forKeys: [.fileSizeKey]))?.fileSize.map(UInt64.init) else { continue }
+                var mark = state.files[path] ?? FileMark(offset: 0, owner: src.owner(f))
+                if size < mark.offset { mark.offset = 0 }   // rewritten: counted ids are skipped anyway
+                guard size > mark.offset else { continue }
+                mark.offset = autoreleasepool { read(f, from: mark.offset, owner: mark.owner) }
+                state.files[path] = mark
+                changed = true
+                if archiveEnabled { archive(f, root: src.root, as: src.archiveName, owner: mark.owner) }
+            }
+        }
+        if changed { save() }
+        return state
+    }
+
+    // Parses complete lines from `offset`; returns the offset after the last complete line.
+    private func read(_ f: URL, from offset: UInt64, owner: String) -> UInt64 {
+        guard let h = try? FileHandle(forReadingFrom: f) else { return offset }
+        defer { try? h.close() }
+        try? h.seek(toOffset: offset)
+        var pos = offset
+        var carry = Data()
+        let marker = Data("\"usage\"".utf8)
+        while let chunk = try? h.read(upToCount: 4 << 20), !chunk.isEmpty {
+            carry.append(chunk)
+            var start = carry.startIndex
+            while let nl = carry[start...].firstIndex(of: 0x0A) {
+                let line = carry[start..<nl]
+                if line.range(of: marker) != nil { autoreleasepool { count(line, owner: owner) } }
+                pos += UInt64(nl - start + 1)
+                start = carry.index(after: nl)
+            }
+            carry = Data(carry[start...])
+        }
+        return pos
+    }
+
+    static let dayFormat: DateFormatter = {
+        let f = DateFormatter()
+        f.locale = Locale(identifier: "en_US_POSIX")
+        f.dateFormat = "yyyy-MM-dd"
+        return f
+    }()
+
+    private func count(_ line: Data, owner: String) {
+        guard let j = try? JSONSerialization.jsonObject(with: line) as? [String: Any],
+              let m = j["message"] as? [String: Any], let u = m["usage"] as? [String: Any],
+              let model = m["model"] as? String, model != "<synthetic>" else { return }
+        let key = (m["id"] as? String ?? "") + "|" + (j["requestId"] as? String ?? "")
+        if key != "|" {
+            guard seen.insert(Self.fnv(key)).inserted else { return }
+        }
+        let stamp = (j["timestamp"] as? String).flatMap { try? Date($0, strategy: .iso8601) } ?? Date()
+        let day = Self.dayFormat.string(from: stamp)
+        var t = UsageTotals()
+        t.input = u["input_tokens"] as? Int ?? 0
+        t.output = u["output_tokens"] as? Int ?? 0
+        t.cacheWrite = u["cache_creation_input_tokens"] as? Int ?? 0
+        t.cacheRead = u["cache_read_input_tokens"] as? Int ?? 0
+        t.messages = 1
+        state.days[day, default: [:]][owner, default: [:]][model, default: UsageTotals()] =
+            (state.days[day]?[owner]?[model] ?? UsageTotals()) + t
+    }
+
+    // APFS clone of the transcript under Archive/<owner>/<source>/<path>: takes no space while Claude
+    // keeps the original, and survives Claude Code's cleanup.
+    private func archive(_ f: URL, root: URL, as name: String, owner: String) {
+        let rel = String(f.standardizedFileURL.path.dropFirst(root.standardizedFileURL.path.count)).trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+        let dest = archiveURL.appendingPathComponent(owner).appendingPathComponent(name).appendingPathComponent(rel)
+        let fm = FileManager.default
+        // Transcripts hold whole conversations: only this user may open the archive.
+        if !fm.fileExists(atPath: archiveURL.path) {
+            try? fm.createDirectory(at: archiveURL, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+        }
+        try? fm.createDirectory(at: dest.deletingLastPathComponent(), withIntermediateDirectories: true)
+        let tmp = dest.deletingLastPathComponent().appendingPathComponent(".partial-" + dest.lastPathComponent)
+        try? fm.removeItem(at: tmp)
+        guard copyfile(f.path, tmp.path, nil, copyfile_flags_t(COPYFILE_CLONE)) == 0 else { return }
+        _ = try? fm.replaceItemAt(dest, withItemAt: tmp)
+        if fm.fileExists(atPath: tmp.path) { try? fm.removeItem(at: tmp) }
+    }
+}
+
+// MARK: chat usage limits (opt-in)
+
+// The share of each account's 5-hour and weekly limits, as claude.ai shows them. MultiClaude reads the
+// account's claude.ai session cookie from its Claude folder (Chromium encrypts it with a key kept in the
+// Keychain as "Claude Safe Storage", so macOS asks once) and asks claude.ai for the numbers. The cookie
+// stays in memory, is only sent to claude.ai, and is never logged or written anywhere.
+enum ChatLimits {
+    struct Limit: Equatable { let percent: Double; let resetsAt: Date? }
+    struct Snapshot: Equatable { var fiveHour: Limit?; var week: Limit?; var error: String? }
+
+    nonisolated(unsafe) static var aesKey: Data?
+
+    static func safeStorageKey() -> Data? {
+        if let aesKey { return aesKey }
+        let q: [String: Any] = [kSecClass as String: kSecClassGenericPassword,
+                                kSecAttrService as String: "Claude Safe Storage",
+                                kSecReturnData as String: true, kSecMatchLimit as String: kSecMatchLimitOne]
+        var out: CFTypeRef?
+        guard SecItemCopyMatching(q as CFDictionary, &out) == errSecSuccess, let pw = out as? Data else { return nil }
+        var key = Data(count: 16)
+        let salt = Array("saltysalt".utf8)
+        let rc = key.withUnsafeMutableBytes { k in
+            pw.withUnsafeBytes { p in
+                CCKeyDerivationPBKDF(CCPBKDFAlgorithm(kCCPBKDF2), p.baseAddress?.assumingMemoryBound(to: CChar.self), pw.count,
+                                     salt, salt.count, CCPseudoRandomAlgorithm(kCCPRFHmacAlgSHA1), 1003,
+                                     k.baseAddress?.assumingMemoryBound(to: UInt8.self), 16)
+            }
+        }
+        guard rc == kCCSuccess else { return nil }
+        aesKey = key
+        return key
+    }
+
+    // Chromium's v10 cookie format: "v10" + AES-128-CBC (IV of 16 spaces). Since cookie DB version 24 the
+    // plaintext starts with a 32-byte hash of the domain.
+    static func decrypt(_ blob: Data, key: Data, dbVersion: Int) -> String? {
+        guard blob.count > 3, blob.prefix(3) == Data("v10".utf8) else { return nil }
+        let body = blob.dropFirst(3)
+        let iv = [UInt8](repeating: 0x20, count: 16)
+        var out = Data(count: body.count + 16)
+        var moved = 0
+        let outCount = out.count
+        let rc = out.withUnsafeMutableBytes { o in
+            body.withUnsafeBytes { b in
+                key.withUnsafeBytes { k in
+                    CCCrypt(CCOperation(kCCDecrypt), CCAlgorithm(kCCAlgorithmAES128), CCOptions(kCCOptionPKCS7Padding),
+                            k.baseAddress, 16, iv, b.baseAddress, body.count, o.baseAddress, outCount, &moved)
+                }
+            }
+        }
+        guard rc == kCCSuccess else { return nil }
+        var plain = out.prefix(moved)
+        if dbVersion >= 24 && plain.count > 32 { plain = plain.dropFirst(32) }
+        return String(data: plain, encoding: .utf8)
+    }
+
+    static func sessionKey(in folder: URL, key: Data) -> String? {
+        let db = folder.appendingPathComponent("Cookies")
+        guard FileManager.default.fileExists(atPath: db.path) else { return nil }
+        var h: OpaquePointer?
+        // immutable=1 reads without taking Claude's lock.
+        guard sqlite3_open_v2("file:\(db.path.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? db.path)?immutable=1", &h,
+                              SQLITE_OPEN_READONLY | SQLITE_OPEN_URI, nil) == SQLITE_OK else { sqlite3_close(h); return nil }
+        defer { sqlite3_close(h) }
+        var version = 0
+        var st: OpaquePointer?
+        if sqlite3_prepare_v2(h, "SELECT value FROM meta WHERE key='version'", -1, &st, nil) == SQLITE_OK, sqlite3_step(st) == SQLITE_ROW {
+            version = Int(String(cString: sqlite3_column_text(st, 0))) ?? 0
+        }
+        sqlite3_finalize(st)
+        let q = "SELECT encrypted_value FROM cookies WHERE name='sessionKey' AND host_key LIKE '%claude.ai' ORDER BY expires_utc DESC LIMIT 1"
+        guard sqlite3_prepare_v2(h, q, -1, &st, nil) == SQLITE_OK else { return nil }
+        defer { sqlite3_finalize(st) }
+        guard sqlite3_step(st) == SQLITE_ROW, let p = sqlite3_column_blob(st, 0) else { return nil }
+        let blob = Data(bytes: p, count: Int(sqlite3_column_bytes(st, 0)))
+        return decrypt(blob, key: key, dbVersion: version)
+    }
+
+    static func get(_ path: String, _ cookie: String) async throws -> Any {
+        var req = URLRequest(url: URL(string: "https://claude.ai" + path)!, timeoutInterval: 20)
+        req.setValue("sessionKey=" + cookie, forHTTPHeaderField: "Cookie")
+        req.setValue("application/json", forHTTPHeaderField: "Accept")
+        req.setValue("MultiClaude/\(appVersion)", forHTTPHeaderField: "User-Agent")
+        req.httpShouldHandleCookies = false
+        let (data, resp) = try await URLSession.shared.data(for: req)
+        let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
+        guard code == 200 else { throw NSError(domain: "claude.ai", code: code) }
+        return try JSONSerialization.jsonObject(with: data)
+    }
+
+    static func parse(_ j: Any) -> Snapshot {
+        func limit(_ k: String) -> Limit? {
+            guard let d = (j as? [String: Any])?[k] as? [String: Any], let u = d["utilization"] as? Double else { return nil }
+            return Limit(percent: u, resetsAt: (d["resets_at"] as? String).flatMap { try? Date($0, strategy: .iso8601) })
+        }
+        return Snapshot(fiveHour: limit("five_hour"), week: limit("seven_day"))
+    }
+
+    static func fetch(folder: URL) async -> Snapshot {
+        guard let key = safeStorageKey() else { return Snapshot(error: "Keychain access refused") }
+        guard let cookie = sessionKey(in: folder, key: key) else { return Snapshot(error: "Not signed in") }
+        do {
+            guard let orgs = try await get("/api/organizations", cookie) as? [[String: Any]], !orgs.isEmpty else {
+                return Snapshot(error: "No organization")
+            }
+            let org = orgs.first { ($0["capabilities"] as? [String])?.contains("chat") == true } ?? orgs[0]
+            guard let uuid = org["uuid"] as? String else { return Snapshot(error: "No organization") }
+            return parse(try await get("/api/organizations/\(uuid)/usage", cookie))
+        } catch {
+            let code = (error as NSError).code
+            Log.write("chat limits: claude.ai answered \(code)")
+            return Snapshot(error: code == 401 || code == 403 ? "claude.ai refused (\(code))" : "Couldn't reach claude.ai")
+        }
+    }
+}
+
+// MARK: usage model for the panel and the window
+
+@MainActor
+final class Usage: ObservableObject {
+    static let shared = Usage()
+
+    @Published private(set) var days: [String: [String: [String: UsageTotals]]] = [:]
+    @Published private(set) var limits: [String: ChatLimits.Snapshot] = [:]   // profile id -> limits
+    @Published private(set) var scanning = false
+    @Published private(set) var lastScan: Date?
+    private var timer: Timer?
+    private var limitsAt: Date?
+
+    func start() {
+        guard timer == nil else { return }
+        timer = Timer(timeInterval: 120, repeats: true) { _ in MainActor.assumeIsolated { Usage.shared.refresh() } }
+        RunLoop.main.add(timer!, forMode: .common)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 5) { Usage.shared.refresh() }
+    }
+
+    func stop() {
+        timer?.invalidate()
+        timer = nil
+    }
+
+    func refresh(force: Bool = false) {
+        let e = Engine.shared
+        if e.isOn(.trackUsage) && !scanning {
+            scanning = true
+            let profiles = e.profiles
+            let archive = e.isOn(.archiveCode)
+            UsageScan.shared.queue.async {
+                UsageScan.shared.archiveEnabled = archive
+                let s = UsageScan.shared.scan(profiles: profiles)
+                DispatchQueue.main.async {
+                    MainActor.assumeIsolated {
+                        Usage.shared.days = s.days
+                        Usage.shared.scanning = false
+                        Usage.shared.lastScan = Date()
+                    }
+                }
+            }
+        }
+        if e.isOn(.chatLimits), force || limitsAt.map({ -$0.timeIntervalSinceNow > 290 }) ?? true {
+            limitsAt = Date()
+            let folders = e.profiles.map { ($0.id.uuidString, $0.folderURL) }
+            Task.detached {
+                var out: [String: ChatLimits.Snapshot] = [:]
+                for (id, f) in folders { out[id] = await ChatLimits.fetch(folder: f) }
+                let snapshot = out
+                await MainActor.run { Usage.shared.limits = snapshot }
+            }
+        } else if !e.isOn(.chatLimits) && !limits.isEmpty {
+            limits = [:]
+            ChatLimits.aesKey = nil
+        }
+    }
+
+    // Totals per owner (profile id or "terminal") over the last `days` days, today included; 0 = all time.
+    func totals(days n: Int) -> [String: UsageTotals] {
+        var out: [String: UsageTotals] = [:]
+        for (day, owners) in days where Self.inRange(day, n) {
+            for (owner, models) in owners { out[owner] = models.values.reduce(out[owner] ?? UsageTotals(), +) }
+        }
+        return out
+    }
+
+    func byModel(days n: Int) -> [(String, UsageTotals)] {
+        var out: [String: UsageTotals] = [:]
+        for (day, owners) in days where Self.inRange(day, n) {
+            for models in owners.values { for (m, t) in models { out[m] = (out[m] ?? UsageTotals()) + t } }
+        }
+        return out.sorted { $0.value.total > $1.value.total }
+    }
+
+    // Day -> totals, for one account or all of them.
+    func perDay(owner: String?) -> [String: UsageTotals] {
+        days.mapValues { owners in
+            owners.filter { owner == nil || $0.key == owner }.values.flatMap(\.values).reduce(UsageTotals(), +)
+        }
+    }
+
+    static func inRange(_ day: String, _ n: Int) -> Bool {
+        guard n > 0, let start = Calendar.current.date(byAdding: .day, value: -(n - 1), to: Calendar.current.startOfDay(for: Date()))
+        else { return true }
+        return day >= UsageScan.dayFormat.string(from: start)
+    }
+
+    static func ownerName(_ owner: String) -> String {
+        if owner == UsageScan.terminal { return "Terminal" }
+        return Engine.shared.profiles.first { $0.id.uuidString == owner }?.name ?? "Removed profile"
+    }
+
+    static func ownerTint(_ owner: String) -> Color {
+        Engine.shared.profiles.first { $0.id.uuidString == owner }?.tint ?? .secondary
+    }
+
+    static func short(_ n: Int) -> String {
+        switch n {
+        case 1_000_000_000...: String(format: "%.1fB", Double(n) / 1e9)
+        case 1_000_000...: String(format: "%.1fM", Double(n) / 1e6)
+        case 1_000...: String(format: "%.0fK", Double(n) / 1e3)
+        default: "\(n)"
+        }
+    }
+}
+
+// MARK: archived conversations
+
+struct ArchivedSession: Identifiable, Hashable {
+    let id: String        // file path
+    let owner: String
+    let title: String
+    let project: String
+    let date: Date
+    let size: Int
+}
+
+enum ArchiveIndex {
+    // Main transcripts only (not subagents), newest first. Reads the first 256 KB of each for a title.
+    static func list(titles: [String: String] = [:]) -> [ArchivedSession] {
+        let root = UsageScan.shared.archiveURL
+        let fm = FileManager.default
+        var out: [ArchivedSession] = []
+        guard let owners = try? fm.contentsOfDirectory(atPath: root.path) else { return [] }
+        for owner in owners where !owner.hasPrefix(".") {
+            guard let e = fm.enumerator(at: root.appendingPathComponent(owner),
+                                        includingPropertiesForKeys: [.contentModificationDateKey, .fileSizeKey]) else { continue }
+            for case let f as URL in e where f.pathExtension == "jsonl" && !f.path.contains("/subagents/")
+                && !f.lastPathComponent.hasPrefix(".partial-") && f.lastPathComponent != "audit.jsonl" {
+                let v = try? f.resourceValues(forKeys: [.contentModificationDateKey, .fileSizeKey])
+                let (title, project) = summary(f)
+                guard let title else { continue }
+                out.append(ArchivedSession(id: f.path, owner: owner, title: titles[UsageScan.sessionID(of: f)] ?? title, project: project,
+                                           date: v?.contentModificationDate ?? .distantPast, size: v?.fileSize ?? 0))
+            }
+        }
+        return out.sorted { $0.date > $1.date }
+    }
+
+    static func summary(_ f: URL) -> (String?, String) {
+        guard let h = try? FileHandle(forReadingFrom: f) else { return (nil, "") }
+        defer { try? h.close() }
+        let data = (try? h.read(upToCount: 256 << 10)) ?? Data()
+        var title: String?, custom: String?, cwd = ""
+        for line in data.split(separator: 0x0A) {
+            guard let j = try? JSONSerialization.jsonObject(with: Data(line)) as? [String: Any] else { continue }
+            if let t = j["customTitle"] as? String { custom = t }
+            if cwd.isEmpty, let c = j["cwd"] as? String { cwd = c }
+            if title == nil, j["type"] as? String == "user", (j["isMeta"] as? Bool) != true,
+               let text = Transcript.text(of: j["message"]), !text.hasPrefix("<") {
+                title = String(text.prefix(90)).replacingOccurrences(of: "\n", with: " ")
+            }
+            if title != nil && custom != nil { break }
+        }
+        return (custom ?? title, URL(fileURLWithPath: cwd).lastPathComponent)
+    }
+}
+
+enum Transcript {
+    struct Turn: Identifiable { let id: Int; let role: String; let text: String }
+
+    static func text(of message: Any?) -> String? {
+        guard let m = message as? [String: Any] else { return nil }
+        if let s = m["content"] as? String { return s.trimmingCharacters(in: .whitespacesAndNewlines) }
+        guard let blocks = m["content"] as? [[String: Any]] else { return nil }
+        let parts = blocks.compactMap { b -> String? in
+            switch b["type"] as? String {
+            case "text": return b["text"] as? String
+            case "tool_use": return "_[\(b["name"] as? String ?? "tool")]_"
+            default: return nil
+            }
+        }
+        let s = parts.joined(separator: "\n\n").trimmingCharacters(in: .whitespacesAndNewlines)
+        return s.isEmpty ? nil : s
+    }
+
+    // User prompts and Claude's replies, without tool results or system lines.
+    static func turns(_ path: String) -> [Turn] {
+        guard let data = FileManager.default.contents(atPath: path) else { return [] }
+        var out: [Turn] = []
+        var lastAssistant: String?
+        for line in data.split(separator: 0x0A) {
+            guard let j = try? JSONSerialization.jsonObject(with: Data(line)) as? [String: Any],
+                  let type = j["type"] as? String, type == "user" || type == "assistant",
+                  (j["isMeta"] as? Bool) != true, (j["isSidechain"] as? Bool) != true,
+                  let text = text(of: j["message"]), !text.hasPrefix("<") else { continue }
+            // Claude Code writes one line per content block of a reply; merge them back.
+            let mid = (j["message"] as? [String: Any])?["id"] as? String
+            if type == "assistant", let mid, mid == lastAssistant, let last = out.popLast() {
+                out.append(Turn(id: last.id, role: "assistant", text: last.text + "\n\n" + text))
+                continue
+            }
+            lastAssistant = type == "assistant" ? mid : nil
+            out.append(Turn(id: out.count, role: type, text: text))
+        }
+        return out
+    }
+
+    static func markdown(_ s: ArchivedSession, account: String) -> String {
+        var md = "# \(s.title)\n\n"
+        md += "\(account) · \(s.project) · \(s.date.formatted(date: .abbreviated, time: .shortened))\n\n"
+        for t in turns(s.id) { md += "## \(t.role == "user" ? "You" : "Claude")\n\n\(t.text)\n\n" }
+        return md
+    }
+}
+
 // MARK: - App icon (drawn, so the bundle needs no image files)
 
 enum AppIcon {
@@ -2574,6 +3119,13 @@ struct ProfileRow: View {
 // Confirmations for actions that quit a window or write into a profile's folder.
 @MainActor
 enum Dialogs {
+    // Chat limits read each account's claude.ai session cookie, so ask before the first time.
+    static func confirmChatLimits() -> Bool {
+        alert("Show each account's chat limits?",
+              "claude.ai keeps the 5-hour and weekly limits, not your Mac. To ask for them, MultiClaude reads each account's claude.ai sign-in cookie from its Claude folder (macOS asks you to allow \"Claude Safe Storage\" in the Keychain) and sends it to claude.ai only, every few minutes. It is kept in memory, never written or logged. This uses an endpoint claude.ai doesn't document, so it may stop working.",
+              buttons: ["Show Chat Limits", "Cancel"]).0 == 0
+    }
+
     static func alert(_ title: String, _ text: String, buttons: [String], field: String? = nil) -> (Int, String) {
         PanelController.shared.close()
         NSApp.activate()
@@ -2853,6 +3405,431 @@ struct AwakeSection: View {
     }
 }
 
+// The panel's Usage section: today's Claude Code tokens per account and in all, and each account's
+// chat limits when that setting is on.
+struct UsageSection: View {
+    @ObservedObject var usage = Usage.shared
+    @ObservedObject var engine = Engine.shared
+
+    var body: some View {
+        let today = usage.totals(days: 1)
+        let owners = engine.profiles.map(\.id.uuidString) + (today[UsageScan.terminal] != nil ? [UsageScan.terminal] : [])
+        VStack(spacing: 0) {
+            ForEach(owners, id: \.self) { owner in
+                HStack(spacing: 9) {
+                    Circle().fill(Usage.ownerTint(owner)).frame(width: 8, height: 8).frame(width: 24)
+                    Text(Usage.ownerName(owner)).font(.system(size: 13)).lineLimit(1)
+                    Spacer(minLength: 4)
+                    if let l = usage.limits[owner] { LimitText(snapshot: l) }
+                    Text(Usage.short(UsageMetric.current.value(today[owner] ?? UsageTotals()))).font(.system(size: 12, weight: .medium)).monospacedDigit()
+                        .foregroundStyle(.secondary).frame(minWidth: 40, alignment: .trailing)
+                }
+                .padding(.horizontal, 8)
+                .padding(.vertical, 4)
+            }
+            HStack {
+                Text("Open Usage and Conversations…").font(.system(size: 13))
+                Spacer()
+            }
+            .padding(.horizontal, 8)
+            .padding(.vertical, 4)
+            .modifier(HoverBackground(radius: 6))
+            .onTapGesture { PanelController.shared.close(); UsageWindow.show() }
+        }
+    }
+}
+
+struct LimitText: View {
+    let snapshot: ChatLimits.Snapshot
+    var body: some View {
+        if let e = snapshot.error {
+            Text(e).font(.system(size: 10)).foregroundStyle(.tertiary).lineLimit(1)
+        } else {
+            HStack(spacing: 6) {
+                if let h = snapshot.fiveHour { Meter(label: "5h", limit: h) }
+                if let w = snapshot.week { Meter(label: "wk", limit: w) }
+            }
+        }
+    }
+}
+
+struct Meter: View {
+    let label: String
+    let limit: ChatLimits.Limit
+    var body: some View {
+        HStack(spacing: 3) {
+            Text(label).font(.system(size: 9, weight: .medium)).foregroundStyle(.tertiary)
+            ZStack(alignment: .leading) {
+                Capsule().fill(Color.primary.opacity(0.14))
+                Capsule().fill(limit.percent >= 90 ? Color.red : Color.claude)
+                    .frame(width: max(2, 26 * min(limit.percent, 100) / 100))
+            }
+            .frame(width: 26, height: 4)
+        }
+        .help("\(Int(limit.percent.rounded()))% used" + (limit.resetsAt.map { ", resets \($0.formatted(date: .omitted, time: .shortened))" } ?? ""))
+    }
+}
+
+// MARK: usage window
+
+struct UsageWindowView: View {
+    @ObservedObject var usage = Usage.shared
+    @AppStorage("usage.tab") private var tab = 0
+    var body: some View {
+        VStack(spacing: 0) {
+            Picker("", selection: $tab) {
+                Text("Usage").tag(0)
+                Text("Conversations").tag(1)
+            }
+            .pickerStyle(.segmented).labelsHidden().frame(width: 260).padding(.vertical, 10)
+            Divider()
+            if tab == 0 { UsageStatsView() } else { ConversationsView() }
+        }
+        .frame(minWidth: 760, minHeight: 520)
+    }
+}
+
+// What a number means. Cache reads are most of Claude Code's raw total (the same context read again on
+// every turn), so the default is output: what Claude actually wrote.
+enum UsageMetric: String, CaseIterable, Identifiable {
+    case output, fresh, all
+    var id: String { rawValue }
+    var title: String {
+        switch self {
+        case .output: "Output"
+        case .fresh: "New Tokens"
+        case .all: "All Tokens"
+        }
+    }
+    var unit: String {
+        switch self {
+        case .output: "out"
+        case .fresh: "new"
+        case .all: "tokens"
+        }
+    }
+    var help: String {
+        switch self {
+        case .output: "Tokens Claude wrote."
+        case .fresh: "Tokens processed for the first time: input, output and cache writes. Leaves out cache reads."
+        case .all: "Everything, cache reads included. Cache reads are cheap and repeat the same context every turn."
+        }
+    }
+    func value(_ t: UsageTotals) -> Int {
+        switch self {
+        case .output: t.output
+        case .fresh: t.input + t.output + t.cacheWrite
+        case .all: t.total
+        }
+    }
+    static var current: UsageMetric { UsageMetric(rawValue: UserDefaults.standard.string(forKey: "usage.metric") ?? "") ?? .output }
+}
+
+struct UsageStatsView: View {
+    @ObservedObject var usage = Usage.shared
+    @ObservedObject var engine = Engine.shared
+    @AppStorage("usage.range") private var range = 7
+    @AppStorage("usage.metric") private var metricRaw = UsageMetric.output.rawValue
+    @AppStorage("usage.heatOwner") private var heatOwner = ""   // "" = every account
+
+    var body: some View {
+        let metric = UsageMetric(rawValue: metricRaw) ?? .output
+        let totals = usage.totals(days: range)
+        let all = totals.values.reduce(UsageTotals(), +)
+        let owners = totals.sorted { metric.value($0.value) > metric.value($1.value) }
+        ScrollView {
+            VStack(alignment: .leading, spacing: 22) {
+                HStack(spacing: 12) {
+                    Picker("", selection: $range) {
+                        Text("Today").tag(1); Text("7 Days").tag(7); Text("30 Days").tag(30); Text("All").tag(0)
+                    }
+                    .pickerStyle(.segmented).labelsHidden().frame(width: 280)
+                    Picker("", selection: $metricRaw) {
+                        ForEach(UsageMetric.allCases) { Text($0.title).tag($0.rawValue) }
+                    }
+                    .labelsHidden().frame(width: 130)
+                    .help(metric.help)
+                    Spacer()
+                    if usage.scanning { ProgressView().controlSize(.small) }
+                    Button("Refresh") { usage.refresh(force: true) }
+                }
+
+                HStack(spacing: 10) {
+                    Tile(title: metric.title, value: Usage.short(metric.value(all)), accent: true)
+                    Tile(title: "Replies", value: Usage.short(all.messages))
+                    Tile(title: "Output per reply", value: all.messages > 0 ? Usage.short(all.output / all.messages) : "0")
+                    Tile(title: "Cache hit", value: all.input + all.cacheRead + all.cacheWrite > 0
+                         ? "\(all.cacheRead * 100 / (all.input + all.cacheRead + all.cacheWrite))%" : "–")
+                        .help("Share of input read from cache. Higher is cheaper and faster.")
+                }
+
+                // Share of the chosen metric per account, one thin bar.
+                if metric.value(all) > 0 {
+                    VStack(alignment: .leading, spacing: 8) {
+                        GeometryReader { g in
+                            HStack(spacing: 2) {
+                                ForEach(owners, id: \.key) { owner, t in
+                                    let w = g.size.width * CGFloat(metric.value(t)) / CGFloat(metric.value(all))
+                                    if w >= 1 {
+                                        RoundedRectangle(cornerRadius: 3).fill(Usage.ownerTint(owner)).frame(width: max(w - 2, 1))
+                                            .help("\(Usage.ownerName(owner)): \(metric.value(t).formatted())")
+                                    }
+                                }
+                            }
+                        }
+                        .frame(height: 8)
+                        HStack(spacing: 16) {
+                            ForEach(owners, id: \.key) { owner, t in
+                                HStack(spacing: 5) {
+                                    Circle().fill(Usage.ownerTint(owner)).frame(width: 7, height: 7)
+                                    Text(Usage.ownerName(owner)).font(.caption)
+                                    Text("\(metric.value(t) * 100 / max(metric.value(all), 1))% · \(Usage.short(metric.value(t)))")
+                                        .font(.caption).foregroundStyle(.secondary).monospacedDigit()
+                                }
+                            }
+                        }
+                    }
+                }
+
+                VStack(alignment: .leading, spacing: 10) {
+                    HStack {
+                        Text("Last 6 months").font(.headline)
+                        Spacer()
+                        Picker("", selection: $heatOwner) {
+                            Text("All accounts").tag("")
+                            ForEach(engine.profiles) { Text($0.name).tag($0.id.uuidString) }
+                            Text("Terminal").tag(UsageScan.terminal)
+                        }
+                        .labelsHidden().frame(width: 150)
+                    }
+                    Heatmap(values: usage.perDay(owner: heatOwner.isEmpty ? nil : heatOwner).mapValues(metric.value),
+                            tint: heatOwner.isEmpty ? .claude : Usage.ownerTint(heatOwner), unit: metric.unit)
+                }
+
+                Text("By model").font(.headline)
+                Grid(alignment: .leading, horizontalSpacing: 22, verticalSpacing: 6) {
+                    GridRow { header("Model"); header(metric.title); header("Replies"); header("Output per reply") }
+                    ForEach(usage.byModel(days: range).sorted { metric.value($0.1) > metric.value($1.1) }, id: \.0) { m, t in
+                        GridRow {
+                            Text(m).font(.system(size: 12, design: .monospaced))
+                            num(metric.value(t)); num(t.messages); num(t.messages > 0 ? t.output / t.messages : 0)
+                        }
+                    }
+                }
+
+                if !usage.limits.isEmpty {
+                    Text("Chat limits").font(.headline)
+                    Grid(alignment: .leading, horizontalSpacing: 22, verticalSpacing: 6) {
+                        ForEach(engine.profiles) { p in
+                            if let l = usage.limits[p.id.uuidString] {
+                                GridRow {
+                                    HStack { Circle().fill(p.tint).frame(width: 8, height: 8); Text(p.name) }
+                                    LimitText(snapshot: l)
+                                }
+                            }
+                        }
+                    }
+                }
+
+                Text("From Claude Code's own logs on this Mac: the Code tab, Cowork and the terminal. Regular chats keep no token counts on the Mac; Show Chat Limits adds each account's 5-hour and weekly limits from claude.ai.")
+                    .font(.footnote).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+            }
+            .padding(20)
+        }
+    }
+
+    private func header(_ s: String) -> some View { Text(s).font(.caption).foregroundStyle(.secondary) }
+    private func num(_ n: Int) -> some View { Text(Usage.short(n)).monospacedDigit() }
+}
+
+// GitHub-style calendar: one square per day, weeks as columns, darker for busier days.
+// Levels follow the busiest days on a log scale, so one huge day doesn't wash the rest out.
+struct Heatmap: View {
+    let values: [String: Int]   // yyyy-MM-dd -> value
+    let tint: Color
+    let unit: String
+    var weeks = 26
+    private let cell: CGFloat = 12
+    private let gap: CGFloat = 3
+
+    var body: some View {
+        let cal = Calendar.current
+        let today = cal.startOfDay(for: Date())
+        let thisWeek = cal.dateInterval(of: .weekOfYear, for: today)?.start ?? today
+        let start = cal.date(byAdding: .weekOfYear, value: -(weeks - 1), to: thisWeek) ?? today
+        let peak = log1p(Double(values.values.max() ?? 0))
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(alignment: .top, spacing: gap) {
+                ForEach(0..<weeks, id: \.self) { w in
+                    let first = cal.date(byAdding: .weekOfYear, value: w, to: start) ?? start
+                    VStack(spacing: gap) {
+                        // Month name over the first week that starts in it.
+                        Text(cal.component(.day, from: first) <= 7 ? first.formatted(.dateTime.month(.abbreviated)) : " ")
+                            .font(.system(size: 9)).foregroundStyle(.secondary).fixedSize().frame(width: cell, alignment: .leading)
+                        ForEach(0..<7, id: \.self) { d in
+                            let day = cal.date(byAdding: .day, value: d, to: first) ?? first
+                            let key = UsageScan.dayFormat.string(from: day)
+                            let v = values[key] ?? 0
+                            RoundedRectangle(cornerRadius: 2.5)
+                                .fill(day > today ? Color.clear : color(v, peak: peak))
+                                .frame(width: cell, height: cell)
+                                .help(day > today ? "" : "\(day.formatted(date: .abbreviated, time: .omitted)): \(v == 0 ? "nothing" : v.formatted() + " " + unit)")
+                        }
+                    }
+                }
+            }
+            HStack(spacing: 4) {
+                Spacer()
+                Text("Less").font(.system(size: 9)).foregroundStyle(.secondary)
+                ForEach(0..<5) { i in
+                    RoundedRectangle(cornerRadius: 2.5).fill(level(i)).frame(width: 10, height: 10)
+                }
+                Text("More").font(.system(size: 9)).foregroundStyle(.secondary)
+            }
+            .frame(width: CGFloat(weeks) * (cell + gap))
+        }
+    }
+
+    private func level(_ i: Int) -> Color { i == 0 ? Color.primary.opacity(0.07) : tint.opacity([0, 0.3, 0.5, 0.75, 1][i]) }
+
+    private func color(_ v: Int, peak: Double) -> Color {
+        guard v > 0, peak > 0 else { return level(0) }
+        let f = log1p(Double(v)) / peak
+        return level(f > 0.9 ? 4 : f > 0.75 ? 3 : f > 0.55 ? 2 : 1)
+    }
+}
+
+struct Tile: View {
+    let title: String
+    let value: String
+    var accent = false
+    var body: some View {
+        VStack(alignment: .leading, spacing: 3) {
+            Text(title).font(.caption).foregroundStyle(.secondary)
+            Text(value).font(.system(size: 22, weight: .semibold)).monospacedDigit()
+                .foregroundStyle(accent ? Color.claude : .primary)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(10)
+        .background(RoundedRectangle(cornerRadius: 10).fill(Color.primary.opacity(0.05)))
+    }
+}
+
+struct ConversationsView: View {
+    @State private var sessions: [ArchivedSession] = []
+    @State private var query = ""
+    @State private var selection: ArchivedSession.ID?
+    @State private var loading = true
+    @AppStorage("usage.hideOneShot") private var hideOneShot = true
+
+    var body: some View {
+        // Hooks and scripts that run `claude -p` start every session with the same prompt.
+        let repeated = Dictionary(grouping: sessions, by: \.title).filter { $0.value.count >= 5 }
+        let kept = hideOneShot ? sessions.filter { repeated[$0.title] == nil } : sessions
+        let shown = query.isEmpty ? kept : kept.filter {
+            $0.title.localizedCaseInsensitiveContains(query) || $0.project.localizedCaseInsensitiveContains(query)
+                || Usage.ownerName($0.owner).localizedCaseInsensitiveContains(query)
+        }
+        HSplitView {
+            VStack(spacing: 0) {
+                TextField("Search titles, projects, accounts", text: $query).textFieldStyle(.roundedBorder).padding([.horizontal, .top], 8)
+                HStack {
+                    Toggle("Hide automated runs", isOn: $hideOneShot).toggleStyle(.checkbox).font(.caption)
+                        .help("Hides sessions that start with the same prompt 5 times or more: hooks and scripts running `claude -p`.")
+                    Spacer()
+                    Text("\(shown.count) of \(sessions.count)").font(.caption).foregroundStyle(.secondary)
+                }
+                .padding(.horizontal, 10).padding(.vertical, 6)
+                if loading { ProgressView().padding() }
+                List(shown, selection: $selection) { s in
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(s.title).lineLimit(1)
+                        HStack(spacing: 5) {
+                            Circle().fill(Usage.ownerTint(s.owner)).frame(width: 6, height: 6)
+                            Text("\(Usage.ownerName(s.owner)) · \(s.project) · \(s.date.formatted(date: .abbreviated, time: .shortened))")
+                                .font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                        }
+                    }
+                    .tag(s.id)
+                }
+            }
+            .frame(minWidth: 300, idealWidth: 340)
+            if let s = sessions.first(where: { $0.id == selection }) {
+                TranscriptView(session: s).id(s.id)
+            } else {
+                Text(sessions.isEmpty && !loading ? "No conversations kept yet." : "Pick a conversation.")
+                    .foregroundStyle(.secondary).frame(maxWidth: .infinity, maxHeight: .infinity)
+            }
+        }
+        .task {
+            let profiles = Engine.shared.profiles
+            let list = await Task.detached { ArchiveIndex.list(titles: UsageScan.sessionIndex(profiles).titles) }.value
+            sessions = list
+            loading = false
+        }
+    }
+}
+
+struct TranscriptView: View {
+    let session: ArchivedSession
+    @State private var turns: [Transcript.Turn] = []
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack {
+                Text(session.title).font(.headline).lineLimit(1)
+                Spacer()
+                Button("Show in Finder") { NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: session.id)]) }
+                Button("Export Markdown…") { export() }
+            }
+            .padding(10)
+            Divider()
+            ScrollView {
+                LazyVStack(alignment: .leading, spacing: 14) {
+                    ForEach(turns) { t in
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text(t.role == "user" ? "You" : "Claude").font(.caption.weight(.semibold))
+                                .foregroundStyle(t.role == "user" ? Color.claude : .secondary)
+                            Text(t.text.count > 6000 ? t.text.prefix(6000) + "…" : t.text).textSelection(.enabled)
+                        }
+                    }
+                }
+                .padding(16)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            }
+        }
+        .task { turns = await Task.detached { [path = session.id] in Transcript.turns(path) }.value }
+    }
+
+    private func export() {
+        let p = NSSavePanel()
+        p.nameFieldStringValue = String(session.title.prefix(60)).replacingOccurrences(of: "/", with: "-") + ".md"
+        p.allowedContentTypes = [.init(filenameExtension: "md")!]
+        guard p.runModal() == .OK, let url = p.url else { return }
+        try? Transcript.markdown(session, account: Usage.ownerName(session.owner)).write(to: url, atomically: true, encoding: .utf8)
+    }
+}
+
+@MainActor
+enum UsageWindow {
+    static var window: NSWindow?
+
+    static func show() {
+        if window == nil {
+            let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 900, height: 620),
+                             styleMask: [.titled, .closable, .miniaturizable, .resizable], backing: .buffered, defer: false)
+            w.title = "MultiClaude Usage"
+            w.isReleasedWhenClosed = false
+            w.contentView = NSHostingView(rootView: UsageWindowView())
+            w.center()
+            window = w
+        }
+        Usage.shared.refresh()
+        NSApp.activate()
+        window?.makeKeyAndOrderFront(nil)
+    }
+}
+
 struct MenuView: View {
     @ObservedObject var engine = Engine.shared
     @ObservedObject var panel = PanelController.shared
@@ -2860,6 +3837,8 @@ struct MenuView: View {
     @AppStorage("settingsOpen") private var settingsOpen = false
     @AppStorage("awakeOpen") private var awakeOpen = false
     @ObservedObject var awake = Awake.shared
+    @ObservedObject var usage = Usage.shared
+    @AppStorage("usageOpen") private var usageOpen = true
     @State private var editing: UUID?
 
     var body: some View {
@@ -2924,6 +3903,13 @@ struct MenuView: View {
                     }
                     .padding(.horizontal, 6)
                     .padding(.bottom, 5)
+                }
+                if engine.isOn(.trackUsage) || engine.isOn(.chatLimits) {
+                    Divider().padding(.horizontal, 14)
+                    SectionHeader(title: "Usage Today",
+                                  trailing: Usage.short(UsageMetric.current.value(usage.totals(days: 1).values.reduce(UsageTotals(), +))) + " " + UsageMetric.current.unit,
+                                  open: $usageOpen)
+                    if usageOpen { UsageSection().padding(.horizontal, 6).padding(.bottom, 5) }
                 }
             }
 
@@ -3201,6 +4187,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         engine.boot()
         engine.updateScroll()
         if !isDemo { Awake.shared.boot() }
+        if !isDemo { Usage.shared.start() }
         refreshIcon()
         // Preview hook for screenshots: MULTICLAUDE_PREVIEW=panel|settings|awake|about
         switch ProcessInfo.processInfo.environment["MULTICLAUDE_PREVIEW"] {
@@ -3220,6 +4207,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
                 if let b = self?.item.button { PanelController.shared.open(below: b) }
             }
+        case "usage":
+            UserDefaults.standard.set(0, forKey: "usage.tab")
+            UsageWindow.show()
+        case "conversations":
+            UserDefaults.standard.set(1, forKey: "usage.tab")
+            UsageWindow.show()
         case "about": AboutWindow.show()
         default: break
         }
@@ -3632,6 +4625,86 @@ if args.count == 2, args[1] == "--selftest-awake" {
         check("managing Claude is on by default", Setting.onByDefault.contains(.manageClaude))
         check("shortcut keys apart from MultiClaude's", Set(AwakeSetting.allCases.map(\.key)).isDisjoint(with: Setting.allCases.map(\.rawValue)))
     }
+    exit(ok ? 0 : 1)
+}
+if args.count == 3, args[1] == "--usage-report" {
+    // --usage-report <store folder>: scans this Mac's transcripts into that folder (no archive) and prints totals.
+    let scan = UsageScan()
+    scan.folder = URL(fileURLWithPath: args[2])
+    scan.archiveEnabled = false
+    let start = Date()
+    let s = MainActor.assumeIsolated { scan.scan(profiles: Engine.shared.profiles) }
+    print("scanned \(s.files.count) files in \(Int(-start.timeIntervalSinceNow)) s")
+    var owners: [String: UsageTotals] = [:]
+    for (_, o) in s.days { for (owner, models) in o { owners[owner] = models.values.reduce(owners[owner] ?? UsageTotals(), +) } }
+    MainActor.assumeIsolated {
+        for (o, t) in owners.sorted(by: { $0.value.total > $1.value.total }) {
+            print(Usage.ownerName(o), "total", Usage.short(t.total), "in", Usage.short(t.input), "out", Usage.short(t.output), "replies", t.messages)
+        }
+    }
+    exit(0)
+}
+if args.count == 2, args[1] == "--selftest-usage" {
+    // Token counting on synthetic transcripts, the archive copy, and the cookie decryption round trip.
+    var ok = true
+    func check(_ name: String, _ cond: Bool) { print(cond ? "PASS" : "FAIL", name); ok = ok && cond }
+    let fm = FileManager.default
+    let tmp = fm.temporaryDirectory.appendingPathComponent("mc-usage-\(UUID().uuidString)")
+    defer { try? fm.removeItem(at: tmp) }
+    let root = tmp.appendingPathComponent("projects/-p")
+    try? fm.createDirectory(at: root.appendingPathComponent("s1/subagents"), withIntermediateDirectories: true)
+    func reply(_ id: String, _ req: String, _ out: Int, day: String = "2026-10-15") -> String {
+        #"{"type":"assistant","requestId":"\#(req)","timestamp":"\#(day)T12:00:00Z","message":{"id":"\#(id)","model":"claude-test","content":[{"type":"text","text":"ok"}],"usage":{"input_tokens":10,"output_tokens":\#(out),"cache_creation_input_tokens":100,"cache_read_input_tokens":1000}}}"#
+    }
+    let user = #"{"type":"user","message":{"role":"user","content":"Hello there"},"cwd":"/tmp/proj"}"#
+    let s1 = root.appendingPathComponent("s1.jsonl"), s2 = root.appendingPathComponent("s2.jsonl")
+    // m1 appears twice in a row (one line per content block), m2 again in s2 (a copied history).
+    try? ([user, reply("m1", "r1", 5), reply("m1", "r1", 5), reply("m2", "r2", 7)].joined(separator: "\n") + "\n").write(to: s1, atomically: true, encoding: .utf8)
+    try? ([reply("m2", "r2", 7), reply("m3", "r3", 11, day: "2026-10-14")].joined(separator: "\n") + "\n").write(to: s2, atomically: true, encoding: .utf8)
+    try? (reply("m4", "r4", 13) + "\n").write(to: root.appendingPathComponent("s1/subagents/agent-a.jsonl"), atomically: true, encoding: .utf8)
+    let scan = UsageScan()
+    scan.folder = tmp.appendingPathComponent("store")
+    let src = UsageSource(root: tmp.appendingPathComponent("projects"), archiveName: "code") { f in
+        UsageScan.sessionID(of: f) == "s1" ? "A" : "B"
+    }
+    var s = scan.scan(sources: [src])
+    func out(_ o: String) -> Int { s.days.values.compactMap { $0[o]?.values.reduce(0) { $0 + $1.output } }.reduce(0, +) }
+    // Files are read in any order, so m2 goes to whichever file came first; it must count once either way.
+    check("duplicate lines and copied replies counted once", out("A") + out("B") == 5 + 7 + 11 + 13)
+    check("subagent credited to its session", out("A") >= 5 + 13 && out("B") >= 11)
+    check("days kept apart", s.days["2026-10-14"]?["B"]?["claude-test"]?.output == 11)
+    check("cache counted", s.days.values.flatMap { $0.values.flatMap(\.values) }.reduce(0) { $0 + $1.cacheRead } == 4000)
+    // A half-written line waits for the next scan.
+    if let h = try? FileHandle(forWritingTo: s1) {
+        h.seekToEndOfFile()
+        let line = reply("m5", "r5", 17)
+        h.write(Data(line.prefix(40).utf8)); s = scan.scan(sources: [src])
+        check("partial line not counted yet", out("A") + out("B") == 36)
+        h.write(Data((line.dropFirst(40) + "\n").utf8)); try? h.close()
+        s = scan.scan(sources: [src])
+        check("appended reply counted once complete", out("A") + out("B") == 53)
+    }
+    let again = UsageScan(); again.folder = scan.folder
+    s = again.scan(sources: [src])
+    check("state survives a restart without double counting", out("A") + out("B") == 53)
+    let archived = scan.archiveURL.appendingPathComponent("A/code/-p/s1.jsonl")
+    check("transcript archived under its account", (try? String(contentsOf: archived, encoding: .utf8))?.contains("m5") == true)
+    check("archive keeps a transcript Claude deleted", { try? fm.removeItem(at: s1); return fm.fileExists(atPath: archived.path) }())
+    check("transcript turns merge a reply's blocks", Transcript.turns(archived.path).map(\.role) == ["user", "assistant", "assistant", "assistant"])
+    // Cookie format: encrypt like Chromium, decrypt with ChatLimits.
+    let key = Data((0..<16).map { UInt8($0) })
+    for version in [23, 24] {
+        let plain = (version >= 24 ? Data(repeating: 7, count: 32) : Data()) + Data("sk-ant-sid01-test".utf8)
+        var enc = Data(count: plain.count + 16); var n = 0
+        let encCount = enc.count
+        _ = enc.withUnsafeMutableBytes { o in plain.withUnsafeBytes { p in key.withUnsafeBytes { k in
+            CCCrypt(CCOperation(kCCEncrypt), CCAlgorithm(kCCAlgorithmAES128), CCOptions(kCCOptionPKCS7Padding), k.baseAddress, 16,
+                    [UInt8](repeating: 0x20, count: 16), p.baseAddress, plain.count, o.baseAddress, encCount, &n) } } }
+        check("cookie decrypts (db version \(version))", ChatLimits.decrypt(Data("v10".utf8) + enc.prefix(n), key: key, dbVersion: version) == "sk-ant-sid01-test")
+    }
+    let sample = #"{"five_hour":{"utilization":42.0,"resets_at":"2026-10-15T15:00:00Z"},"seven_day":{"utilization":7.5,"resets_at":null}}"#
+    let parsed = ChatLimits.parse(try! JSONSerialization.jsonObject(with: Data(sample.utf8)))
+    check("limits parsed", parsed.fiveHour?.percent == 42 && parsed.week?.percent == 7.5 && parsed.fiveHour?.resetsAt != nil)
     exit(ok ? 0 : 1)
 }
 if args.count == 2, args[1] == "--selftest-version" {

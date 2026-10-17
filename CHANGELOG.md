@@ -8,7 +8,11 @@
 
 - **Keep-awake only.** Turn off **Manage Claude Accounts** in Settings and MultiClaude becomes a keep-awake and scroll app: the profiles and their settings leave the panel, the `claude://` links go back to Claude, and MultiClaude stops watching, reopening, renaming or quitting Claude windows. Your profiles and folders stay as they are; turn the setting back on to pick up where you were.
 
-Both come from Cocaine, our keep-awake app. If Cocaine runs too and already reverses a direction, MultiClaude leaves that direction alone (the setting says "on in Cocaine") so scrolling isn't flipped twice.
+- **Token usage, per account and in all.** MultiClaude reads the token counts Claude Code logs for every reply (Code tab, Cowork and terminal) and credits each session to the account it ran in. The panel's **Usage Today** shows each account's output; **Open Usage and Conversations…** opens a window with totals for today, 7 or 30 days or all time, each account's share, a 6-month heatmap (all accounts or one), output per reply, cache hit rate and a by-model table. Output is the default measure, since cache reads (the same context read again every turn) are most of the raw total; New Tokens and All Tokens are one click away. The first count reads every transcript once (about a minute for 16 GB), then only what was added.
+- **Chat limits** (off by default). Regular chats keep no token counts on the Mac, so **Show Chat Limits** asks claude.ai for each account's 5-hour and weekly limits, using that account's sign-in cookie. MultiClaude asks before turning it on, macOS asks for Keychain access, and the cookie only goes to claude.ai. It uses an endpoint claude.ai doesn't document, so it may stop working.
+- **Your Claude Code conversations, kept.** Claude Code deletes transcripts after 30 days by default. **Keep Claude Code Conversations** (on) keeps an APFS clone of every transcript under its account in `~/Library/Application Support/MultiClaude/Archive`, readable only by you. The window's **Conversations** tab lists them by account with Claude's own titles, searches them, shows each one and exports it to Markdown. Repeated automated runs (hooks that call `claude -p`) are hidden by default.
+
+Both keep-awake and the scroll reverser come from Cocaine, our keep-awake app. If Cocaine runs too and already reverses a direction, MultiClaude leaves that direction alone (the setting says "on in Cocaine") so scrolling isn't flipped twice.
 
 ## 1.4.1 (build 9), 2026-10-11
 
