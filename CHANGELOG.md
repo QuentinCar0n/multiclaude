@@ -1,6 +1,6 @@
 # MultiClaude release notes
 
-## 1.5 (build 10), 2026-10-14
+## 1.5 (build 10), 2026-10-16
 
 ### New
 - **Keep your Mac awake.** The bolt next to the switch at the top of the panel turns it on and off. The **Keep Awake** section just below it holds off sleep until you turn it off, or for 15, 30 or 45 minutes, 1, 2, 4 or 8 hours, or any time from 5 minutes to 24 hours with the slider under the gear. The section header counts down, and a bolt joins the asterisk in the menu bar while it's on. A restart for a MultiClaude update keeps it going. Its **Options**: activate at launch, activate with a left click on the menu bar icon (right-click still opens the panel), a ⌃⌥⌘A shortcut, let the display sleep, stay awake with the lid closed (macOS asks for your password, since it takes `pmset disablesleep`), a notification when it turns off, turn on when power is connected, turn off when it's disconnected or the battery drops below 20%.
