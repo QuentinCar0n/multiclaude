@@ -1,5 +1,10 @@
 # MultiClaude release notes
 
+## 1.5.1 (build 11), 2026-10-16
+
+### Fixed
+- **Chat limits read clearly in the panel.** The "5h" label no longer wraps onto two lines, each meter now shows its percentage, and the account name keeps its room.
+
 ## 1.5 (build 10), 2026-10-16
 
 ### New

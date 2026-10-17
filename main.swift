@@ -3444,11 +3444,11 @@ struct UsageSection: View {
             ForEach(owners, id: \.self) { owner in
                 HStack(spacing: 9) {
                     Circle().fill(Usage.ownerTint(owner)).frame(width: 8, height: 8).frame(width: 24)
-                    Text(Usage.ownerName(owner)).font(.system(size: 13)).lineLimit(1)
-                    Spacer(minLength: 4)
+                    Text(Usage.ownerName(owner)).font(.system(size: 13)).lineLimit(1).layoutPriority(1)
+                    Spacer(minLength: 2)
                     if let l = usage.limits[owner] { LimitText(snapshot: l) }
                     Text(Usage.short(UsageMetric.current.value(today[owner] ?? UsageTotals()))).font(.system(size: 12, weight: .medium)).monospacedDigit()
-                        .foregroundStyle(.secondary).frame(minWidth: 40, alignment: .trailing)
+                        .foregroundStyle(.secondary).frame(minWidth: 34, alignment: .trailing)
                 }
                 .padding(.horizontal, 8)
                 .padding(.vertical, 4)
@@ -3471,7 +3471,7 @@ struct LimitText: View {
         if let e = snapshot.error {
             Text(e).font(.system(size: 10)).foregroundStyle(.tertiary).lineLimit(1)
         } else {
-            HStack(spacing: 6) {
+            HStack(spacing: 5) {
                 if let h = snapshot.fiveHour { Meter(label: "5h", limit: h) }
                 if let w = snapshot.week { Meter(label: "wk", limit: w) }
             }
@@ -3484,13 +3484,15 @@ struct Meter: View {
     let limit: ChatLimits.Limit
     var body: some View {
         HStack(spacing: 3) {
-            Text(label).font(.system(size: 9, weight: .medium)).foregroundStyle(.tertiary)
+            Text(label).font(.system(size: 9, weight: .medium)).foregroundStyle(.tertiary).fixedSize()
             ZStack(alignment: .leading) {
                 Capsule().fill(Color.primary.opacity(0.14))
                 Capsule().fill(limit.percent >= 90 ? Color.red : Color.claude)
-                    .frame(width: max(2, 26 * min(limit.percent, 100) / 100))
+                    .frame(width: max(2, 22 * min(limit.percent, 100) / 100))
             }
-            .frame(width: 26, height: 4)
+            .frame(width: 22, height: 4)
+            Text("\(Int(limit.percent.rounded()))%").font(.system(size: 9, weight: .medium)).monospacedDigit()
+                .foregroundStyle(.secondary).fixedSize()
         }
         .help("\(Int(limit.percent.rounded()))% used" + (limit.resetsAt.map { ", resets \($0.formatted(date: .omitted, time: .shortened))" } ?? ""))
     }
