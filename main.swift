@@ -1720,7 +1720,9 @@ enum Freezer {
         let me = getuid()
         var stopped: [pid_t] = []
         for app in NSWorkspace.shared.runningApplications {
-            guard let id = app.bundleIdentifier, apps[id] != nil, !app.isTerminated else { continue }
+            // MULTICLAUDE_FREEZE_EXTRA (preview runs only) adds one bundle id, to test with a harmless app.
+            let extra = isPreview ? ProcessInfo.processInfo.environment["MULTICLAUDE_FREEZE_EXTRA"] : nil
+            guard let id = app.bundleIdentifier, apps[id] != nil || id == extra, !app.isTerminated else { continue }
             for pid in tree(app.processIdentifier, in: table) {
                 var info = proc_bsdinfo()
                 // Only our own user's processes.
@@ -1971,7 +1973,40 @@ final class Awake: ObservableObject {
     }
 
     // Lid actions only matter while the Mac stays awake with the lid closed.
-    var lidActionsLive: Bool { active && isOn(.lidClosed) }
+    var lidActionsLive: Bool { active && (isOn(.lidClosed) || simulatedLid) }
+    var simulatedLid = false   // MULTICLAUDE_PREVIEW=lidtest: lid actions without lid mode's root change
+
+    // Closes and opens a pretend lid and logs what happened to each action, then quits.
+    func runLidTest() {
+        simulatedLid = true
+        activate(minutes: 1)
+        func pausedCount() -> Int {
+            recovery.frozen.filter { pid in
+                var info = proc_bsdinfo()
+                return proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &info, Int32(MemoryLayout<proc_bsdinfo>.size)) > 0 && info.pbi_status == UInt32(SSTOP)
+            }.count
+        }
+        let frozenBefore = { () -> [pid_t] in self.recovery.frozen }
+        lidChanged(true)
+        let paused = pausedCount(), stateSaved = FileManager.default.fileExists(atPath: Recovery.stateURL.path)
+        let muted = OutputMute.defaultDevice().map(OutputMute.isMuted) ?? false
+        Log.write("lidtest closed: muted=\(muted) paused=\(paused)/\(frozenBefore().count) state-file=\(stateSaved)")
+        DispatchQueue.main.asyncAfter(deadline: .now() + 5) {
+            let pids = self.recovery.frozen
+            self.lidChanged(false)
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1) {
+                let still = pids.filter { pid in
+                    var info = proc_bsdinfo()
+                    return proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &info, Int32(MemoryLayout<proc_bsdinfo>.size)) > 0 && info.pbi_status == UInt32(SSTOP)
+                }.count
+                let mutedNow = OutputMute.defaultDevice().map(OutputMute.isMuted) ?? false
+                self.deactivate()
+                let left = FileManager.default.fileExists(atPath: Recovery.stateURL.path)
+                Log.write("lidtest opened: muted=\(mutedNow) still-paused=\(still) state-file=\(left)")
+                NSApp.terminate(nil)
+            }
+        }
+    }
 
     func toggle(_ s: AwakeSetting) {
         let on = !isOn(s)
@@ -4686,6 +4721,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
                 if let b = self?.item.button { PanelController.shared.open(below: b) }
             }
+        case "lidtest": DispatchQueue.main.asyncAfter(deadline: .now() + 1) { Awake.shared.runLidTest() }
         case "usage":
             UserDefaults.standard.set(0, forKey: "usage.tab")
             UsageWindow.show()
