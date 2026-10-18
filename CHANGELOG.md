@@ -1,5 +1,17 @@
 # MultiClaude release notes
 
+## 1.6 (build 12), 2026-10-17
+
+### New
+- **Lid-closed sessions, after Insomnia.** With **Keep Awake with Lid Closed** on, closing the lid now turns the screen off, mutes the sound and pauses Slack, WhatsApp and Discord (with their helper processes) so they stop syncing and pinging. Opening the lid undoes all three. Each one is its own option, on by default.
+- **Low Power Mode when it helps:** while the lid is closed, on battery below 40%, or when the Mac runs hot. MultiClaude only turns off a Low Power Mode it turned on.
+- **Ease Off When Hot** (on): Low Power Mode when the Mac's thermal state is serious, and the session ends at critical.
+- **Password-Free Lid Mode** (optional): one password prompt installs `/etc/sudoers.d/multiclaude`, checked with `visudo`, so the four `pmset` commands for sleep and Low Power Mode run without asking again. Any app running as you could run those four commands too; the confirmation says so. Remove it from the same row.
+- **Recovery agent.** A small launchd agent checks every minute: if MultiClaude is gone while a session had changed something, it resumes paused apps, turns the sound back on and, with the helper, lets the Mac sleep again and turns Low Power Mode off. MultiClaude also undoes a leftover session at its next launch.
+
+### Credits
+The lid-closed design (lid actions that undo themselves, battery and heat floors, the recovery agent and the sudoers rule) follows [Insomnia](https://github.com/krishhgg/Insomnia) by Krish Garg, MIT, rewritten here in a smaller form. See NOTICE.
+
 ## 1.5.1 (build 11), 2026-10-16
 
 ### Fixed
