@@ -79,6 +79,7 @@ MultiClaude is that trick with a proper interface.
 - **Keep-awake only, if you like.** Turn off **Manage Claude Accounts** and MultiClaude leaves Claude alone and keeps just the keep-awake and scroll features. Your profiles wait for you to turn it back on.
 - **Token usage per account and in all.** Claude Code logs every reply's tokens on your Mac (Code tab, Cowork and terminal). MultiClaude credits each session to the account it ran in and shows today's output per account in the panel, plus a window with a 6-month heatmap, each account's share, and a by-model table. Regular chats keep no token counts on the Mac; turn on **Show Chat Limits** for each account's 5-hour and weekly limits from claude.ai.
 - **Keeps your Claude Code conversations.** Claude Code deletes transcripts after 30 days by default. MultiClaude keeps a copy of each one per account (an APFS clone, so no extra space while the original exists), lists them with search, shows them, and exports any one to Markdown.
+- **Lid closed, done right.** Keep the Mac awake with the lid closed for long agent runs: the screen goes off, sound mutes, Slack, WhatsApp and Discord pause, and Low Power Mode steps in on low battery or heat. Opening the lid undoes it, and a recovery agent undoes it if MultiClaude is gone. Optional password-free mode. Design after [Insomnia](https://github.com/krishhgg/Insomnia).
 - **Scroll your own way.** Reverse the scroll direction of a mouse and a trackpad separately, in Settings (needs Accessibility permission).
 - **Global shortcuts.** ⌃⌥⌘M opens the panel; turn on Profile Shortcuts and ⌃⌥1 to ⌃⌥9 jump straight to each account.
 - **Updates itself.** Once a day MultiClaude checks for a new release, installs it in the background and restarts while the panel is closed. Your Claude windows stay open.
@@ -188,6 +189,8 @@ Issues and pull requests are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md). Id
 ## License
 
 [Apache License 2.0](LICENSE). You can use, share and modify MultiClaude freely, including commercially. Contributors grant a patent license with their code, and anyone who sues over a patent in this project loses theirs.
+
+The lid-closed part of Keep Awake follows [Insomnia](https://github.com/krishhgg/Insomnia) by Krish Garg (MIT); see [NOTICE](NOTICE).
 
 Claude is a trademark of Anthropic, PBC. MultiClaude is not affiliated with or endorsed by Anthropic.
 

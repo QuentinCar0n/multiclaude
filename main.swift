@@ -11,6 +11,8 @@ import IOKit.ps
 import UserNotifications
 import CommonCrypto
 import SQLite3
+import CoreAudio
+import Darwin
 
 let appVersion = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "1.0"
 let websiteURL = URL(string: "https://somalabs.me")!
@@ -1560,11 +1562,308 @@ enum HotKey {
     }
 }
 
+// MARK: - Lid-closed sessions (ideas ported from Insomnia)
+
+// The lid-closed part of Keep Awake follows Insomnia by Krish Garg (MIT, github.com/krishhgg/Insomnia):
+// lid actions that undo themselves on open, battery and heat floors, and a recovery agent that undoes a
+// session's changes if MultiClaude is gone. Rewritten here, smaller; see NOTICE.
+
+// Root-only pmset changes. With the helper installed, a sudoers rule lets these four commands run without
+// a password; otherwise macOS asks for the administrator password each time.
+enum Root {
+    static let sudoersPath = "/etc/sudoers.d/multiclaude"
+    static let pmsetCommands = [["-a", "disablesleep", "1"], ["-a", "disablesleep", "0"],
+                                ["-b", "lowpowermode", "1"], ["-b", "lowpowermode", "0"]]
+
+    static var installed: Bool { FileManager.default.fileExists(atPath: sudoersPath) }
+
+    static func sudoersText(user: String) -> String {
+        "# Installed by MultiClaude: lets \(user) keep the Mac awake with the lid closed without a password.\n"
+            + "\(user) ALL=(root) NOPASSWD: " + pmsetCommands.map { "/usr/bin/pmset " + $0.joined(separator: " ") }.joined(separator: ", ") + "\n"
+    }
+
+    @discardableResult
+    static func pmset(_ args: [String]) -> Bool {
+        guard pmsetCommands.contains(args) else { return false }
+        if installed {
+            let p = Process()
+            p.executableURL = URL(fileURLWithPath: "/usr/bin/sudo")
+            p.arguments = ["-n", "/usr/bin/pmset"] + args
+            p.standardOutput = FileHandle.nullDevice
+            p.standardError = FileHandle.nullDevice
+            if (try? p.run()) != nil {
+                p.waitUntilExit()
+                if p.terminationStatus == 0 { return true }
+            }
+            Log.write("lid: sudo -n pmset \(args.joined(separator: " ")) refused, asking for the password instead")
+        }
+        return admin("/usr/bin/pmset " + args.joined(separator: " "))
+    }
+
+    // One administrator prompt for a shell command (macOS's own dialog; MultiClaude never sees the password).
+    static func admin(_ command: String) -> Bool {
+        let escaped = command.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"")
+        var err: NSDictionary?
+        NSAppleScript(source: "do shell script \"\(escaped)\" with administrator privileges")?.executeAndReturnError(&err)
+        return err == nil
+    }
+
+    // Writes the rule to a temp file, checks it with visudo, then installs it root-owned and 0440.
+    static func install() -> Bool {
+        let tmp = FileManager.default.temporaryDirectory.appendingPathComponent("multiclaude-sudoers-\(UUID().uuidString)")
+        guard (try? sudoersText(user: NSUserName()).write(to: tmp, atomically: true, encoding: .utf8)) != nil else { return false }
+        defer { try? FileManager.default.removeItem(at: tmp) }
+        let ok = admin("/usr/sbin/visudo -cf \(shellQuote(tmp.path)) && /usr/bin/install -m 0440 -o root -g wheel \(shellQuote(tmp.path)) \(sudoersPath)")
+        Log.write(ok ? "lid helper installed (\(sudoersPath))" : "lid helper not installed")
+        return ok && installed
+    }
+
+    static func uninstall() -> Bool {
+        let ok = admin("/bin/rm -f \(sudoersPath)")
+        Log.write(ok ? "lid helper removed" : "lid helper not removed")
+        return ok
+    }
+
+    static func lowPowerOn() -> Bool {
+        let p = Process()
+        let pipe = Pipe()
+        p.executableURL = URL(fileURLWithPath: "/usr/bin/pmset")
+        p.arguments = ["-g"]
+        p.standardOutput = pipe
+        guard (try? p.run()) != nil else { return false }
+        let out = String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+        p.waitUntilExit()
+        return out.split(separator: "\n").contains { $0.split(separator: " ").first == "lowpowermode" && $0.hasSuffix("1") }
+    }
+}
+
+// Lid open and closed, from IOPMrootDomain's AppleClamshellState, with a 2 s debounce so a lid that flaps
+// while being moved doesn't trigger anything.
+@MainActor
+final class LidObserver {
+    static let shared = LidObserver()
+    var onChange: ((Bool) -> Void)?
+    private(set) var closed = false
+    private var port: IONotificationPortRef?
+    private var service: io_service_t = 0
+    private var note: io_object_t = 0
+    private var pending: Timer?
+
+    nonisolated static func read() -> Bool? {
+        let s = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("IOPMrootDomain"))
+        guard s != 0 else { return nil }
+        defer { IOObjectRelease(s) }
+        guard let v = IORegistryEntryCreateCFProperty(s, "AppleClamshellState" as CFString, kCFAllocatorDefault, 0)?.takeRetainedValue() else { return nil }
+        return (v as? Bool) ?? (v as? NSNumber)?.boolValue
+    }
+
+    func start() {
+        guard port == nil else { return }
+        closed = Self.read() ?? false
+        service = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("IOPMrootDomain"))
+        guard service != 0, let p = IONotificationPortCreate(kIOMainPortDefault) else { return }
+        port = p
+        CFRunLoopAddSource(CFRunLoopGetMain(), IONotificationPortGetRunLoopSource(p).takeUnretainedValue(), .commonModes)
+        let kr = IOServiceAddInterestNotification(p, service, kIOGeneralInterest, { _, _, _, _ in
+            MainActor.assumeIsolated { LidObserver.shared.changed() }
+        }, nil, &note)
+        if kr != KERN_SUCCESS { Log.write("lid: can't watch the lid (\(kr))") }
+    }
+
+    private func changed() {
+        guard let now = Self.read(), now != closed else { pending?.invalidate(); pending = nil; return }
+        pending?.invalidate()
+        let t = Timer(timeInterval: 2, repeats: false) { _ in
+            MainActor.assumeIsolated {
+                let l = LidObserver.shared
+                l.pending = nil
+                guard let settled = LidObserver.read(), settled != l.closed else { return }
+                l.closed = settled
+                Log.write("lid \(settled ? "closed" : "opened")")
+                l.onChange?(settled)
+            }
+        }
+        RunLoop.main.add(t, forMode: .common)
+        pending = t
+    }
+}
+
+// Pauses chat apps (and their helper processes) with SIGSTOP while the lid is closed, so they stop
+// syncing and pinging; SIGCONT on open. Meeting and recording apps are never paused.
+enum Freezer {
+    static let apps = ["com.tinyspeck.slackmacgap": "Slack", "net.whatsapp.WhatsApp": "WhatsApp",
+                       "desktop.WhatsApp": "WhatsApp", "com.hnc.Discord": "Discord"]
+
+    static func processTable() -> [(pid: pid_t, ppid: pid_t)] {
+        var mib: [Int32] = [CTL_KERN, KERN_PROC, KERN_PROC_ALL, 0]
+        var size = 0
+        guard sysctl(&mib, 4, nil, &size, nil, 0) == 0 else { return [] }
+        var procs = [kinfo_proc](repeating: kinfo_proc(), count: size / MemoryLayout<kinfo_proc>.stride + 16)
+        size = procs.count * MemoryLayout<kinfo_proc>.stride
+        guard sysctl(&mib, 4, &procs, &size, nil, 0) == 0 else { return [] }
+        return procs.prefix(size / MemoryLayout<kinfo_proc>.stride).map { ($0.kp_proc.p_pid, $0.kp_eproc.e_ppid) }
+    }
+
+    // The app's process and every descendant (Electron helpers), children first.
+    static func tree(_ root: pid_t, in table: [(pid: pid_t, ppid: pid_t)]) -> [pid_t] {
+        var out: [pid_t] = []
+        var queue = [root]
+        while let p = queue.popLast() {
+            out.append(p)
+            queue += table.filter { $0.ppid == p && $0.pid != p }.map(\.pid)
+        }
+        return out.reversed()
+    }
+
+    static func freeze() -> [pid_t] {
+        let table = processTable()
+        let me = getuid()
+        var stopped: [pid_t] = []
+        for app in NSWorkspace.shared.runningApplications {
+            guard let id = app.bundleIdentifier, apps[id] != nil, !app.isTerminated else { continue }
+            for pid in tree(app.processIdentifier, in: table) {
+                var info = proc_bsdinfo()
+                // Only our own user's processes.
+                guard proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &info, Int32(MemoryLayout<proc_bsdinfo>.size)) > 0, info.pbi_uid == me else { continue }
+                if kill(pid, SIGSTOP) == 0 { stopped.append(pid) }
+            }
+        }
+        if !stopped.isEmpty { Log.write("lid: paused \(stopped.count) chat app processes") }
+        return stopped
+    }
+
+    // SIGCONT never harms a running process, so a pid reused since is safe.
+    static func thaw(_ pids: [pid_t]) {
+        for p in pids { kill(p, SIGCONT) }
+        if !pids.isEmpty { Log.write("lid: resumed \(pids.count) processes") }
+    }
+}
+
+// Default output mute through Core Audio.
+enum OutputMute {
+    static var muteAddress = AudioObjectPropertyAddress(mSelector: kAudioDevicePropertyMute, mScope: kAudioDevicePropertyScopeOutput,
+                                                        mElement: kAudioObjectPropertyElementMain)
+
+    static func defaultDevice() -> AudioObjectID? {
+        var a = AudioObjectPropertyAddress(mSelector: kAudioHardwarePropertyDefaultOutputDevice, mScope: kAudioObjectPropertyScopeGlobal,
+                                           mElement: kAudioObjectPropertyElementMain)
+        var d = AudioObjectID(kAudioObjectUnknown)
+        var size = UInt32(MemoryLayout<AudioObjectID>.size)
+        guard AudioObjectGetPropertyData(AudioObjectID(kAudioObjectSystemObject), &a, 0, nil, &size, &d) == noErr, d != kAudioObjectUnknown else { return nil }
+        return d
+    }
+
+    static func isMuted(_ d: AudioObjectID) -> Bool {
+        var m: UInt32 = 0
+        var size = UInt32(MemoryLayout<UInt32>.size)
+        return AudioObjectGetPropertyData(d, &muteAddress, 0, nil, &size, &m) == noErr && m != 0
+    }
+
+    static func set(_ d: AudioObjectID, muted: Bool) -> Bool {
+        var m: UInt32 = muted ? 1 : 0
+        return AudioObjectSetPropertyData(d, &muteAddress, 0, nil, UInt32(MemoryLayout<UInt32>.size), &m) == noErr
+    }
+}
+
+// What a session changed, on disk, so the recovery agent can undo it if MultiClaude is gone
+// (crash, force quit, update gone wrong). Plain key=value lines the agent's shell script reads.
+enum Recovery {
+    static let label = "me.somalabs.multiclaude.recovery"
+    static var folder: URL { supportDir.appendingPathComponent("MultiClaude") }
+    static var stateURL: URL { folder.appendingPathComponent("awake-state") }
+    static var scriptURL: URL { folder.appendingPathComponent("recovery.sh") }
+    static var plistURL: URL {
+        FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/LaunchAgents/\(label).plist")
+    }
+
+    struct State: Equatable {
+        var disableSleep = false, lowPower = false, muted = false
+        var frozen: [pid_t] = []
+        var isEmpty: Bool { !disableSleep && !lowPower && !muted && frozen.isEmpty }
+        var text: String {
+            "disablesleep=\(disableSleep ? 1 : 0)\nlowpower=\(lowPower ? 1 : 0)\nmuted=\(muted ? 1 : 0)\nfrozen=\(frozen.map(String.init).joined(separator: " "))\n"
+        }
+    }
+
+    static func save(_ s: State) {
+        if s.isEmpty { try? FileManager.default.removeItem(at: stateURL); return }
+        try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        try? s.text.write(to: stateURL, atomically: true, encoding: .utf8)
+    }
+
+    // Runs every minute; does nothing while MultiClaude runs or when there's nothing to undo.
+    // Root changes only undo with the helper installed (sudo -n never prompts).
+    static let script = """
+    #!/bin/sh
+    # MultiClaude recovery agent: undoes a keep-awake session's changes when MultiClaude isn't running.
+    dir="$HOME/Library/Application Support/MultiClaude"
+    state="$dir/awake-state"
+    [ -f "$state" ] || exit 0
+    /usr/bin/pgrep -qx MultiClaude && exit 0
+    val() { /usr/bin/sed -n "s/^$1=//p" "$state" | /usr/bin/tr -cd '0-9 '; }
+    log() { echo "$(/bin/date -u +%Y-%m-%dT%H:%M:%SZ) recovery: $1" >> "$HOME/Library/Logs/MultiClaude.log"; }
+    left=0
+    if [ "$(val disablesleep)" = "1" ]; then
+      /usr/bin/sudo -n /usr/bin/pmset -a disablesleep 0 && log "sleep allowed again" || left=1
+    fi
+    if [ "$(val lowpower)" = "1" ]; then
+      /usr/bin/sudo -n /usr/bin/pmset -b lowpowermode 0 && log "Low Power Mode off" || left=1
+    fi
+    for p in $(val frozen); do /bin/kill -CONT "$p" 2>/dev/null; done
+    [ -n "$(val frozen)" ] && log "resumed paused apps"
+    if [ "$(val muted)" = "1" ]; then
+      /usr/bin/osascript -e 'set volume without output muted' && log "sound back on"
+    fi
+    /usr/bin/sed -i '' -e 's/^frozen=.*/frozen=/' -e 's/^muted=.*/muted=0/' "$state"
+    if [ "$left" = "0" ]; then
+      /bin/rm -f "$state" "$dir/.recovery-warned"
+    elif [ ! -f "$dir/.recovery-warned" ]; then
+      log "sleep stays off until MultiClaude opens again, or run: sudo pmset -a disablesleep 0"
+      /usr/bin/touch "$dir/.recovery-warned"
+    fi
+    """
+
+    static func installAgent() {
+        let fm = FileManager.default
+        try? fm.createDirectory(at: folder, withIntermediateDirectories: true)
+        try? fm.createDirectory(at: plistURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+        let plist: [String: Any] = ["Label": label, "ProgramArguments": ["/bin/sh", scriptURL.path],
+                                    "StartInterval": 60, "RunAtLoad": true, "ProcessType": "Background"]
+        let data = try? PropertyListSerialization.data(fromPropertyList: plist, format: .xml, options: 0)
+        let unchanged = (try? String(contentsOf: scriptURL, encoding: .utf8)) == script && (try? Data(contentsOf: plistURL)) == data
+        guard !unchanged else { return }
+        try? script.write(to: scriptURL, atomically: true, encoding: .utf8)
+        try? data?.write(to: plistURL, options: .atomic)
+        let domain = "gui/\(getuid())"
+        for args in [["bootout", domain + "/" + label], ["bootstrap", domain, plistURL.path]] {
+            let p = Process()
+            p.executableURL = URL(fileURLWithPath: "/bin/launchctl")
+            p.arguments = args
+            p.standardError = FileHandle.nullDevice
+            p.standardOutput = FileHandle.nullDevice
+            try? p.run()
+            p.waitUntilExit()
+        }
+        Log.write("recovery agent installed")
+    }
+}
+
 // MARK: - Keep awake and scroll direction (ported from Cocaine)
 
 enum AwakeSetting: String, CaseIterable, Identifiable {
     case activateAtLaunch, leftClick, shortcut, allowDisplaySleep, lidClosed
-    case notifications, powerConnect, powerDisconnect, lowBattery
+    case lidScreenOff, lidMute, lidFreeze, lidLowPower
+    case notifications, powerConnect, powerDisconnect, lowBattery, batteryLowPower, heatRules
+
+    // Insomnia's defaults: the lid actions that cost nothing are on; Low Power Mode needs the helper.
+    static let onByDefault: Set<AwakeSetting> = [.lidScreenOff, .lidMute, .lidFreeze, .heatRules]
+    static let needsHelper: Set<AwakeSetting> = [.lidLowPower, .batteryLowPower]
+    static let groups: [(String, [AwakeSetting])] = [
+        ("General", [.activateAtLaunch, .leftClick, .shortcut, .allowDisplaySleep, .notifications]),
+        ("Lid", [.lidClosed, .lidScreenOff, .lidMute, .lidFreeze, .lidLowPower]),
+        ("Power", [.powerConnect, .powerDisconnect, .lowBattery, .batteryLowPower, .heatRules]),
+    ]
+    static let lidActions: Set<AwakeSetting> = [.lidScreenOff, .lidMute, .lidFreeze, .lidLowPower]
 
     var id: String { rawValue }
     var key: String { "awake." + rawValue }   // apart from MultiClaude's own settings of the same name
@@ -1576,6 +1875,12 @@ enum AwakeSetting: String, CaseIterable, Identifiable {
         case .shortcut: "Keyboard Shortcut"
         case .allowDisplaySleep: "Allow Display Sleep"
         case .lidClosed: "Keep Awake with Lid Closed"
+        case .lidScreenOff: "Turn the Screen Off"
+        case .lidMute: "Mute Sound"
+        case .lidFreeze: "Pause Chat Apps"
+        case .lidLowPower: "Low Power Mode"
+        case .batteryLowPower: "Low Power Mode Below 40%"
+        case .heatRules: "Ease Off When Hot"
         case .notifications: "Notify When It Turns Off"
         case .powerConnect: "Activate on Power Connect"
         case .powerDisconnect: "Deactivate on Power Disconnect"
@@ -1590,6 +1895,12 @@ enum AwakeSetting: String, CaseIterable, Identifiable {
         case .shortcut: "command"
         case .allowDisplaySleep: "moon"
         case .lidClosed: "laptopcomputer.and.arrow.down"
+        case .lidScreenOff: "display"
+        case .lidMute: "speaker.slash"
+        case .lidFreeze: "pause.circle"
+        case .lidLowPower: "leaf"
+        case .batteryLowPower: "battery.50"
+        case .heatRules: "thermometer.medium"
         case .notifications: "bell"
         case .powerConnect: "bolt"
         case .powerDisconnect: "bolt.slash"
@@ -1600,6 +1911,7 @@ enum AwakeSetting: String, CaseIterable, Identifiable {
     var hint: String? {
         switch self {
         case .shortcut: "⌃⌥⌘A"
+        case .lidFreeze: "Slack, Discord…"
         default: nil
         }
     }
@@ -1628,6 +1940,10 @@ final class Awake: ObservableObject {
     }
 
     func boot() {
+        undoLeftovers()
+        LidObserver.shared.onChange = { Awake.shared.lidChanged($0) }
+        LidObserver.shared.start()
+        if isOn(.lidClosed) { Recovery.installAgent() }
         lastOnAC = Power.snapshot().onAC
         powerSource = IOPSNotificationCreateRunLoopSource({ _ in
             MainActor.assumeIsolated { Awake.shared.powerChanged() }
@@ -1649,7 +1965,13 @@ final class Awake: ObservableObject {
         defaults.set(endDate?.timeIntervalSince1970 ?? 0, forKey: "awake.resume")
     }
 
-    func isOn(_ s: AwakeSetting) -> Bool { defaults.bool(forKey: s.key) }
+    func isOn(_ s: AwakeSetting) -> Bool {
+        if AwakeSetting.onByDefault.contains(s) && defaults.object(forKey: s.key) == nil { return true }
+        return defaults.bool(forKey: s.key)
+    }
+
+    // Lid actions only matter while the Mac stays awake with the lid closed.
+    var lidActionsLive: Bool { active && isOn(.lidClosed) }
 
     func toggle(_ s: AwakeSetting) {
         let on = !isOn(s)
@@ -1660,7 +1982,19 @@ final class Awake: ObservableObject {
         defaults.set(on, forKey: s.key)
         if s == .shortcut { Engine.shared.updateHotKeys() }
         if s == .allowDisplaySleep && holding { takeAssertion() }
-        if s == .lidClosed && active { setLid(on) }
+        if s == .lidClosed {
+            if active { setLid(on) }
+            if on { Recovery.installAgent() }
+        }
+        // Turning a lid action off while the lid is closed undoes it now.
+        if lidActionsLive && LidObserver.shared.closed && !on {
+            switch s {
+            case .lidMute: unmute()
+            case .lidFreeze: Freezer.thaw(recovery.frozen); recovery.frozen = []
+            default: break
+            }
+        }
+        updateLowPower()
         Engine.shared.onChange?()
     }
 
@@ -1683,11 +2017,13 @@ final class Awake: ObservableObject {
     }
 
     func deactivate(reason: String? = nil) {
-        guard active || holding || lidApplied else { return }
+        guard active || holding || lidApplied || !recovery.isEmpty else { return }
         if holding { IOPMAssertionRelease(assertion) }
         holding = false
-        if lidApplied { setLid(false) }
+        undoLidActions()
         active = false
+        updateLowPower()
+        if lidApplied { setLid(false) }
         endDate = nil
         timer?.invalidate()
         timer = nil
@@ -1731,15 +2067,93 @@ final class Awake: ObservableObject {
 
     private func onTick() {
         tick = Date()
-        if let endDate, tick >= endDate { deactivate(reason: "Time is up, your Mac can sleep again.") }
+        if let endDate, tick >= endDate { deactivate(reason: "Time is up, your Mac can sleep again."); return }
+        // Floors every 30 s: critical heat ends the session, the rest is Low Power Mode.
+        guard Int(tick.timeIntervalSince1970) % 30 == 0 else { return }
+        if isOn(.heatRules) && ProcessInfo.processInfo.thermalState == .critical {
+            deactivate(reason: "Your Mac got too hot, so it can sleep again.")
+            return
+        }
+        updateLowPower()
     }
 
-    // Lid-closed awake needs `pmset disablesleep`, which only root can set. macOS asks for the password.
+    // Lid-closed awake needs `pmset disablesleep`, which only root can set: password-free with the helper,
+    // otherwise macOS asks for the administrator password.
     private func setLid(_ on: Bool) {
-        let src = "do shell script \"/usr/bin/pmset -a disablesleep \(on ? 1 : 0)\" with administrator privileges"
-        var err: NSDictionary?
-        NSAppleScript(source: src)?.executeAndReturnError(&err)
-        if err == nil { lidApplied = on }
+        if Root.pmset(["-a", "disablesleep", on ? "1" : "0"]) {
+            lidApplied = on
+            recovery.disableSleep = on
+        }
+    }
+
+    // What this session changed, mirrored to disk for the recovery agent.
+    private var recovery = Recovery.State() { didSet { if recovery != oldValue { Recovery.save(recovery) } } }
+    private var mutedDevice: AudioObjectID?
+
+    func lidChanged(_ closed: Bool) {
+        guard lidActionsLive else { return }
+        if closed {
+            if isOn(.lidScreenOff) {
+                let p = Process()
+                p.executableURL = URL(fileURLWithPath: "/usr/bin/pmset")
+                p.arguments = ["displaysleepnow"]
+                try? p.run()
+            }
+            if isOn(.lidMute), let d = OutputMute.defaultDevice(), !OutputMute.isMuted(d), OutputMute.set(d, muted: true) {
+                mutedDevice = d
+                recovery.muted = true
+            }
+            if isOn(.lidFreeze) { recovery.frozen += Freezer.freeze() }
+        } else {
+            undoLidActions()
+        }
+        updateLowPower()
+    }
+
+    private func unmute() {
+        guard recovery.muted else { return }
+        if let d = mutedDevice ?? OutputMute.defaultDevice() { _ = OutputMute.set(d, muted: false) }
+        mutedDevice = nil
+        recovery.muted = false
+    }
+
+    private func undoLidActions() {
+        Freezer.thaw(recovery.frozen)
+        recovery.frozen = []
+        unmute()
+    }
+
+    // Low Power Mode while the lid is closed, on battery below 40%, or when the Mac runs hot. Only with
+    // the helper, so it never brings up a password prompt on its own. Turned off again only if we set it.
+    private func updateLowPower() {
+        let p = Power.snapshot()
+        let hot = ProcessInfo.processInfo.thermalState
+        let wanted = active && Root.installed && (
+            (isOn(.lidLowPower) && lidActionsLive && LidObserver.shared.closed)
+            || (isOn(.batteryLowPower) && !p.onAC && (p.percent ?? 100) < 40)
+            || (isOn(.heatRules) && hot == .serious))
+        if wanted && !recovery.lowPower && !Root.lowPowerOn() {
+            if Root.pmset(["-b", "lowpowermode", "1"]) { recovery.lowPower = true; Log.write("Low Power Mode on") }
+        } else if !wanted && recovery.lowPower {
+            if Root.pmset(["-b", "lowpowermode", "0"]) { recovery.lowPower = false; Log.write("Low Power Mode off") }
+        }
+    }
+
+    // A session MultiClaude didn't get to undo (crash, force quit): undo it at the next launch.
+    private func undoLeftovers() {
+        guard let text = try? String(contentsOf: Recovery.stateURL, encoding: .utf8) else { return }
+        var v: [String: String] = [:]
+        for line in text.split(separator: "\n") {
+            let kv = line.split(separator: "=", maxSplits: 1).map(String.init)
+            if kv.count == 2 { v[kv[0]] = kv[1] }
+        }
+        Freezer.thaw((v["frozen"] ?? "").split(separator: " ").compactMap { pid_t($0) })
+        if v["muted"] == "1", let d = OutputMute.defaultDevice() { _ = OutputMute.set(d, muted: false) }
+        var left = Recovery.State()
+        if v["lowpower"] == "1" { left.lowPower = !Root.pmset(["-b", "lowpowermode", "0"]) }
+        if v["disablesleep"] == "1" { left.disableSleep = !Root.pmset(["-a", "disablesleep", "0"]) }
+        Recovery.save(left)
+        Log.write("undid the changes of a keep-awake session that ended without MultiClaude")
     }
 
     private func powerChanged() {
@@ -3145,6 +3559,17 @@ struct ProfileRow: View {
 // Confirmations for actions that quit a window or write into a profile's folder.
 @MainActor
 enum Dialogs {
+    static func confirmHelper() -> Bool {
+        alert("Keep the Mac awake with the lid closed, without a password?",
+              "MultiClaude adds a rule in /etc/sudoers.d/multiclaude so four commands run without your password: pmset -a disablesleep 1 and 0, and pmset -b lowpowermode 1 and 0. They only change sleep and Low Power Mode, but any app running as you could run them too. macOS asks for your password once to install it. A recovery agent also checks every minute and undoes a session's changes if MultiClaude isn't running.",
+              buttons: ["Install", "Cancel"]).0 == 0
+    }
+
+    static func confirmRemoveHelper() -> Bool {
+        alert("Remove Password-Free Lid Mode?", "MultiClaude deletes /etc/sudoers.d/multiclaude. Keeping the Mac awake with the lid closed will ask for your password again.",
+              buttons: ["Remove", "Cancel"]).0 == 0
+    }
+
     // Chat limits read each account's claude.ai session cookie, so ask before the first time.
     static func confirmChatLimits() -> Bool {
         alert("Show each account's chat limits?",
@@ -3423,11 +3848,33 @@ struct AwakeSection: View {
             .modifier(HoverBackground(radius: 6))
             .onTapGesture { withAnimation(.easeOut(duration: 0.18)) { optionsOpen.toggle() } }
             if optionsOpen {
-                ForEach(AwakeSetting.allCases) { s in
-                    ToggleRow(symbol: s.symbol, title: s.title, hint: s.hint, on: awake.isOn(s)) { awake.toggle(s) }
+                ForEach(AwakeSetting.groups, id: \.0) { group, settings in
+                    Text(group == "Lid" ? "When the Lid Closes" : group).font(.system(size: 11, weight: .semibold)).foregroundStyle(.tertiary)
+                        .frame(maxWidth: .infinity, alignment: .leading).padding(.horizontal, 8).padding(.top, 6).padding(.bottom, 1)
+                    // The lid actions only show once lid mode is on.
+                    ForEach(settings.filter { !AwakeSetting.lidActions.contains($0) || awake.isOn(.lidClosed) }) { s in
+                        let blocked = AwakeSetting.needsHelper.contains(s) && !Root.installed
+                        ToggleRow(symbol: s.symbol, title: s.title, hint: blocked ? "helper" : s.hint, on: awake.isOn(s)) { awake.toggle(s) }
+                            .padding(.leading, AwakeSetting.lidActions.contains(s) ? 14 : 0)
+                    }
+                    if group == "Lid" { helperRow }
                 }
             }
         }
+    }
+
+    private var helperRow: some View {
+        ToggleRow(symbol: "key", title: "No Password Prompt", hint: Root.installed ? "installed" : "asks once",
+                          on: Root.installed) {
+                    if Root.installed {
+                        if Dialogs.confirmRemoveHelper() { _ = Root.uninstall() }
+                    } else if Dialogs.confirmHelper() {
+                        _ = Root.install()
+                        Recovery.installAgent()
+                    }
+                    awake.objectWillChange.send()
+                }
+                .padding(.leading, 14)
     }
 }
 
@@ -4655,6 +5102,50 @@ if args.count == 2, args[1] == "--selftest-awake" {
         check("keep-awake-only mode keeps its way back and the scroll settings",
               Setting.claudeOnly.isDisjoint(with: [.manageClaude, .reverseMouse, .reverseTrackpad, .launchAtLogin, .autoUpdate]))
         check("managing Claude is on by default", Setting.onByDefault.contains(.manageClaude))
+        // Lid sessions (Insomnia port).
+        let rule = Root.sudoersText(user: "tester")
+        let ruleURL = FileManager.default.temporaryDirectory.appendingPathComponent("mc-sudoers-\(UUID().uuidString)")
+        try? rule.write(to: ruleURL, atomically: true, encoding: .utf8)
+        let visudo = Process()
+        visudo.executableURL = URL(fileURLWithPath: "/usr/sbin/visudo")
+        visudo.arguments = ["-cf", ruleURL.path]
+        visudo.standardOutput = FileHandle.nullDevice
+        visudo.standardError = FileHandle.nullDevice
+        try? visudo.run(); visudo.waitUntilExit()
+        try? FileManager.default.removeItem(at: ruleURL)
+        check("sudoers rule passes visudo", visudo.terminationStatus == 0)
+        check("sudoers rule allows only the four pmset commands",
+              rule.components(separatedBy: "/usr/bin/pmset").count - 1 == 4 && !rule.contains("ALL, ") && rule.contains("NOPASSWD"))
+        check("pmset refuses commands outside the list", !Root.pmset(["-a", "sleep", "0"]))
+        // Freeze and thaw a child process tree of our own.
+        let child = Process()
+        child.executableURL = URL(fileURLWithPath: "/bin/sh")
+        child.arguments = ["-c", "sleep 30 & wait"]
+        try? child.run()
+        usleep(300_000)
+        let tree = Freezer.tree(child.processIdentifier, in: Freezer.processTable())
+        check("process tree includes the child's own children", tree.count >= 2 && tree.last == child.processIdentifier)
+        func state(_ pid: pid_t) -> UInt32 {
+            var info = proc_bsdinfo()
+            _ = proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &info, Int32(MemoryLayout<proc_bsdinfo>.size))
+            return info.pbi_status
+        }
+        for pid in tree { kill(pid, SIGSTOP) }
+        usleep(100_000)
+        check("tree paused", tree.allSatisfy { state($0) == UInt32(SSTOP) })
+        Freezer.thaw(tree)
+        usleep(100_000)
+        check("tree resumed", tree.allSatisfy { state($0) != UInt32(SSTOP) })
+        for pid in tree { kill(pid, SIGTERM) }
+        check("recovery state text", Recovery.State(disableSleep: true, lowPower: false, muted: true, frozen: [12, 34]).text
+              == "disablesleep=1\nlowpower=0\nmuted=1\nfrozen=12 34\n")
+        let sh = Process()
+        sh.executableURL = URL(fileURLWithPath: "/bin/sh")
+        sh.arguments = ["-n", "-c", Recovery.script]
+        try? sh.run(); sh.waitUntilExit()
+        check("recovery script parses", sh.terminationStatus == 0)
+        check("lid actions on by default, Low Power Mode needs the helper",
+              Awake.shared.isOn(.lidMute) && AwakeSetting.needsHelper == [.lidLowPower, .batteryLowPower])
         check("shortcut keys apart from MultiClaude's", Set(AwakeSetting.allCases.map(\.key)).isDisjoint(with: Setting.allCases.map(\.rawValue)))
     }
     exit(ok ? 0 : 1)
