@@ -3088,8 +3088,10 @@ enum Runtimes {
             let stamped = (try? String(contentsOf: stampURL(p.id), encoding: .utf8)) ?? ""
             if stamped.hasPrefix("\(format)|"), current == sourceVersion || Updater.isNewer(current, than: sourceVersion) {
                 if stamped == stamp(p, version: current) && hasLook(rt) { return rt }
-                applyLook(p, to: rt, version: current)
-                return rt
+                // macOS guards an app bundle once it has run (App Management), so the icon can fail on an
+                // older copy. A fresh clone isn't guarded yet: same version, so it is made again below.
+                if applyLook(p, to: rt, version: current) || current != sourceVersion { return rt }
+                Log.write("profile copy \(rt.lastPathComponent): made again to take its icon")
             }
             try? fm.removeItem(at: rt)
         }
@@ -3113,7 +3115,8 @@ enum Runtimes {
         FileManager.default.fileExists(atPath: app.appendingPathComponent("Icon\r").path)
     }
 
-    static func applyLook(_ p: Profile, to app: URL, version: String, register: Bool = true) {
+    @discardableResult
+    static func applyLook(_ p: Profile, to app: URL, version: String, register: Bool = true) -> Bool {
         let fm = FileManager.default
         let ok = NSWorkspace.shared.setIcon(AppIcon.finderIcon(color: p.nsTint, letter: p.initial), forFile: app.path, options: [])
         Log.write("profile copy \(app.lastPathComponent): icon \(ok ? "set" : "FAILED"), Claude \(version)")
@@ -3121,6 +3124,7 @@ enum Runtimes {
         if register { LSRegisterURL(app as CFURL, true) }
         // Written even when the icon failed: ensure() also checks hasLook, so a closed copy tries again.
         try? Data(stamp(p, version: version).utf8).write(to: stampURL(p.id))
+        return ok
     }
 
     // Deletes the copies of profiles that are gone (or of all, with profile apps off), unless running.
