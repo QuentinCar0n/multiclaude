@@ -2241,8 +2241,9 @@ enum Cocaine {
 }
 
 // Flips scroll direction through a session event tap, which needs Accessibility permission.
-// Wheel mice send line-based (non-continuous) events; trackpads send continuous ones.
-// A Magic Mouse also sends continuous events, so it follows the trackpad switch.
+// Trackpads send continuous events with a gesture phase (fingers down, then momentum). Wheel mice send
+// line-based events, and mice with smooth scrolling (Logi Options+ on an MX Master) send continuous ones
+// with no phase, so both follow the mouse switch. A Magic Mouse has phases, so it follows the trackpad switch.
 @MainActor
 enum ScrollReverser {
     // What the flip applies: the setting, minus any direction Cocaine already reverses.
@@ -2311,9 +2312,14 @@ enum ScrollReverser {
         source = nil
     }
 
+    nonisolated static func isTrackpad(_ e: CGEvent) -> Bool {
+        e.getIntegerValueField(.scrollWheelEventIsContinuous) != 0
+            && (e.getIntegerValueField(.scrollWheelEventScrollPhase) != 0
+                || e.getIntegerValueField(.scrollWheelEventMomentumPhase) != 0)
+    }
+
     nonisolated static func flip(_ e: CGEvent) {
-        let continuous = e.getIntegerValueField(.scrollWheelEventIsContinuous) != 0
-        guard continuous ? reverseTrackpad : reverseMouse else { return }
+        guard isTrackpad(e) ? reverseTrackpad : reverseMouse else { return }
         let axes: [(CGEventField, CGEventField, CGEventField)] = [
             (.scrollWheelEventDeltaAxis1, .scrollWheelEventFixedPtDeltaAxis1, .scrollWheelEventPointDeltaAxis1),
             (.scrollWheelEventDeltaAxis2, .scrollWheelEventFixedPtDeltaAxis2, .scrollWheelEventPointDeltaAxis2),
@@ -5107,12 +5113,14 @@ if args.count == 3, args[1] == "--export-profile-icon" {   // --export-profile-i
     exit(0)
 }
 if args.count == 2, args[1] == "--selftest-awake" {
-    // Scroll flip on synthetic wheel (line) and trackpad (continuous) events, and the keep-awake labels.
+    // Scroll flip on synthetic wheel (line), smooth mouse (continuous, no phase) and trackpad (continuous
+    // with a gesture phase) events, and the keep-awake labels.
     var ok = true
     func check(_ name: String, _ cond: Bool) { print(cond ? "PASS" : "FAIL", name); ok = ok && cond }
-    func make(_ unit: CGScrollEventUnit, continuous: Bool) -> CGEvent {
+    func make(_ unit: CGScrollEventUnit, continuous: Bool, phase: Int64 = 0) -> CGEvent {
         let e = CGEvent(scrollWheelEvent2Source: nil, units: unit, wheelCount: 2, wheel1: 3, wheel2: -2, wheel3: 0)!
         e.setIntegerValueField(.scrollWheelEventIsContinuous, value: continuous ? 1 : 0)
+        e.setIntegerValueField(.scrollWheelEventScrollPhase, value: phase)
         return e
     }
     func y(_ e: CGEvent) -> Int64 { e.getIntegerValueField(.scrollWheelEventDeltaAxis1) }
@@ -5121,14 +5129,17 @@ if args.count == 2, args[1] == "--selftest-awake" {
     for (mouse, pad) in [(true, false), (false, true), (true, true), (false, false)] {
         ScrollReverser.reverseMouse = mouse
         ScrollReverser.reverseTrackpad = pad
-        let wheel = make(.line, continuous: false), track = make(.pixel, continuous: true)
-        let (wy, wx, wf, ty, tx) = (y(wheel), x(wheel), fy(wheel), y(track), x(track))
+        let wheel = make(.line, continuous: false), track = make(.pixel, continuous: true, phase: 2)
+        let smooth = make(.pixel, continuous: true)
+        let (wy, wx, wf, ty, tx, sy) = (y(wheel), x(wheel), fy(wheel), y(track), x(track), y(smooth))
         ScrollReverser.flip(wheel)
         ScrollReverser.flip(track)
+        ScrollReverser.flip(smooth)
         let tag = "mouse=\(mouse) trackpad=\(pad)"
         check("\(tag): wheel \(mouse ? "flipped" : "kept")", y(wheel) == (mouse ? -wy : wy) && x(wheel) == (mouse ? -wx : wx)
               && fy(wheel) == (mouse ? -wf : wf))
         check("\(tag): trackpad \(pad ? "flipped" : "kept")", y(track) == (pad ? -ty : ty) && x(track) == (pad ? -tx : tx))
+        check("\(tag): smooth mouse \(mouse ? "flipped" : "kept")", y(smooth) == (mouse ? -sy : sy))
     }
     MainActor.assumeIsolated {
         let a = Awake.shared
