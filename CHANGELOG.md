@@ -3,6 +3,7 @@
 ## Unreleased
 
 ### Fixed
+- **Reverse Mouse Scroll works with smooth-scrolling mice.** A mouse with smooth scrolling (an MX Master with Logi Options+, for one) sends the same kind of events as a trackpad, so it only followed the trackpad switch. MultiClaude now tells them apart by the trackpad's gesture phase.
 - **Profile apps keep their colored Claude icon.** macOS guards an app once it has run, so a profile's copy of Claude could lose its icon and show a plain folder in the Dock. When that happens and the copy is closed, MultiClaude now makes a fresh copy, which takes the icon.
 
 ## 1.6 (build 12), 2026-10-17
