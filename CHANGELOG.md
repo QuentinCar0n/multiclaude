@@ -1,6 +1,6 @@
 # MultiClaude release notes
 
-## Unreleased
+## 1.6.1 (build 13), 2026-10-21
 
 ### Fixed
 - **Reverse Mouse Scroll works with smooth-scrolling mice.** A mouse with smooth scrolling (an MX Master with Logi Options+, for one) sends the same kind of events as a trackpad, so it only followed the trackpad switch. MultiClaude now tells them apart by the trackpad's gesture phase.
