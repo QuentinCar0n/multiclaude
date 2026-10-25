@@ -55,6 +55,8 @@ MultiClaude is that trick with a proper interface.
 | Keep your existing aliases | | imported on first launch |
 | Tell accounts apart | every window has the same icon | a color per account, active one named in the menu bar, a named and colored app per account for the Dock and Spotlight |
 | After Claude updates itself | windows come back on the default account | profiles reopen on their own accounts |
+| Tokens spent per account | no | today in the panel, 6 months in a heatmap |
+| Long runs with the lid closed | `caffeinate` and `pmset` by hand | Keep Awake, undone when the lid opens |
 
 ## Features
 
@@ -79,12 +81,18 @@ MultiClaude is that trick with a proper interface.
 - **Keep-awake only, if you like.** Turn off **Manage Claude Accounts** and MultiClaude leaves Claude alone and keeps just the keep-awake and scroll features. Your profiles wait for you to turn it back on.
 - **Token usage per account and in all.** Claude Code logs every reply's tokens on your Mac (Code tab, Cowork and terminal). MultiClaude credits each session to the account it ran in and shows today's output per account in the panel, plus a window with a 6-month heatmap, each account's share, and a by-model table. Regular chats keep no token counts on the Mac; turn on **Show Chat Limits** for each account's 5-hour and weekly limits from claude.ai.
 - **Keeps your Claude Code conversations.** Claude Code deletes transcripts after 30 days by default. MultiClaude keeps a copy of each one per account (an APFS clone, so no extra space while the original exists), lists them with search, shows them, and exports any one to Markdown.
-- **Lid closed, done right.** Keep the Mac awake with the lid closed for long agent runs: the screen goes off, sound mutes, Slack, WhatsApp and Discord pause, and Low Power Mode steps in on low battery or heat. Opening the lid undoes it, and a recovery agent undoes it if MultiClaude is gone. Optional password-free mode. Design after [Insomnia](https://github.com/krishhgg/Insomnia).
-- **Scroll your own way.** Reverse the scroll direction of a mouse and a trackpad separately, in Settings (needs Accessibility permission).
+- **Lid closed, done right.** Turn on **Keep Awake with Lid Closed** for long agent runs. When the lid closes, each of these is its own option, on by default:
+  - **Turn the Screen Off**, **Mute Sound** and **Pause Chat Apps** (Slack, WhatsApp and Discord with their helpers stop syncing and pinging; meeting and recording apps are never paused),
+  - **Low Power Mode** while the lid is closed, and **Low Power Mode Below 40%** on battery,
+  - **Ease Off When Hot**: Low Power Mode when the Mac runs hot, and the session ends when it gets critical.
+
+  Opening the lid undoes all of it, and MultiClaude only turns off a Low Power Mode it turned on. If MultiClaude is gone while a session had changed something, a small recovery agent puts it back within a minute. **No Password Prompt** (optional) installs one sudoers rule so the sleep and Low Power Mode commands stop asking for your password. Design after [Insomnia](https://github.com/krishhgg/Insomnia).
+- **Scroll your own way.** Reverse the scroll direction of a mouse and a trackpad separately, in Settings (needs Accessibility permission). Smooth-scrolling mice, like an MX Master with Logi Options+, follow the mouse setting.
+- **Quit them all together.** Turn on **Quit Profiles with MultiClaude** and quitting MultiClaude closes every account it opened.
 - **Global shortcuts.** ⌃⌥⌘M opens the panel; turn on Profile Shortcuts and ⌃⌥1 to ⌃⌥9 jump straight to each account.
 - **Updates itself.** Once a day MultiClaude checks for a new release, installs it in the background and restarts while the panel is closed. Your Claude windows stay open.
 - **Launch at login**, light and dark mode, colored menu bar icon.
-- **Tiny.** A single Swift file, no dependencies, under 1.5 MB installed.
+- **Small.** A single Swift file, no dependencies, a 1.6 MB download.
 
 <p align="center">
 <picture>
@@ -129,10 +137,12 @@ Your default Claude account is always the first profile. It uses the app's norma
 - **Profile icons on open windows.** With profile apps on, each account runs from its own copy of Claude.app in `~/Library/Application Support/MultiClaude/Runtimes.noindex`. The copy is an APFS clone, so it takes no extra disk space, and it wears the profile icon as a Finder icon, outside the signed part of the bundle. Nothing inside the bundle changes: its signature stays Anthropic's, Gatekeeper accepts it, and Claude keeps its Keychain access and its own folders. A copy is refreshed from Claude.app after Claude updates, while that account is closed. If Claude's updater restarts a copy without its account folder, MultiClaude closes it and reopens the account. Claude.app itself is never touched.
 - **Status** comes from the running Claude processes: MultiClaude reads each one's `--user-data-dir` argument and matches it to a profile.
 - **Profiles** are a small list in MultiClaude's own preferences (`me.somalabs.multiclaude`). Data folders live in `~/Library/Application Support/Claude-<Name>`, next to Claude's own. MultiClaude never moves the folder of an account that is open. **Remove from List** keeps the folder and stops MultiClaude from adding it back.
+- **Token usage** comes from the JSONL transcripts Claude Code writes to `~/.claude/projects` and each account's Cowork folder. A session is credited to the profile whose folder lists it, or to "Terminal" when none does. Replies seen twice are counted once.
+- **Keep Awake** holds a macOS power assertion. With the lid closed it also runs `pmset disablesleep 1` (and `pmset lowpowermode` for Low Power Mode), mutes the default output device, and pauses chat apps with `SIGSTOP`, then sends `SIGCONT` when the lid opens. What a session changed is written to a small state file, which the launchd agent `me.somalabs.multiclaude.recovery` reads to undo it if MultiClaude quits or crashes.
 
 ### Privacy
 
-MultiClaude has **no analytics**. Its only network requests are the daily update check and, if you turn on **Show Chat Limits**, claude.ai's usage numbers. The update check: it asks GitHub for this repo's latest release, and downloads it from GitHub when it's newer. Every release is signed with a private key kept outside this repository, and MultiClaude refuses any update whose signature doesn't match the public key built into the app. It also checks the bundle identifier, the version and the code signature before swapping itself. Turn off **Update MultiClaude Automatically** in Settings to stop it. **Usage and conversations** are read and kept on your Mac only: MultiClaude reads Claude Code's transcripts (in `~/.claude` and each account's folder) to count tokens, and keeps copies in `~/Library/Application Support/MultiClaude/Archive`, readable only by you. Turn off **Track Token Usage** and **Keep Claude Code Conversations** to stop both; delete that folder to remove the copies. **Show Chat Limits** is off until you turn it on and confirm: it then reads each account's claude.ai sign-in cookie (macOS asks you to allow "Claude Safe Storage" in the Keychain) and sends it to claude.ai only, never anywhere else; it is kept in memory and never written or logged. It does not modify the Claude app. The scroll reverser, when you turn it on, flips the direction of scroll events as they pass and keeps nothing. Removing a profile only takes it off the list: the folder stays on disk until you delete it yourself.
+MultiClaude has **no analytics**. Its only network requests are the daily update check and, if you turn on **Show Chat Limits**, claude.ai's usage numbers. The update check: it asks GitHub for this repo's latest release, and downloads it from GitHub when it's newer. Every release is signed with a private key kept outside this repository, and MultiClaude refuses any update whose signature doesn't match the public key built into the app. It also checks the bundle identifier, the version and the code signature before swapping itself. Turn off **Update MultiClaude Automatically** in Settings to stop it. **Usage and conversations** are read and kept on your Mac only: MultiClaude reads Claude Code's transcripts (in `~/.claude` and each account's folder) to count tokens, and keeps copies in `~/Library/Application Support/MultiClaude/Archive`, readable only by you. Turn off **Track Token Usage** and **Keep Claude Code Conversations** to stop both; delete that folder to remove the copies. **Show Chat Limits** is off until you turn it on and confirm: it then reads each account's claude.ai sign-in cookie (macOS asks you to allow "Claude Safe Storage" in the Keychain) and sends it to claude.ai only, never anywhere else; it is kept in memory and never written or logged. It does not modify the Claude app. The scroll reverser, when you turn it on, flips the direction of scroll events as they pass and keeps nothing. **Keep Awake with Lid Closed** asks for your password for each `pmset` change, unless you install **No Password Prompt**: that writes `/etc/sudoers.d/multiclaude` (checked with `visudo`), which lets the four `pmset` commands for sleep and Low Power Mode run without a password. Any app running as you could run those four commands too. Remove the rule from the same row. Removing a profile only takes it off the list: the folder stays on disk until you delete it yourself.
 
 ## FAQ
 
@@ -180,11 +190,11 @@ MULTICLAUDE_DEMO=1 MULTICLAUDE_PREVIEW=panel MULTICLAUDE_APPEARANCE=dark \
 
 ## Releases
 
-Push a `v*` tag and [GitHub Actions](.github/workflows/release.yml) builds a universal app, publishes the release with the matching [CHANGELOG](CHANGELOG.md) section, and bumps the Homebrew cask.
+Push a `v*` tag and [GitHub Actions](.github/workflows/release.yml) builds a universal app, signs it, and publishes the release with the matching [CHANGELOG](CHANGELOG.md) section. Tags with a suffix, like `v1.7-rc1`, publish pre-releases that the updater and the cask ignore.
 
 ## Contributing
 
-Issues and pull requests are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md). Ideas on the list: notarized builds, per-profile keyboard shortcuts, a profile color, and a Windows port.
+Issues and pull requests are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md). Ideas on the list: notarized builds, keyboard and VoiceOver access to the profile rows, and a Windows port.
 
 ## License
 
