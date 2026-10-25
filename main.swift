@@ -1848,6 +1848,58 @@ enum Recovery {
         }
         Log.write("recovery agent installed")
     }
+
+    static func removeAgent() {
+        let domain = "gui/\(getuid())"
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/bin/launchctl")
+        p.arguments = ["bootout", domain + "/" + label]
+        p.standardError = FileHandle.nullDevice
+        p.standardOutput = FileHandle.nullDevice
+        try? p.run()
+        p.waitUntilExit()
+        for url in [plistURL, scriptURL, stateURL, folder.appendingPathComponent(".recovery-warned")] {
+            try? FileManager.default.removeItem(at: url)
+        }
+        Log.write("recovery agent removed")
+    }
+}
+
+// Takes out everything MultiClaude added outside your account folders, then moves the app to the Trash.
+// Kept: each account's Claude-<Name> folder, the conversation archive, and Claude.app itself.
+@MainActor
+enum Uninstaller {
+    static func run() {
+        guard Dialogs.confirmUninstall() else { return }
+        let fm = FileManager.default
+        var left: [String] = []
+        Awake.shared.deactivate(reason: "uninstall")
+        if Root.installed && !Root.uninstall() { left.append("\(Root.sudoersPath) (remove it with: sudo rm \(Root.sudoersPath))") }
+        Recovery.removeAgent()
+        LinkRelay.giveBack()
+        try? SMAppService.mainApp.unregister()
+        try? fm.removeItem(at: Launchers.folder)
+        // A copy of Claude that is open keeps running from its folder, so it stays until that account is closed.
+        for dir in (try? fm.contentsOfDirectory(at: Runtimes.folder, includingPropertiesForKeys: nil)) ?? [] {
+            if let app = Runtimes.current(UUID(uuidString: dir.lastPathComponent) ?? UUID()), Runtimes.isRunning(app) {
+                left.append(dir.path)
+            } else {
+                try? fm.removeItem(at: dir)
+            }
+        }
+        for item in (try? fm.contentsOfDirectory(at: Recovery.folder, includingPropertiesForKeys: nil)) ?? []
+        where !["Archive", "Runtimes.noindex"].contains(item.lastPathComponent) {
+            try? fm.removeItem(at: item)
+        }
+        if (try? fm.contentsOfDirectory(atPath: Runtimes.folder.path))?.isEmpty ?? false { try? fm.removeItem(at: Runtimes.folder) }
+        Log.write("uninstalled; left: \(left.isEmpty ? "nothing" : left.joined(separator: ", "))")
+        try? fm.removeItem(at: Log.url)
+        UserDefaults.standard.removePersistentDomain(forName: Bundle.main.bundleIdentifier ?? "me.somalabs.multiclaude")
+        Dialogs.uninstalled(left: left)
+        NSWorkspace.shared.recycle([Bundle.main.bundleURL]) { _, _ in
+            DispatchQueue.main.async { NSApp.terminate(nil) }
+        }
+    }
 }
 
 // MARK: - Keep awake and scroll direction (ported from Cocaine)
@@ -3615,6 +3667,19 @@ enum Dialogs {
               buttons: ["Remove", "Cancel"]).0 == 0
     }
 
+    static func confirmUninstall() -> Bool {
+        alert("Uninstall MultiClaude?",
+              "MultiClaude ends any keep-awake session, removes /etc/sudoers.d/multiclaude if you installed it (macOS asks for your password), the recovery agent, the login item, the profile apps and the copies of Claude it made, gives claude:// links back to Claude, deletes its settings, then moves itself to the Trash.\n\nKept: your accounts' folders (Claude-<Name> in Application Support), your conversation archive in Application Support/MultiClaude/Archive, and Claude.app. Open Claude windows stay open.",
+              buttons: ["Uninstall", "Cancel"]).0 == 0
+    }
+
+    static func uninstalled(left: [String]) {
+        let text = left.isEmpty
+            ? "Everything MultiClaude added is gone. If you installed it with Homebrew, also run: brew uninstall --cask multiclaude"
+            : "These are still there and can be deleted by hand:\n" + left.map { "• " + $0 }.joined(separator: "\n")
+        _ = alert("MultiClaude is uninstalled", text, buttons: ["OK"])
+    }
+
     // Chat limits read each account's claude.ai session cookie, so ask before the first time.
     static func confirmChatLimits() -> Bool {
         alert("Show each account's chat limits?",
@@ -4590,6 +4655,7 @@ struct AboutView: View {
                 HStack(spacing: 18) {
                     Button("Support") { NSWorkspace.shared.open(supportURL) }
                     Button("Website") { NSWorkspace.shared.open(websiteURL) }
+                    Button("Uninstall…") { AboutWindow.window?.close(); Uninstaller.run() }
                 }
                 .buttonStyle(PillButtonStyle())
                 .padding(.top, 18)

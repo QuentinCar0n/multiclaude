@@ -1,5 +1,13 @@
 # MultiClaude release notes
 
+## 1.7 (build 14), 2026-10-25
+
+### New
+- **Uninstall.** About > **Uninstall…** takes out everything MultiClaude added outside your account folders: the sudoers rule (if you installed it), the recovery agent, the login item, the profile apps and the copies of Claude, the `claude://` link handler and its settings, then moves the app to the Trash. Your accounts, your conversation archive and Claude.app stay. The README lists the same steps for when the app is already gone.
+
+### Changed
+- **Maintenance mode.** MultiClaude keeps getting fixes when Claude changes, but no new features are planned. The README says so, and lists notification clicks landing in the wrong account as a known limit macOS doesn't let MultiClaude fix.
+
 ## 1.6.1 (build 13), 2026-10-21
 
 ### Fixed
