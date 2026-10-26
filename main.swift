@@ -347,6 +347,7 @@ final class Engine: ObservableObject {
     }
 
     func toggle(_ s: Setting) {
+        guard !isUninstalling else { return }
         let on = !isOn(s)
         if s == .chatLimits && on && !Dialogs.confirmChatLimits() { return }
         objectWillChange.send()
@@ -437,7 +438,7 @@ final class Engine: ObservableObject {
     // ASWebAuthenticationSession instead of the browser, so every account signs in in its own window.
     // (Claude: "[Auth] Not the claude:// handler; keeping ASWebAuth".)
     func holdLinks() {
-        guard !isDemo, !isCLI, managing, isOn(.routeSignIn) || signIn != nil, !LinkRelay.isOurs() else { return }
+        guard !isDemo, !isCLI, !isUninstalling, managing, isOn(.routeSignIn) || signIn != nil, !LinkRelay.isOurs() else { return }
         LinkRelay.take { _ in }
     }
 
@@ -465,7 +466,7 @@ final class Engine: ObservableObject {
     }
 
     private func takeOverLinks(for p: Profile) {
-        guard signIn?.target == p.id else { return }
+        guard !isUninstalling, signIn?.target == p.id else { return }
         LinkRelay.take { ok in
             DispatchQueue.main.async {
                 MainActor.assumeIsolated {
@@ -549,7 +550,7 @@ final class Engine: ObservableObject {
         signInTimer = nil
         signIn = nil
         if !isOn(.routeSignIn) { LinkRelay.giveBack() }
-        let reopen = profiles.filter { s.reopen.contains($0.id) && !isRunning($0) }
+        let reopen = isUninstalling ? [] : profiles.filter { s.reopen.contains($0.id) && !isRunning($0) }
         reopen.forEach(open)
         let target = profiles.first { $0.id == s.target }?.name ?? "the account"
         if cancelled { notice = nil; return }
@@ -562,7 +563,7 @@ final class Engine: ObservableObject {
 
     // Matches each Claude process to a profile through its --user-data-dir argument.
     func refresh() {
-        guard !isDemo else { return }
+        guard !isDemo, !isUninstalling else { return }
         if isOn(.reverseMouse) || isOn(.reverseTrackpad) {
             let before = (ScrollReverser.cocaineMouse, ScrollReverser.cocaineTrackpad)
             updateScroll()
@@ -665,6 +666,7 @@ final class Engine: ObservableObject {
     // MARK: actions
 
     func open(_ p: Profile) {
+        guard !isUninstalling else { return }
         if let app = running[p.id] {
             LinkRelay.bringForward(app)
             return
@@ -957,7 +959,7 @@ final class Engine: ObservableObject {
     // Keeps ~/Applications/MultiClaude Launchers in step with the list: one app per profile while the
     // setting is on, none while it's off. Apps that move or go away are moved or taken off the Dock too.
     func syncLaunchers() {
-        guard !isDemo, !isCLI else { return }
+        guard !isDemo, !isCLI, !isUninstalling else { return }
         let result = Launchers.sync(isOn(.dockApps) ? profiles : [], in: Launchers.folder)
         Runtimes.prune(keeping: isOn(.dockApps) ? Set(profiles.map(\.id)) : [])
         // Restyle each profile's own Claude now rather than at its next launch (only the icon if it's open).
@@ -1051,7 +1053,7 @@ enum Updater {
 
     @MainActor static func checkIfDue(force: Bool) {
         let d = UserDefaults.standard
-        guard Engine.shared.isOn(.autoUpdate), !busy, installedPending == nil else { return }
+        guard !isUninstalling, Engine.shared.isOn(.autoUpdate), !busy, installedPending == nil else { return }
         if !force, let last = d.object(forKey: "lastUpdateCheck") as? Date, -last.timeIntervalSinceNow < 86_400 { return }
         // A test build (1.5-rc1, 0.0.0-ci) is never replaced by a release behind the tester's back.
         guard !currentVersion.contains("-") else { return }
@@ -1071,7 +1073,7 @@ enum Updater {
                 // A failed check is tried again in 3 hours rather than the next day (or every hour for a bad release).
                 if let failure { Log.write("update failed: \(failure)") }
                 d.set(failure == nil ? Date() : Date().addingTimeInterval(-86_400 + 3 * 3600), forKey: "lastUpdateCheck")
-                if let installed = installed ?? nil {
+                if let installed = installed ?? nil, !isUninstalling {
                     installedPending = installed
                     Log.write("update: installed \(installed), relaunching when idle")
                     relaunchWhenIdle(version: installed, app: target)
@@ -1155,6 +1157,8 @@ enum Updater {
         guard info?["CFBundleIdentifier"] as? String == "me.somalabs.multiclaude",
               info?["CFBundleShortVersionString"] as? String == r.version else { throw UpdateError.invalid }
         try run("/usr/bin/codesign", ["--verify", "--deep", "--strict", app.path])
+        // An uninstall started while this downloaded: never put the app back.
+        guard !isUninstalling else { throw UpdateError.command("uninstalling") }
         _ = try fm.replaceItemAt(target, withItemAt: app)
     }
 
@@ -1178,6 +1182,7 @@ enum Updater {
     // Waits while the panel is open or a sign-in is relaying links (a restart would drop it). The new copy
     // starts once this process is gone, so `open` can't just bring the old one forward.
     @MainActor static func relaunchWhenIdle(version: String, app: URL) {
+        guard !isUninstalling else { return }
         guard !PanelController.shared.isOpen, Engine.shared.signIn == nil, !Awake.shared.lidApplied else {
             DispatchQueue.main.asyncAfter(deadline: .now() + 30) { relaunchWhenIdle(version: version, app: app) }
             return
@@ -1205,7 +1210,7 @@ enum Log {
     static let maxSize: UInt64 = 1 << 20   // past 1 MB the log moves to MultiClaude.log.1 and starts over
 
     static func write(_ line: String) {
-        guard !isCLI else { return }
+        guard !isCLI, !isUninstalling else { return }
         let text = ISO8601DateFormatter().string(from: Date()) + " " + String(line.prefix(400)) + "\n"
         let fm = FileManager.default
         if ((try? fm.attributesOfItem(atPath: url.path))?[.size] as? NSNumber)?.uint64Value ?? 0 > maxSize {
@@ -1610,6 +1615,7 @@ enum Root {
 
     // Writes the rule to a temp file, checks it with visudo, then installs it root-owned and 0440.
     static func install() -> Bool {
+        guard !isUninstalling else { return false }
         let tmp = FileManager.default.temporaryDirectory.appendingPathComponent("multiclaude-sudoers-\(UUID().uuidString)")
         guard (try? sudoersText(user: NSUserName()).write(to: tmp, atomically: true, encoding: .utf8)) != nil else { return false }
         defer { try? FileManager.default.removeItem(at: tmp) }
@@ -1826,6 +1832,7 @@ enum Recovery {
     """
 
     static func installAgent() {
+        guard !isUninstalling else { return }
         let fm = FileManager.default
         try? fm.createDirectory(at: folder, withIntermediateDirectories: true)
         try? fm.createDirectory(at: plistURL.deletingLastPathComponent(), withIntermediateDirectories: true)
@@ -1867,38 +1874,153 @@ enum Recovery {
 
 // Takes out everything MultiClaude added outside your account folders, then moves the app to the Trash.
 // Kept: each account's Claude-<Name> folder, the conversation archive, and Claude.app itself.
+// Once it starts, isUninstalling stops every timer from taking claude:// links, making copies or writing again.
+nonisolated(unsafe) var isUninstalling = false
+
 @MainActor
 enum Uninstaller {
-    static func run() {
-        guard Dialogs.confirmUninstall() else { return }
+    // Everything the cleanup touches, so the self-test can run it on a scratch folder with fakes.
+    struct Env {
+        var support: URL                       // ~/Library/Application Support/MultiClaude
+        var runtimes: URL                      // copies of Claude, inside support
+        var launchers: URL
+        var logs: [URL]
+        var helperInstalled: @MainActor () -> Bool
+        var removeHelper: @MainActor () -> Bool
+        var removeAgent: @MainActor () -> Void
+        var endSession: @MainActor () -> Bool             // false when a keep-awake change could not be undone
+        var giveBackLinks: @MainActor () -> Void
+        var unregisterLogin: @MainActor () -> Bool         // false when the login item is still registered
+        var removeDockTiles: @MainActor (_ under: [URL]) -> Void
+        var isRunning: @MainActor (URL) -> Bool
+
+        static var live: Env {
+            Env(support: Recovery.folder, runtimes: Runtimes.folder, launchers: Launchers.folder,
+                logs: [Log.url, Log.url.appendingPathExtension("1")],
+                helperInstalled: { Root.installed }, removeHelper: { Root.uninstall() },
+                removeAgent: { Recovery.removeAgent() },
+                endSession: { Awake.shared.deactivate(); return Awake.shared.nothingToUndo },
+                giveBackLinks: { LinkRelay.giveBack() },
+                unregisterLogin: {
+                    let app = SMAppService.mainApp
+                    if app.status == .enabled || app.status == .requiresApproval { try? app.unregister() }
+                    return app.status != .enabled
+                },
+                removeDockTiles: { Dock.removeTiles(under: $0) },
+                isRunning: { Runtimes.isRunning($0) })
+        }
+    }
+
+    // Returns what is still there, as lines for the user. Safe to run again: a second run finds nothing.
+    static func clean(_ env: Env) -> [String] {
         let fm = FileManager.default
         var left: [String] = []
-        Awake.shared.deactivate(reason: "uninstall")
-        if Root.installed && !Root.uninstall() { left.append("\(Root.sudoersPath) (remove it with: sudo rm \(Root.sudoersPath))") }
-        Recovery.removeAgent()
-        LinkRelay.giveBack()
-        try? SMAppService.mainApp.unregister()
-        try? fm.removeItem(at: Launchers.folder)
-        // A copy of Claude that is open keeps running from its folder, so it stays until that account is closed.
-        for dir in (try? fm.contentsOfDirectory(at: Runtimes.folder, includingPropertiesForKeys: nil)) ?? [] {
-            if let app = Runtimes.current(UUID(uuidString: dir.lastPathComponent) ?? UUID()), Runtimes.isRunning(app) {
-                left.append(dir.path)
-            } else {
-                try? fm.removeItem(at: dir)
+        func remove(_ url: URL) {
+            guard (try? url.checkResourceIsReachable()) == true || isLink(url) else { return }
+            do { try fm.removeItem(at: url) } catch { left.append(url.path) }
+        }
+        func isLink(_ url: URL) -> Bool { (try? fm.destinationOfSymbolicLink(atPath: url.path)) != nil }
+        func children(_ url: URL) -> [URL] {
+            // A symlink in place of one of our folders is removed as a link, never followed.
+            guard !isLink(url) else { return [] }
+            return (try? fm.contentsOfDirectory(at: url, includingPropertiesForKeys: nil)) ?? []
+        }
+
+        // A support folder moved elsewhere and linked back is the user's choice: clean inside it, keep the link.
+        var env = env
+        let dockFolders = [env.launchers, env.runtimes]
+        let supportLinked = isLink(env.support)
+        if supportLinked {
+            let real = env.support.resolvingSymlinksInPath()
+            if env.runtimes.deletingLastPathComponent().standardizedFileURL == env.support.standardizedFileURL {
+                env.runtimes = real.appendingPathComponent(env.runtimes.lastPathComponent)
             }
+            env.support = real
         }
-        for item in (try? fm.contentsOfDirectory(at: Recovery.folder, includingPropertiesForKeys: nil)) ?? []
-        where !["Archive", "Runtimes.noindex"].contains(item.lastPathComponent) {
-            try? fm.removeItem(at: item)
+
+        // Undo the session first, while the sudoers rule can still turn sleep back on without a prompt.
+        if !env.endSession() { left.append("sleep may still be off: run sudo pmset -a disablesleep 0") }
+        if env.helperInstalled() && !env.removeHelper() { left.append("\(Root.sudoersPath) (remove it with: sudo rm \(Root.sudoersPath))") }
+        env.removeAgent()
+        env.giveBackLinks()
+        if !env.unregisterLogin() { left.append("login item (remove it in System Settings > General > Login Items)") }
+        env.removeDockTiles(Array(Set(dockFolders + [env.launchers, env.runtimes])).sorted { $0.path < $1.path })
+        // Only the profile apps go; anything else someone put in that folder stays, and so does the folder then.
+        if isLink(env.launchers) { remove(env.launchers) } else {
+            children(env.launchers).filter { $0.pathExtension == "app" }.forEach(remove)
+            if children(env.launchers).isEmpty { remove(env.launchers) }
         }
-        if (try? fm.contentsOfDirectory(atPath: Runtimes.folder.path))?.isEmpty ?? false { try? fm.removeItem(at: Runtimes.folder) }
-        Log.write("uninstalled; left: \(left.isEmpty ? "nothing" : left.joined(separator: ", "))")
-        try? fm.removeItem(at: Log.url)
+        // A copy of Claude that is open keeps running from its folder, so it stays until that account is closed.
+        for dir in children(env.runtimes) {
+            let apps = children(dir).filter { $0.pathExtension == "app" }
+            if apps.contains(where: env.isRunning) { left.append(dir.path + " (an account is still open from it)") } else { remove(dir) }
+        }
+        if isLink(env.runtimes) || children(env.runtimes).isEmpty { remove(env.runtimes) }
+        for item in children(env.support) where !["Archive", env.runtimes.lastPathComponent].contains(item.lastPathComponent) {
+            remove(item)
+        }
+        if !supportLinked && children(env.support).isEmpty { remove(env.support) }
+        env.logs.forEach(remove)
+        return left
+    }
+
+    private static var started = false
+
+    static func run() {
+        guard !started, !isDemo else { return }
+        guard Dialogs.confirmUninstall() else { return }
+        started = true
+        Log.write("uninstalling")
+        // From here no timer takes links, opens accounts, makes copies, updates or writes state.
+        isUninstalling = true
+        PanelController.shared.close()
+        Dock.pendingRestore = nil
+        if Engine.shared.signIn != nil { Engine.shared.finishSignIn(cancelled: true) }
+        afterUpdate(waited: 0)
+    }
+
+    // An update that was already downloading either swapped the app in or gave up; wait for it (at most 5 min).
+    private static func afterUpdate(waited: Int) {
+        if Updater.busy && waited < 600 {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { afterUpdate(waited: waited + 1) }
+            return
+        }
+        // A usage scan in flight finishes before its folder goes (the queue is serial), without blocking the UI.
+        // Capped at 30 s. Saves and archive copies check isUninstalling on entry, and it was set before this wait,
+        // so a scan still running then is only reading; finish() sweeps once more right before quitting anyway.
+        UsageScan.shared.queue.async {
+            DispatchQueue.main.async { MainActor.assumeIsolated { finish() } }
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 30) { finish() }
+    }
+
+    private static var finished = false
+
+    private static func finish() {
+        guard !finished else { return }
+        finished = true
+        var left = clean(.live)
+        // Last, so nothing writes the settings back before the app is gone.
         UserDefaults.standard.removePersistentDomain(forName: Bundle.main.bundleIdentifier ?? "me.somalabs.multiclaude")
-        Dialogs.uninstalled(left: left)
-        NSWorkspace.shared.recycle([Bundle.main.bundleURL]) { _, _ in
-            DispatchQueue.main.async { NSApp.terminate(nil) }
+        NSWorkspace.shared.recycle([Bundle.main.bundleURL]) { _, err in
+            DispatchQueue.main.async { linksBack(waited: 0) { linksOK in
+                if !linksOK { left.append("claude:// links (open Claude.app once and it takes them back)") }
+                _ = clean(.live)   // a last sweep for anything written while the app was being trashed
+                if err != nil {
+                    let translocated = Bundle.main.bundleURL.path.contains("/AppTranslocation/")
+                    left.append(translocated ? "MultiClaude.app, where you put it (drag it to the Trash)" : Bundle.main.bundleURL.path + " (drag it to the Trash)")
+                }
+                Dialogs.uninstalled(left: left)
+                NSApp.terminate(nil)
+            } }
         }
+    }
+
+    // Giving the links back finishes in the background; wait for it (at most 3 s) so a failure is reported.
+    private static func linksBack(waited: Int, _ done: @escaping @MainActor (Bool) -> Void) {
+        if !LinkRelay.isOurs() || waited >= 30 { done(!LinkRelay.isOurs()); return }
+        if waited == 10 { LinkRelay.giveBack() }   // once more, in case the first try lost a race with Claude starting
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { linksBack(waited: waited + 1, done) }
     }
 }
 
@@ -2086,6 +2208,7 @@ final class Awake: ObservableObject {
     }
 
     func activate(minutes m: Int? = nil) {
+        guard !isUninstalling else { return }
         if let m { setMinutes(m) }
         start(until: minutes == 0 ? nil : Date().addingTimeInterval(TimeInterval(minutes * 60)))
     }
@@ -2102,6 +2225,9 @@ final class Awake: ObservableObject {
         RunLoop.main.add(timer!, forMode: .common)
         Engine.shared.onChange?()
     }
+
+    // True once every change a session made (sleep, Low Power Mode, sound, paused apps) is undone.
+    var nothingToUndo: Bool { recovery.isEmpty }
 
     func deactivate(reason: String? = nil) {
         guard active || holding || lidApplied || !recovery.isEmpty else { return }
@@ -2256,6 +2382,7 @@ final class Awake: ObservableObject {
     }
 
     private func notify(_ body: String) {
+        guard !isUninstalling else { return }
         let c = UNMutableNotificationContent()
         c.title = "Keep Awake is off"
         c.body = body
@@ -2450,6 +2577,7 @@ final class UsageScan: @unchecked Sendable {
     }
 
     private func save() {
+        guard !isUninstalling else { return }
         try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
         if let d = try? JSONEncoder().encode(state) { try? d.write(to: stateURL, options: .atomic) }
         try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: stateURL.path)
@@ -2579,6 +2707,7 @@ final class UsageScan: @unchecked Sendable {
     // APFS clone of the transcript under Archive/<owner>/<source>/<path>: takes no space while Claude
     // keeps the original, and survives Claude Code's cleanup.
     private func archive(_ f: URL, root: URL, as name: String, owner: String) {
+        guard !isUninstalling else { return }
         let rel = String(f.standardizedFileURL.path.dropFirst(root.standardizedFileURL.path.count)).trimmingCharacters(in: CharacterSet(charactersIn: "/"))
         let dest = archiveURL.appendingPathComponent(owner).appendingPathComponent(name).appendingPathComponent(rel)
         let fm = FileManager.default
@@ -2762,7 +2891,7 @@ final class Usage: ObservableObject {
     }
 
     func refresh(force: Bool = false) {
-        guard !isDemo else { return }
+        guard !isDemo, !isUninstalling else { return }
         let e = Engine.shared
         if e.isOn(.trackUsage) && !scanning {
             scanning = true
@@ -3409,6 +3538,18 @@ enum Dock {
                        "file-data": ["_CFURLString": app.absoluteString, "_CFURLStringType": 15]]]
     }
 
+    // Drops every tile for an app inside one of these folders (MultiClaude's own apps, at uninstall).
+    static func removeTiles(under folders: [URL]) {
+        guard let list = entries() else { return }
+        let kept = without(list, under: folders)
+        if kept.count != list.count { write(kept) }
+    }
+
+    static func without(_ list: [[String: Any]], under folders: [URL]) -> [[String: Any]] {
+        let roots = folders.map { $0.standardizedFileURL.path + "/" }
+        return list.filter { e in !(path(of: e).map { p in roots.contains { p.hasPrefix($0) } } ?? false) }
+    }
+
     static func contains(_ app: URL) -> Bool {
         (entries() ?? []).contains { path(of: $0) == app.standardizedFileURL.path }
     }
@@ -3427,6 +3568,7 @@ enum Dock {
 
     @discardableResult
     static func add(_ app: URL) -> Bool {
+        guard !isUninstalling else { return false }
         guard var list = entries() else { Log.write("Dock: app list unreadable, not adding \(app.lastPathComponent)"); return false }
         if list.contains(where: { path(of: $0) == app.standardizedFileURL.path }) { return true }
         list.append(entry(for: app))
@@ -4551,6 +4693,7 @@ final class PanelController: ObservableObject {
     func toggle(below button: NSStatusBarButton) { isOpen ? close() : open(below: button) }
 
     func open(below button: NSStatusBarButton) {
+        guard !isUninstalling else { return }
         let p = panel ?? makePanel()
         panel = p
         guard let win = button.window, let screen = win.screen else { return }
@@ -4812,8 +4955,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationWillTerminate(_ n: Notification) {
         Dock.pendingRestore?()
         LinkRelay.giveBack()
-        if Engine.shared.managing && Engine.shared.isOn(.quitWithApp) && !Updater.relaunching { Engine.shared.quitAll() }
-        Awake.shared.deactivate()
+        if !isUninstalling && Engine.shared.managing && Engine.shared.isOn(.quitWithApp) && !Updater.relaunching { Engine.shared.quitAll() }
+        // The uninstall already undid the session; doing it again here could ask for the password.
+        if isUninstalling {
+            UserDefaults.standard.removePersistentDomain(forName: Bundle.main.bundleIdentifier ?? "me.somalabs.multiclaude")
+        } else {
+            Awake.shared.deactivate()
+        }
     }
 
     @objc private func clicked() {
@@ -5178,6 +5326,134 @@ if args.count == 3, args[1] == "--export-profile-icon" {   // --export-profile-i
     }
     exit(0)
 }
+if args.count == 2, args[1] == "--selftest-uninstall" {
+    // Runs the uninstall cleanup on a scratch folder with fakes: never touches the real Mac.
+    var ok = true
+    func check(_ name: String, _ cond: Bool) { print(cond ? "PASS" : "FAIL", name); ok = ok && cond }
+    let fm = FileManager.default
+    let root = fm.temporaryDirectory.appendingPathComponent("mc-uninstall-\(UUID().uuidString)")
+    func mk(_ url: URL, _ text: String? = nil) {
+        if let text { try? fm.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true); try? text.write(to: url, atomically: true, encoding: .utf8) }
+        else { try? fm.createDirectory(at: url, withIntermediateDirectories: true) }
+    }
+    func exists(_ url: URL) -> Bool { fm.fileExists(atPath: url.path) || (try? fm.destinationOfSymbolicLink(atPath: url.path)) != nil }
+    struct Calls { var order: [String] = []; var dock: [URL] = [] }
+    nonisolated(unsafe) var calls = Calls()
+    func env(_ base: URL, helper: Bool = false, helperRemoves: Bool = true, sessionClean: Bool = true, loginGoes: Bool = true, running: Set<String> = []) -> Uninstaller.Env {
+        let support = base.appendingPathComponent("Support/MultiClaude")
+        return Uninstaller.Env(support: support, runtimes: support.appendingPathComponent("Runtimes.noindex"),
+                               launchers: base.appendingPathComponent("Applications/MultiClaude Launchers"),
+                               logs: [base.appendingPathComponent("Logs/MultiClaude.log"), base.appendingPathComponent("Logs/MultiClaude.log.1")],
+                               helperInstalled: { helper }, removeHelper: { calls.order.append("helper"); return helperRemoves },
+                               removeAgent: { calls.order.append("agent") },
+                               endSession: { calls.order.append("session"); return sessionClean },
+                               giveBackLinks: { calls.order.append("links") }, unregisterLogin: { calls.order.append("login"); return loginGoes },
+                               removeDockTiles: { calls.dock = $0 }, isRunning: { running.contains($0.lastPathComponent) })
+    }
+    MainActor.assumeIsolated {
+        // 1. A full install: everything goes except the archive and an open account's copy.
+        let a = root.appendingPathComponent("a")
+        var e = env(a, helper: true, running: ["Claude Zé ✳.app"])
+        let rt = e.runtimes, sup = e.support
+        let closed = rt.appendingPathComponent(UUID().uuidString), open = rt.appendingPathComponent(UUID().uuidString)
+        mk(closed.appendingPathComponent("Claude Work.app/Contents/Info.plist"), "x")
+        mk(open.appendingPathComponent("Claude Zé ✳.app/Contents/Info.plist"), "x")
+        mk(rt.appendingPathComponent("not-a-uuid")); mk(rt.appendingPathComponent("stray-file"), "x")
+        mk(sup.appendingPathComponent("usage.json"), "{}"); mk(sup.appendingPathComponent("usage-seen.bin"), "x")
+        mk(sup.appendingPathComponent("awake-state"), "muted=1"); mk(sup.appendingPathComponent("recovery.sh"), "#!/bin/sh")
+        mk(sup.appendingPathComponent("Archive/Work/s.jsonl"), "keep")
+        mk(e.launchers.appendingPathComponent("Claude Work.app/Contents/MacOS/run"), "x")
+        let note = root.appendingPathComponent("a2/Applications/MultiClaude Launchers/notes.txt")
+        e.logs.forEach { mk($0, "log") }
+        calls = Calls()
+        var left = Uninstaller.clean(e)
+        check("session undone before the helper goes", calls.order.firstIndex(of: "session")! < calls.order.firstIndex(of: "helper")!)
+        check("agent, links and login item handled", ["agent", "links", "login"].allSatisfy(calls.order.contains))
+        check("dock tiles dropped for launchers and copies", calls.dock == [e.launchers, e.runtimes])
+        check("archive kept", (try? String(contentsOf: sup.appendingPathComponent("Archive/Work/s.jsonl"), encoding: .utf8)) == "keep")
+        check("closed copy removed", !exists(closed))
+        check("open copy kept and reported", exists(open) && left.contains { $0.contains(open.lastPathComponent) })
+        check("stray runtime entries removed", !exists(rt.appendingPathComponent("not-a-uuid")) && !exists(rt.appendingPathComponent("stray-file")))
+        check("state files removed", ["usage.json", "usage-seen.bin", "awake-state", "recovery.sh"].allSatisfy { !exists(sup.appendingPathComponent($0)) })
+        check("launchers removed", !exists(e.launchers))
+        check("logs removed", e.logs.allSatisfy { !exists($0) })
+        check("only the open copy is left", left.count == 1)
+        // 2. Run again: nothing new, no crash; once the account closes, its copy goes too.
+        left = Uninstaller.clean(e)
+        check("second run reports the same open copy only", left.count == 1)
+        e.isRunning = { _ in false }
+        left = Uninstaller.clean(e)
+        check("copy removed once closed", left.isEmpty && !exists(rt))
+        check("support folder kept for the archive", exists(sup.appendingPathComponent("Archive")))
+
+        // 2b. A file of the user's in the launchers folder stays, with the folder.
+        let ea2 = env(root.appendingPathComponent("a2"))
+        mk(ea2.launchers.appendingPathComponent("Claude Home.app/x"), "x"); mk(note, "mine")
+        _ = Uninstaller.clean(ea2)
+        check("user file in launchers kept, apps removed", exists(note) && !exists(ea2.launchers.appendingPathComponent("Claude Home.app")))
+
+        // 3. Nothing installed at all.
+        let b = root.appendingPathComponent("b")
+        check("empty Mac: nothing left, no folder made", Uninstaller.clean(env(b)).isEmpty && !exists(b))
+
+        // 4. Symlinks are removed as links, never followed.
+        let c = root.appendingPathComponent("c"), outside = root.appendingPathComponent("outside")
+        let ec = env(c)
+        mk(outside.appendingPathComponent("precious.txt"), "mine"); mk(outside.appendingPathComponent("Other.app/x"), "mine")
+        mk(ec.support); mk(ec.launchers.deletingLastPathComponent())
+        try? fm.createSymbolicLink(at: ec.launchers, withDestinationURL: outside)
+        try? fm.createSymbolicLink(at: ec.support.appendingPathComponent("link.txt"), withDestinationURL: outside.appendingPathComponent("precious.txt"))
+        try? fm.createSymbolicLink(at: ec.runtimes, withDestinationURL: outside)
+        left = Uninstaller.clean(ec)
+        check("linked folders removed as links", !exists(ec.launchers) && !exists(ec.runtimes) && !exists(ec.support.appendingPathComponent("link.txt")))
+        check("files behind links untouched", (try? String(contentsOf: outside.appendingPathComponent("precious.txt"), encoding: .utf8)) == "mine"
+              && exists(outside.appendingPathComponent("Other.app/x")))
+        check("symlink run reports nothing", left.isEmpty)
+
+        // 4b. A support folder moved elsewhere and linked back: cleaned inside, link and archive kept.
+        let f = root.appendingPathComponent("f"), moved = root.appendingPathComponent("moved")
+        let ef = env(f)
+        mk(moved.appendingPathComponent("usage.json"), "{}"); mk(moved.appendingPathComponent("Archive/a.jsonl"), "keep")
+        mk(moved.appendingPathComponent("Runtimes.noindex/\(UUID().uuidString)/Claude.app/x"), "x")
+        mk(ef.support.deletingLastPathComponent())
+        try? fm.createSymbolicLink(at: ef.support, withDestinationURL: moved)
+        calls = Calls()
+        left = Uninstaller.clean(ef)
+        check("linked support: link kept, archive kept", exists(ef.support) && exists(moved.appendingPathComponent("Archive/a.jsonl")))
+        check("linked support: dock tiles dropped under both paths", calls.dock.contains(ef.runtimes) && calls.dock.contains { $0.path.hasPrefix(moved.resolvingSymlinksInPath().path) })
+        check("linked support: state and copies removed", !exists(moved.appendingPathComponent("usage.json")) && !exists(moved.appendingPathComponent("Runtimes.noindex")))
+
+        // 5. Something that can't be deleted is reported, and the rest still goes.
+        let d = root.appendingPathComponent("d")
+        let ed = env(d)
+        let locked = ed.support.appendingPathComponent("locked")
+        mk(locked.appendingPathComponent("inner"), "x"); mk(ed.support.appendingPathComponent("usage.json"), "{}")
+        try? fm.setAttributes([.posixPermissions: 0o500], ofItemAtPath: locked.path)
+        left = Uninstaller.clean(ed)
+        check("undeletable item reported", getuid() == 0 || left.contains { $0.contains("locked") })
+        check("other items still removed", !exists(ed.support.appendingPathComponent("usage.json")))
+        try? fm.setAttributes([.posixPermissions: 0o700], ofItemAtPath: locked.path)
+
+        // 6. A declined password prompt and a session that couldn't be undone are both reported.
+        left = Uninstaller.clean(env(root.appendingPathComponent("e"), helper: true, helperRemoves: false, sessionClean: false, loginGoes: false))
+        check("login item still registered reported", left.contains { $0.contains("Login Items") })
+        check("declined helper removal reported", left.contains { $0.contains("sudoers") })
+        check("sleep left off reported", left.contains { $0.contains("disablesleep 0") })
+
+        // 7. Dock tiles: only tiles inside our folders go, not a sibling folder sharing the prefix.
+        let L = URL(fileURLWithPath: "/Users/x/Applications/MultiClaude Launchers")
+        let list: [[String: Any]] = [Dock.entry(for: L.appendingPathComponent("Work.app")),
+                                     Dock.entry(for: URL(fileURLWithPath: "/Users/x/Applications/MultiClaude Launchers 2/Work.app")),
+                                     Dock.entry(for: URL(fileURLWithPath: "/Applications/Safari.app")),
+                                     ["tile-type": "spacer-tile"]]
+        let kept = Dock.without(list, under: [L])
+        check("dock keeps others, spacers and look-alike folders", kept.count == 3 && !kept.contains { Dock.path(of: $0)?.hasPrefix(L.path + "/") ?? false })
+    }
+    try? fm.removeItem(at: root)
+    print(ok ? "all passed" : "SOME FAILED")
+    exit(ok ? 0 : 1)
+}
+
 if args.count == 2, args[1] == "--selftest-awake" {
     // Scroll flip on synthetic wheel (line), smooth mouse (continuous, no phase) and trackpad (continuous
     // with a gesture phase) events, and the keep-awake labels.
