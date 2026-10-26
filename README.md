@@ -25,6 +25,8 @@ brew install --cask quentincar0n/tap/multiclaude
 
 </div>
 
+> **Maintenance mode.** MultiClaude works and gets fixes when Claude changes under it, but no new features are planned. It is unofficial and relies on how the Claude app works today, so a Claude update can break parts of it. Pull requests are welcome.
+
 ## Why
 
 The Claude desktop app signs in to **one account at a time**. Plenty of people have more than one:
@@ -121,6 +123,26 @@ brew install --cask quentincar0n/tap/multiclaude
 
 Requires macOS 15 or later and the [Claude desktop app](https://claude.ai/download) in `/Applications`.
 
+### Uninstall
+
+Open **About** from the panel and click **Uninstall…**. MultiClaude ends any keep-awake session, removes the sudoers rule if you installed it (macOS asks for your password), the recovery agent, the login item, the profile apps and its copies of Claude, gives `claude://` links back to Claude, deletes its settings and moves itself to the Trash. Your accounts' folders, your conversation archive and Claude.app stay. With Homebrew, then run `brew uninstall --cask multiclaude`.
+
+If you already deleted the app, these are the things it may have left:
+
+```bash
+sudo rm -f /etc/sudoers.d/multiclaude
+```
+
+```bash
+launchctl bootout gui/$(id -u)/me.somalabs.multiclaude.recovery; rm -f ~/Library/LaunchAgents/me.somalabs.multiclaude.recovery.plist
+```
+
+```bash
+rm -rf ~/Applications/"MultiClaude Launchers" ~/Library/Application\ Support/MultiClaude/Runtimes.noindex
+```
+
+Then open Claude.app once so it takes its `claude://` links back. The conversation archive is in `~/Library/Application Support/MultiClaude/Archive`.
+
 ## Use
 
 1. Click the ✳ icon in the menu bar.
@@ -164,6 +186,9 @@ Claude asks every account to sign in again from time to time. Google and SSO sig
 **Does an open account's window show its own name and icon?**
 The icon, yes: with **App for Each Profile** on, each open account shows its profile icon in the Dock, ⌘-Tab and Mission Control. The name, no. A running app takes its name from inside its signed bundle, and renaming it there breaks the signature: Gatekeeper then reports the app as damaged. So an open window is still called Claude. The profile apps carry the name in Spotlight, Launchpad and on a pinned Dock tile, and the menu bar names the account in front.
 
+**Clicking a notification opens the wrong account.**
+Known limit, and MultiClaude can't fix it. Every account runs the same Claude app with the same bundle identifier, and macOS hands a notification click to one of them, not to the window that posted it. Changing the identifier would break Claude's signature and its Keychain access. Use the panel or the Dock to switch to the account instead.
+
 **How do I remove an account completely?**
 Right-click it and choose **Show Data Folder in Finder**, quit it, choose **Remove from List**, then trash the folder.
 
@@ -194,7 +219,7 @@ Push a `v*` tag and [GitHub Actions](.github/workflows/release.yml) builds a uni
 
 ## Contributing
 
-Issues and pull requests are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md). Ideas on the list: notarized builds, keyboard and VoiceOver access to the profile rows, and a Windows port.
+Issues and pull requests are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md). Fixes for breakage come first; new features are unlikely from the maintainer, but pull requests for them (notarized builds, keyboard and VoiceOver access to the profile rows, a Windows port) are welcome.
 
 ## License
 
