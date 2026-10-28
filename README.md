@@ -73,7 +73,7 @@ MultiClaude is that trick with a proper interface.
 - **Copy MCP servers between accounts.** Set your MCP servers up once, then right-click another profile and choose **Copy MCP Servers From**. Its config is backed up first.
 - **Open accounts at startup.** Right-click a profile and tick **Open When MultiClaude Starts**. With Launch at Login on, your accounts are waiting every morning.
 - **Duplicate a profile.** **Duplicate as New Profile** clones a profile's whole data folder, sign-in and chats included, into a new one. Handy for keeping your current history under a name like "Personal" before signing the default app in to another account. On APFS the copy is instant and takes no extra space.
-- **Right-click** a profile to rename it, move it, show its data folder in Finder, copy a shell alias for it, or take it off the list.
+- **Right-click** a profile to rename it, move it, show its data folder in Finder, copy a shell alias for it, take it off the list, or delete it with **Delete Profile…**.
 - **Imports your setup.** First launch picks up your default Claude account, any `--user-data-dir` aliases in `~/.zshrc`, and any `Claude-*` folder in Application Support. A `Claude-*` folder created later, by an alias for example, joins the list on its own.
 - **Folders follow names.** Rename a profile and its folder becomes `Claude-<Name>` the next time that account is closed. A link stays at the old path, so old aliases and Claude's own saved paths keep working.
 - **Sign-in that lands in the right window.** Claude's Google and SSO sign-in normally comes back to whichever Claude window opened first. MultiClaude makes each account sign in inside its own window, with nothing to click first.
@@ -165,7 +165,7 @@ Claude asks every account to sign in again from time to time. Google and SSO sig
 The icon, yes: with **App for Each Profile** on, each open account shows its profile icon in the Dock, ⌘-Tab and Mission Control. The name, no. A running app takes its name from inside its signed bundle, and renaming it there breaks the signature: Gatekeeper then reports the app as damaged. So an open window is still called Claude. The profile apps carry the name in Spotlight, Launchpad and on a pinned Dock tile, and the menu bar names the account in front.
 
 **How do I remove an account completely?**
-Right-click it and choose **Show Data Folder in Finder**, quit it, choose **Remove from List**, then trash the folder.
+Right-click it and choose **Delete Profile…**. MultiClaude closes the account and moves its data folder, its Claude Code folder and its app to the Trash, so you can still restore them from there. Your Keychain is not touched. **Remove from List** only takes it off the panel and keeps the data.
 
 **What about Windows and Linux?**
 MultiClaude is a native macOS app. A port is welcome.

@@ -792,13 +792,13 @@ final class Engine: ObservableObject {
     }
 
     // Quits a running profile and calls back once its process is gone (true) or after 15 s (false: still open,
-    // for example behind a quit dialog).
-    func quitAndWait(_ p: Profile, then done: @escaping @Sendable @MainActor (Bool) -> Void) {
+    // for example behind a quit dialog). The timeout is in seconds.
+    func quitAndWait(_ p: Profile, timeout: Int = 15, then done: @escaping @Sendable @MainActor (Bool) -> Void) {
         guard let app = running[p.id], !app.isTerminated else { done(true); return }
         userQuit[p.id] = Date()
         app.terminate()
         func poll(_ n: Int) {
-            if app.isTerminated || n > 60 {
+            if app.isTerminated || n > timeout * 4 {
                 let gone = app.isTerminated
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { MainActor.assumeIsolated { done(gone) } }
                 return
@@ -890,6 +890,63 @@ final class Engine: ObservableObject {
         defaults.set(Array(Set(ignoredFolders.map { $0.lowercased() } + [Folders.canonical(dir)])), forKey: "ignoredFolders")
         profiles.removeAll { $0.id == p.id }
         save()
+    }
+
+    // Quits the profile, then moves its data folder (and the links left by renames) and its Claude Code
+    // folder to the Trash. The launcher app, Dock tile and runtime copy go with the list entry (see save).
+    // The data folder goes first: if that fails, the profile stays on the list.
+    func delete(_ p: Profile) {
+        guard !p.isDefault, !busy.contains(p.id) else { return }
+        busy.insert(p.id)
+        quitAndWait(p, timeout: 10) { quit in
+            let e = Engine.shared
+            defer { e.busy.remove(p.id) }
+            guard let live = e.profiles.first(where: { $0.id == p.id }), let dir = live.dir else { return }
+            guard quit, !Folders.inUse(dir) else {
+                e.notice = "Couldn't delete \(live.name): it didn't quit. Nothing was changed."
+                return
+            }
+            let fm = FileManager.default
+            var links: [URL] = []   // paths that point at the folder: the old names from renames
+            for name in (try? fm.contentsOfDirectory(atPath: supportDir.path)) ?? [] where name.hasPrefix("Claude-") {
+                let url = supportDir.appendingPathComponent(name)
+                if let to = try? fm.destinationOfSymbolicLink(atPath: url.path),
+                   Folders.canonical(to) == Folders.canonical(dir) { links.append(url) }
+            }
+            let real = URL(fileURLWithPath: dir).resolvingSymlinksInPath()
+            let home = fm.homeDirectoryForCurrentUser.path
+            let unsafe = [home, "/", supportDir.path, supportDir.appendingPathComponent("Claude").path,
+                          home + "/Library", home + "/Library/Application Support"]
+            guard !unsafe.contains(where: { Folders.canonical($0) == Folders.canonical(real.path) }) else {
+                e.notice = "Couldn't delete \(live.name): its folder is \(real.path). Nothing was changed."
+                return
+            }
+            do {
+                if fm.fileExists(atPath: real.path) { try fm.trashItem(at: real, resultingItemURL: nil) }
+            } catch {
+                Log.write("delete \(live.name): \(error)")
+                e.notice = "Couldn't move \(live.name)'s folder to the Trash. Nothing was changed."
+                return
+            }
+            for url in links + [URL(fileURLWithPath: dir)] where (try? fm.destinationOfSymbolicLink(atPath: url.path)) != nil {
+                try? fm.trashItem(at: url, resultingItemURL: nil)
+            }
+            var note = "Moved \(live.name) to the Trash."
+            if let code = live.codeConfigDir, Folders.canonical(code) != Folders.canonical(home + "/.claude"),
+               fm.fileExists(atPath: code) {
+                if e.profiles.contains(where: { $0.id != p.id && $0.codeConfigDir.map(Folders.canonical) == Folders.canonical(code) }) {
+                    note += " Its Claude Code folder stays, because another profile uses it."
+                } else {
+                    do { try fm.trashItem(at: URL(fileURLWithPath: code), resultingItemURL: nil) } catch {
+                        Log.write("delete \(live.name) \(code): \(error)")
+                        note = "Moved \(live.name) to the Trash, but not its Claude Code folder \(code)."
+                    }
+                }
+            }
+            e.profiles.removeAll { $0.id == p.id }
+            e.save()
+            e.notice = note
+        }
     }
 
     private var ignoredFolders: [String] { defaults.stringArray(forKey: "ignoredFolders") ?? [] }
@@ -3596,6 +3653,7 @@ struct ProfileRow: View {
             if !profile.isDefault {
                 Divider()
                 Button("Remove from List") { engine.remove(profile) }
+                Button("Delete Profile…", role: .destructive) { Dialogs.delete(profile) }
             }
         }
     }
@@ -3622,12 +3680,23 @@ enum Dialogs {
               buttons: ["Show Chat Limits", "Cancel"]).0 == 0
     }
 
-    static func alert(_ title: String, _ text: String, buttons: [String], field: String? = nil) -> (Int, String) {
+    static func delete(_ p: Profile) {
+        let running = Engine.shared.isRunning(p)
+        let (choice, _) = alert("Delete \u{201C}\(p.name)\u{201D}?",
+                                (running ? "\(p.name) will be closed. " : "")
+                                + "Its data folder (the sign-in and chats), its Claude Code folder and its app are removed. The folders go to the Trash, so you can still put them back from there.",
+                                buttons: ["Cancel", "Move to Trash"], style: .warning)
+        guard choice == 1 else { return }
+        Engine.shared.delete(p)
+    }
+
+    static func alert(_ title: String, _ text: String, buttons: [String], field: String? = nil, style: NSAlert.Style = .informational) -> (Int, String) {
         PanelController.shared.close()
         NSApp.activate()
         let a = NSAlert()
         a.messageText = title
         a.informativeText = text
+        a.alertStyle = style
         buttons.forEach { a.addButton(withTitle: $0) }
         var input: NSTextField?
         if let field {
