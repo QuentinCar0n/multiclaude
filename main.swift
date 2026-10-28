@@ -896,7 +896,8 @@ final class Engine: ObservableObject {
     // folder to the Trash. The launcher app, Dock tile and runtime copy go with the list entry (see save).
     // The data folder goes first: if that fails, the profile stays on the list.
     func delete(_ p: Profile) {
-        guard !p.isDefault, !busy.contains(p.id) else { return }
+        // Demo profiles share real ~/.claude-<name> folders by name, so the demo never deletes.
+        guard !isDemo, !p.isDefault, !busy.contains(p.id) else { return }
         busy.insert(p.id)
         quitAndWait(p, timeout: 10) { quit in
             let e = Engine.shared
