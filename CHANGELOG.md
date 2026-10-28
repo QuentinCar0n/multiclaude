@@ -1,5 +1,10 @@
 # MultiClaude release notes
 
+## Unreleased
+
+### New
+- **Delete Profile…** in a profile's right-click menu closes the account and moves its data folder, its Claude Code folder and its app to the Trash, after you confirm. **Remove from List** still keeps the data.
+
 ## 1.6.1 (build 13), 2026-10-21
 
 ### Fixed
