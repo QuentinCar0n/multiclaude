@@ -184,7 +184,7 @@ enum Setting: String, CaseIterable, Identifiable {
         case .showActive: "Show Active Account in Menu Bar"
         case .showCount: "Show Count in Menu Bar"
         case .coloredIcon: "Colored Menu Bar Icon"
-        case .dockApps: "App for Each Profile"
+        case .dockApps: "Colored Claude Icon per Account"
         case .quitWithApp: "Quit Profiles with MultiClaude"
         case .trackUsage: "Track Token Usage"
         case .archiveCode: "Keep Claude Code Conversations"
@@ -358,7 +358,10 @@ final class Engine: ObservableObject {
         defaults.set(on, forKey: s.rawValue)
         if s == .shortcut || s == .profileShortcuts { updateHotKeys() }
         if s == .routeSignIn { on ? holdLinks() : LinkRelay.giveBack() }
-        if s == .dockApps { syncLaunchers() }
+        if s == .dockApps {
+            syncLaunchers()
+            if on { noteReopenForIcons() }
+        }
         if s == .reverseMouse || s == .reverseTrackpad { updateScroll() }
         if s == .manageClaude { setManaging(on) }
         if s == .trackUsage || s == .archiveCode || s == .chatLimits { Usage.shared.refresh(force: true) }
@@ -981,6 +984,15 @@ final class Engine: ObservableObject {
         let name = raw.trimmingCharacters(in: .whitespaces)
         profiles[i].appName = name.isEmpty || name == Profile(name: p.name, dir: p.dir).dockAppName ? nil : name
         save()
+    }
+
+    // An account that is already open keeps running from Claude.app, so it shows its colored icon only
+    // once it is reopened from MultiClaude.
+    private func noteReopenForIcons() {
+        let plain = profiles.filter { p in running[p.id].map { runtimeOwner($0) == nil } ?? false }
+        guard !plain.isEmpty else { return }
+        let names = ListFormatter.localizedString(byJoining: plain.map(\.name))
+        notice = "Quit and reopen \(names) from MultiClaude to see \(plain.count == 1 ? "its" : "their") colored icon."
     }
 
     func addToDock(_ p: Profile) {
