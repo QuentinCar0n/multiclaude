@@ -360,7 +360,7 @@ final class Engine: ObservableObject {
         if s == .routeSignIn { on ? holdLinks() : LinkRelay.giveBack() }
         if s == .dockApps {
             syncLaunchers()
-            if on { noteReopenForIcons() }
+            on ? noteReopenForIcons() : clearIconNotice()
         }
         if s == .reverseMouse || s == .reverseTrackpad { updateScroll() }
         if s == .manageClaude { setManaging(on) }
@@ -619,6 +619,7 @@ final class Engine: ObservableObject {
             frontID = newFront
             onChange?()
         }
+        if iconNotice != nil && (iconNotice != notice || withoutOwnIcon().isEmpty) { clearIconNotice() }
         reopenAfterUpdate(now: now)
         alignFolders()   // after `running` is current, so an open profile is never moved
     }
@@ -986,13 +987,30 @@ final class Engine: ObservableObject {
         save()
     }
 
-    // An account that is already open keeps running from Claude.app, so it shows its colored icon only
-    // once it is reopened from MultiClaude.
+    // An account that is already open (or starting) runs from Claude.app, so it shows its colored icon
+    // only once it is reopened from MultiClaude.
+    private var iconNotice: String?
+
+    private func withoutOwnIcon() -> [Profile] {
+        profiles.filter { p in
+            if let app = running[p.id] { return runtimeOwner(app)?.id != p.id }
+            return pending[p.id] != nil
+        }
+    }
+
     private func noteReopenForIcons() {
-        let plain = profiles.filter { p in running[p.id].map { runtimeOwner($0) == nil } ?? false }
+        // Never over a sign-in or a message already up, such as a profile app that couldn't be written.
+        guard signIn == nil, notice == nil else { return }
+        let plain = withoutOwnIcon()
         guard !plain.isEmpty else { return }
         let names = ListFormatter.localizedString(byJoining: plain.map(\.name))
         notice = "Quit and reopen \(names) from MultiClaude to see \(plain.count == 1 ? "its" : "their") colored icon."
+        iconNotice = notice
+    }
+
+    private func clearIconNotice() {
+        if let shown = iconNotice, notice == shown { notice = nil }
+        iconNotice = nil
     }
 
     func addToDock(_ p: Profile) {
