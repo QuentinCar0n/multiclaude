@@ -1,5 +1,10 @@
 # MultiClaude release notes
 
+## Unreleased
+
+### Fixed
+- **A notification opens the account that sent it.** Every Claude account posts its notifications under the same app, and macOS hands every click to whichever Claude window registered with Notification Center last, often a different account. MultiClaude now reads two public system log lines, which Claude process posted the notification and which one got the click, and brings forward the account that posted it. Only notification ids and process ids are read, never a notification's text. **Open Notifications in Their Account** in Settings, on by default.
+
 ## 1.6.1 (build 13), 2026-10-21
 
 ### Fixed

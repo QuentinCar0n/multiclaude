@@ -161,13 +161,13 @@ enum Seed {
 // MARK: - Settings
 
 enum Setting: String, CaseIterable, Identifiable {
-    case manageClaude, launchAtLogin, autoUpdate, routeSignIn, reopenAfterUpdate, shortcut, profileShortcuts, showActive, showCount, coloredIcon, dockApps, quitWithApp
+    case manageClaude, launchAtLogin, autoUpdate, routeSignIn, routeNotifications, reopenAfterUpdate, shortcut, profileShortcuts, showActive, showCount, coloredIcon, dockApps, quitWithApp
     case trackUsage, archiveCode, chatLimits
     case reverseMouse, reverseTrackpad
 
-    static let onByDefault: Set<Setting> = [.manageClaude, .trackUsage, .archiveCode, .autoUpdate, .routeSignIn, .reopenAfterUpdate, .showActive, .showCount]
+    static let onByDefault: Set<Setting> = [.manageClaude, .trackUsage, .archiveCode, .autoUpdate, .routeSignIn, .routeNotifications, .reopenAfterUpdate, .showActive, .showCount]
     // Settings that only mean something while MultiClaude manages Claude accounts; hidden when it doesn't.
-    static let claudeOnly: Set<Setting> = [.routeSignIn, .reopenAfterUpdate, .profileShortcuts, .showActive, .showCount, .dockApps, .quitWithApp,
+    static let claudeOnly: Set<Setting> = [.routeSignIn, .routeNotifications, .reopenAfterUpdate, .profileShortcuts, .showActive, .showCount, .dockApps, .quitWithApp,
                                          .trackUsage, .archiveCode, .chatLimits]
 
     var id: String { rawValue }
@@ -178,6 +178,7 @@ enum Setting: String, CaseIterable, Identifiable {
         case .launchAtLogin: "Launch at Login"
         case .autoUpdate: "Update MultiClaude Automatically"
         case .routeSignIn: "Sign In in Each Account's Window"
+        case .routeNotifications: "Open Notifications in Their Account"
         case .reopenAfterUpdate: "Reopen After Claude Updates"
         case .shortcut: "Keyboard Shortcut"
         case .profileShortcuts: "Profile Shortcuts"
@@ -200,6 +201,7 @@ enum Setting: String, CaseIterable, Identifiable {
         case .launchAtLogin: "power"
         case .autoUpdate: "arrow.down.circle"
         case .routeSignIn: "person.badge.key"
+        case .routeNotifications: "bell.badge"
         case .reopenAfterUpdate: "arrow.clockwise"
         case .shortcut: "command"
         case .profileShortcuts: "keyboard"
@@ -317,6 +319,7 @@ final class Engine: ObservableObject {
             }
         }
         if !isDemo { DispatchQueue.main.asyncAfter(deadline: .now() + 2) { Engine.shared.holdLinks() } }
+        watchNotifications()
         let afterSelfUpdate = defaults.string(forKey: "updatedTo") != nil
         if let to = defaults.string(forKey: "updatedTo") {
             defaults.removeObject(forKey: "updatedTo")
@@ -358,6 +361,7 @@ final class Engine: ObservableObject {
         defaults.set(on, forKey: s.rawValue)
         if s == .shortcut || s == .profileShortcuts { updateHotKeys() }
         if s == .routeSignIn { on ? holdLinks() : LinkRelay.giveBack() }
+        if s == .routeNotifications { watchNotifications() }
         if s == .dockApps { syncLaunchers() }
         if s == .reverseMouse || s == .reverseTrackpad { updateScroll() }
         if s == .manageClaude { setManaging(on) }
@@ -380,6 +384,7 @@ final class Engine: ObservableObject {
             pending = [:]
         }
         updateHotKeys()
+        watchNotifications()
         refresh()
     }
 
@@ -557,6 +562,53 @@ final class Engine: ObservableObject {
             + (reopen.isEmpty ? "" : " Reopened " + ListFormatter.localizedString(byJoining: reopen.map(\.name)) + ".")
     }
     func show(notice text: String) { notice = text }
+
+    // MARK: notification clicks
+
+    // macOS hands a click on any Claude notification to the one Claude process that registered with
+    // Notification Center last, so it brings that account forward whichever account posted it.
+    // NoticeWatch reports who posted each notification and who got the click; when they differ,
+    // the account that posted it is brought forward.
+    private var posters: [String: (id: UUID, at: Date)] = [:]   // notification id -> profile that posted it
+
+    func watchNotifications() {
+        if !isDemo, !isCLI, managing, isOn(.routeNotifications) {
+            NoticeWatch.start { event, pid in MainActor.assumeIsolated { Engine.shared.noticeEvent(event, from: pid) } }
+        } else {
+            NoticeWatch.stop()
+            posters = [:]
+        }
+    }
+
+    private func profileID(pid: pid_t) -> UUID? {
+        running.first { $0.value.processIdentifier == pid }?.key
+    }
+
+    func noticeEvent(_ event: NoticeWatch.Event, from pid: pid_t) {
+        switch event {
+        case .posted(let ident):
+            if profileID(pid: pid) == nil { refresh() }
+            guard let id = profileID(pid: pid) else { return }
+            posters[ident] = (id, Date())
+            if posters.count > 200, let oldest = posters.min(by: { $0.value.at < $1.value.at })?.key { posters[oldest] = nil }
+        case .clicked(let ident, let client):
+            guard let id = posters[ident]?.id, running[id]?.processIdentifier != client,
+                  let p = profiles.first(where: { $0.id == id }) else { return }
+            Log.write("notification click went to pid \(client); bringing \(p.name) forward")
+            // macOS brings the wrong window forward just after the click, so follow it, and check once more.
+            for delay in [0.3, 1.0] {
+                DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
+                    let e = Engine.shared
+                    guard let p = e.profiles.first(where: { $0.id == id }) else { return }
+                    if let app = e.running[id] {
+                        if NSWorkspace.shared.frontmostApplication?.processIdentifier != app.processIdentifier { LinkRelay.bringForward(app) }
+                    } else if delay < 1 {
+                        e.open(p)
+                    }
+                }
+            }
+        }
+    }
 
     // MARK: running instances
 
@@ -1454,6 +1506,100 @@ enum UpdateSignature {
               let raw = Data(base64Encoded: publicKeyBase64),
               let key = try? Curve25519.Signing.PublicKey(rawRepresentation: raw) else { return false }
         return key.isValidSignature(sig, for: data)
+    }
+}
+
+// Follows the two public system log lines that tie a Claude notification to a process: the Claude
+// process that posted it, and the process usernoted sent the click to. Only notification ids and
+// process ids are read, never a notification's title or text.
+enum NoticeWatch {
+    enum Event: Equatable {
+        case posted(String)              // notification id, posted by the line's process
+        case clicked(String, pid_t)      // notification id, and the Claude process the click went to
+    }
+
+    static let predicate = #"(process == "Claude" AND subsystem == "com.apple.UserNotifications" AND eventMessage CONTAINS "Adding notification request")"#
+        + #" OR (process == "usernoted" AND eventMessage CONTAINS "about response" AND eventMessage CONTAINS "\#(claudeBundleID):")"#
+
+    static func parse(_ message: String) -> Event? {
+        let posted = "[\(claudeBundleID)] Adding notification request "
+        if message.hasPrefix(posted) {
+            let ident = message.dropFirst(posted.count).prefix { $0 != " " }
+            return ident.isEmpty ? nil : .posted(String(ident))
+        }
+        // Only a click that opens the app: dismissals and background actions leave the windows alone.
+        let client = "Notifying UserNotifications client \(claudeBundleID):"
+        guard message.hasPrefix(client), message.contains("foreground: true"),
+              let pid = pid_t(message.dropFirst(client.count).prefix { $0.isNumber }),
+              let i = message.range(of: "ident:\"") else { return nil }
+        let ident = message[i.upperBound...].prefix { $0 != "\"" }
+        return ident.isEmpty ? nil : .clicked(String(ident), pid)
+    }
+
+    // One `log stream` --style ndjson line: the message and the process that logged it.
+    static func parseLine(_ line: Substring) -> (Event, pid_t)? {
+        guard let obj = try? JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any],
+              let message = obj["eventMessage"] as? String, let pid = obj["processID"] as? Int,
+              let event = parse(message) else { return nil }
+        return (event, pid_t(pid))
+    }
+
+    private static var task: Process?
+    private static var handler: ((Event, pid_t) -> Void)?
+    private static var failures = 0
+
+    @MainActor static func start(_ onEvent: @escaping (Event, pid_t) -> Void) {
+        handler = onEvent
+        guard task == nil else { return }
+        let t = Process(), out = Pipe()
+        t.executableURL = URL(fileURLWithPath: "/usr/bin/log")
+        t.arguments = ["stream", "--style", "ndjson", "--level", "default", "--predicate", predicate]
+        t.standardOutput = out
+        t.standardError = FileHandle.nullDevice
+        let buffer = LineBuffer()   // the handler runs on one queue at a time
+        out.fileHandleForReading.readabilityHandler = { h in
+            let chunk = h.availableData
+            guard !chunk.isEmpty else { h.readabilityHandler = nil; return }
+            for line in buffer.lines(adding: chunk) {
+                guard let (event, pid) = parseLine(Substring(line)) else { continue }
+                DispatchQueue.main.async { MainActor.assumeIsolated { handler?(event, pid) } }
+            }
+        }
+        t.terminationHandler = { ended in
+            DispatchQueue.main.async {
+                MainActor.assumeIsolated {
+                    guard task === ended else { return }   // stopped on purpose
+                    task = nil
+                    failures += 1
+                    if failures == 1 || failures % 20 == 0 { Log.write("notification watch stopped (\(ended.terminationStatus)); restarting") }
+                    let delay = Double(min(failures, 6)) * 10
+                    DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
+                        if task == nil, let h = handler { start(h) }
+                    }
+                }
+            }
+        }
+        do { try t.run(); task = t } catch { Log.write("notification watch didn't start: \(error.localizedDescription)") }
+    }
+
+    final class LineBuffer: @unchecked Sendable {
+        private var data = Data()
+        func lines(adding chunk: Data) -> [String] {
+            data.append(chunk)
+            var out: [String] = []
+            while let nl = data.firstIndex(of: 0x0A) {
+                out.append(String(decoding: data[data.startIndex..<nl], as: UTF8.self))
+                data.removeSubrange(data.startIndex...nl)
+            }
+            return out
+        }
+    }
+
+    @MainActor static func stop() {
+        handler = nil
+        guard let t = task else { return }
+        task = nil
+        if t.isRunning { t.terminate() }
     }
 }
 
@@ -4746,6 +4892,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationWillTerminate(_ n: Notification) {
         Dock.pendingRestore?()
         LinkRelay.giveBack()
+        NoticeWatch.stop()
         if Engine.shared.managing && Engine.shared.isOn(.quitWithApp) && !Updater.relaunching { Engine.shared.quitAll() }
         Awake.shared.deactivate()
     }
@@ -4960,6 +5107,19 @@ if args.count == 2, args[1] == "--selftest-profiles" {
           Updater.trusted("https://github.com/QuentinCar0n/multiclaude/releases/download/v1/x.zip") != nil
           && Updater.trusted("https://github.com/QuentinCar0n/multiclaude/releases/download/../../../evil/x.zip") == nil
           && Updater.trusted("https://github.com:8443/QuentinCar0n/multiclaude/releases/download/v1/x.zip") == nil)
+    // Lines as macOS 26 logs them.
+    check("a Claude notification post is read", NoticeWatch.parse(
+        "[com.anthropic.claudefordesktop] Adding notification request 2E5D-B886 to destinations: Default, contentDate: (null)") == .posted("2E5D-B886"))
+    let click = #"Notifying UserNotifications client com.anthropic.claudefordesktop:3913 about response <NotificationRecord app:"com.anthropic.claudefordesktop" ident:"2E5D-B886" req:"idle-local_1" uuid:"BD346EC1" source:"E9D0A320" alertStyle:"banner" dismissAfterDefaultAction:true <response action: contents actIdent:  foreground: true text: nil> >"#
+    check("a click on a Claude notification is read", NoticeWatch.parse(click) == .clicked("2E5D-B886", 3913))
+    check("a click that doesn't open the app is ignored", NoticeWatch.parse(click.replacingOccurrences(of: "foreground: true", with: "foreground: false")) == nil)
+    check("another app's notifications are ignored",
+          NoticeWatch.parse("[com.tinyspeck.slackmacgap] Adding notification request 1234-ABCD to destinations: Default") == nil
+          && NoticeWatch.parse(click.replacingOccurrences(of: "client com.anthropic.claudefordesktop:", with: "client com.tinyspeck.slackmacgap:")) == nil)
+    check("a log stream line gives the posting process",
+          NoticeWatch.parseLine(#"{"processID":2716,"eventMessage":"[com.anthropic.claudefordesktop] Adding notification request 38C9-4464 to destinations: Default"}"#)
+          .map { $0.0 == .posted("38C9-4464") && $0.1 == 2716 } == true
+          && NoticeWatch.parseLine("Filtering the log data using \"process == Claude\"") == nil)
     try? FileManager.default.removeItem(at: tmp)
     exit(ok ? 0 : 1)
 }
