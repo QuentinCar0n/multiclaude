@@ -1,5 +1,11 @@
 # MultiClaude release notes
 
+## Unreleased
+
+### Changed
+- **App for Each Profile is now Colored Claude Icon per Account.** The old name didn't say it gives every account its own colored Claude icon in the Dock, ⌘-Tab and Mission Control, so it was easy to miss next to Colored Menu Bar Icon. The setting itself is unchanged.
+- **Turning it on says which accounts to reopen.** An account that is already open keeps the plain icon until it is reopened from MultiClaude, and the panel now names those accounts.
+
 ## 1.6.1 (build 13), 2026-10-21
 
 ### Fixed
