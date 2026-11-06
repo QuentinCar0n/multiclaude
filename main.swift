@@ -184,7 +184,7 @@ enum Setting: String, CaseIterable, Identifiable {
         case .showActive: "Show Active Account in Menu Bar"
         case .showCount: "Show Count in Menu Bar"
         case .coloredIcon: "Colored Menu Bar Icon"
-        case .dockApps: "App for Each Profile"
+        case .dockApps: "Colored Claude Icon per Account"
         case .quitWithApp: "Quit Profiles with MultiClaude"
         case .trackUsage: "Track Token Usage"
         case .archiveCode: "Keep Claude Code Conversations"
@@ -358,7 +358,10 @@ final class Engine: ObservableObject {
         defaults.set(on, forKey: s.rawValue)
         if s == .shortcut || s == .profileShortcuts { updateHotKeys() }
         if s == .routeSignIn { on ? holdLinks() : LinkRelay.giveBack() }
-        if s == .dockApps { syncLaunchers() }
+        if s == .dockApps {
+            syncLaunchers()
+            on ? noteReopenForIcons() : clearIconNotice()
+        }
         if s == .reverseMouse || s == .reverseTrackpad { updateScroll() }
         if s == .manageClaude { setManaging(on) }
         if s == .trackUsage || s == .archiveCode || s == .chatLimits { Usage.shared.refresh(force: true) }
@@ -616,6 +619,7 @@ final class Engine: ObservableObject {
             frontID = newFront
             onChange?()
         }
+        if iconNotice != nil && (iconNotice != notice || withoutOwnIcon().isEmpty) { clearIconNotice() }
         reopenAfterUpdate(now: now)
         alignFolders()   // after `running` is current, so an open profile is never moved
     }
@@ -1039,6 +1043,32 @@ final class Engine: ObservableObject {
         let name = raw.trimmingCharacters(in: .whitespaces)
         profiles[i].appName = name.isEmpty || name == Profile(name: p.name, dir: p.dir).dockAppName ? nil : name
         save()
+    }
+
+    // An account that is already open (or starting) runs from Claude.app, so it shows its colored icon
+    // only once it is reopened from MultiClaude.
+    private var iconNotice: String?
+
+    private func withoutOwnIcon() -> [Profile] {
+        profiles.filter { p in
+            if let app = running[p.id] { return runtimeOwner(app)?.id != p.id }
+            return pending[p.id] != nil
+        }
+    }
+
+    private func noteReopenForIcons() {
+        // Never over a sign-in or a message already up, such as a profile app that couldn't be written.
+        guard signIn == nil, notice == nil else { return }
+        let plain = withoutOwnIcon()
+        guard !plain.isEmpty else { return }
+        let names = ListFormatter.localizedString(byJoining: plain.map(\.name))
+        notice = "Quit and reopen \(names) from MultiClaude to see \(plain.count == 1 ? "its" : "their") colored icon."
+        iconNotice = notice
+    }
+
+    private func clearIconNotice() {
+        if let shown = iconNotice, notice == shown { notice = nil }
+        iconNotice = nil
     }
 
     func addToDock(_ p: Profile) {
