@@ -235,6 +235,9 @@ final class Engine: ObservableObject {
     @Published private(set) var running: [UUID: NSRunningApplication] = [:]
     @Published private(set) var frontID: UUID?     // profile of the frontmost Claude window
     @Published private(set) var notice: String?    // one-line message at the top of the panel
+    // Set when the saved list could not be read: the rebuilt profiles have new ids, so every launcher and
+    // profile copy would look orphaned. Nothing is deleted for the rest of this run.
+    private var keepOrphans = false
 
     var onChange: (() -> Void)?
     var onPanelHotKey: (() -> Void)?
@@ -277,7 +280,10 @@ final class Engine: ObservableObject {
             }
             profiles = Seed.profiles()
         }
-        if unreadable { notice = "MultiClaude couldn't read its saved profiles and rebuilt the list from your Claude folders." }
+        if unreadable {
+            notice = "MultiClaude couldn't read its saved profiles and rebuilt the list from your Claude folders."
+            keepOrphans = true
+        }
         for i in profiles.indices where profiles[i].color == nil { profiles[i].color = nextColor() }
         if !isCLI {
             // Copies cut short by a quit or crash during Duplicate (see Duplicate.clone).
@@ -634,7 +640,7 @@ final class Engine: ObservableObject {
     // kept from a running copy. It would show the default account in that profile's icon, so close it and
     // open the profile on its own account. Our own launches are pending and skipped.
     func reopenBareCopy(_ app: NSRunningApplication?, of p: Profile) {
-        if pending[p.id] != nil { return }
+        if isCLI || pending[p.id] != nil { return }   // a CLI run exits before it could reopen the copy
         if let t = bareHandled[p.id], Date().timeIntervalSince(t) < 20 { return }
         bareHandled[p.id] = Date()
         Log.write("\(p.name)'s copy of Claude started without its folder; reopening it on its own account")
@@ -1020,6 +1026,7 @@ final class Engine: ObservableObject {
     // setting is on, none while it's off. Apps that move or go away are moved or taken off the Dock too.
     func syncLaunchers() {
         guard !isDemo, !isCLI else { return }
+        if keepOrphans { Log.write("profile list was rebuilt; launchers and profile copies left as they are"); return }
         let result = Launchers.sync(isOn(.dockApps) ? profiles : [], in: Launchers.folder)
         Runtimes.prune(keeping: isOn(.dockApps) ? Set(profiles.map(\.id)) : [])
         // Restyle each profile's own Claude now rather than at its next launch (only the icon if it's open).
@@ -2697,8 +2704,9 @@ enum ChatLimits {
         defer { sqlite3_close(h) }
         var version = 0
         var st: OpaquePointer?
-        if sqlite3_prepare_v2(h, "SELECT value FROM meta WHERE key='version'", -1, &st, nil) == SQLITE_OK, sqlite3_step(st) == SQLITE_ROW {
-            version = Int(String(cString: sqlite3_column_text(st, 0))) ?? 0
+        if sqlite3_prepare_v2(h, "SELECT value FROM meta WHERE key='version'", -1, &st, nil) == SQLITE_OK, sqlite3_step(st) == SQLITE_ROW,
+           let text = sqlite3_column_text(st, 0) {
+            version = Int(String(cString: text)) ?? 0
         }
         sqlite3_finalize(st)
         let q = "SELECT encrypted_value FROM cookies WHERE name='sessionKey' AND host_key LIKE '%claude.ai' ORDER BY expires_utc DESC LIMIT 1"
@@ -2710,7 +2718,8 @@ enum ChatLimits {
     }
 
     static func get(_ path: String, _ cookie: String) async throws -> Any {
-        var req = URLRequest(url: URL(string: "https://claude.ai" + path)!, timeoutInterval: 20)
+        guard let url = URL(string: "https://claude.ai" + path) else { throw URLError(.badURL) }
+        var req = URLRequest(url: url, timeoutInterval: 20)
         req.setValue("sessionKey=" + cookie, forHTTPHeaderField: "Cookie")
         req.setValue("application/json", forHTTPHeaderField: "Accept")
         req.setValue("MultiClaude/\(appVersion)", forHTTPHeaderField: "User-Agent")
@@ -2983,8 +2992,18 @@ enum Transcript {
 // MARK: - App icon (drawn, so the bundle needs no image files)
 
 enum AppIcon {
-    // MultiClaude's own icon: the Claude asterisk on an orange tile.
-    static func image(_ side: CGFloat) -> NSImage { tile(side, color: .claude, letter: nil) }
+    // MultiClaude's own icon: the Claude asterisk glowing inside frosted glass, the same look as the other
+    // Soma Labs apps. The art ships as Resources/AppIcon.png (assets/AppIcon.png in the repo); the drawn
+    // orange tile stands in when the file is missing, as in a bare `swiftc` build.
+    static let master: NSImage? = Bundle.main.url(forResource: "AppIcon", withExtension: "png").flatMap(NSImage.init(contentsOf:))
+
+    static func image(_ side: CGFloat) -> NSImage {
+        guard let master else { return tile(side, color: .claude, letter: nil) }
+        return NSImage(size: NSSize(width: side, height: side), flipped: false) { r in
+            master.draw(in: r, from: .zero, operation: .sourceOver, fraction: 1)
+            return true
+        }
+    }
 
     // A tile in `color` with the white asterisk, or with `letter` and a small asterisk in the corner
     // (the icon of a profile's app).
@@ -3473,6 +3492,9 @@ enum Dock {
     // The Dock keeps a pinned app's old icon even across restarts, so a tile in `refresh` is taken off
     // the Dock and put back in the same place a moment later, which makes the Dock read the new icon.
     static func update(moved: [(from: URL, to: URL)], removed: [URL], refresh: [URL] = []) {
+        // A restore still waiting from an earlier call goes first: the list read below must hold its tiles,
+        // or the closure replacing it would never put them back.
+        pendingRestore?()
         let gone = Set(removed.map(\.standardizedFileURL.path))
         let moves = Dictionary(moved.map { ($0.from.standardizedFileURL.path, $0.to) }, uniquingKeysWith: { a, _ in a })
         let redo = Set(refresh.map(\.standardizedFileURL.path))
@@ -5398,6 +5420,16 @@ if args.count == 2, args[1] == "--unregister-login" {
 }
 if args.count == 3, args[1] == "--export-iconset" {
     MainActor.assumeIsolated { AppIcon.exportIconset(to: args[2]) }
+    exit(0)
+}
+
+// One MultiClaude at a time: a second copy (Homebrew and ~/Applications, or a build run beside the
+// installed one) would write its own profile list over the first one's and race it for claude:// links.
+if !isDemo, let me = Bundle.main.bundleIdentifier,
+   let other = NSRunningApplication.runningApplications(withBundleIdentifier: me)
+       .first(where: { $0.processIdentifier != getpid() && !$0.isTerminated }) {
+    Log.write("another MultiClaude is running (pid \(other.processIdentifier), \(other.bundleURL?.path ?? "?")); quitting this one")
+    other.activate()
     exit(0)
 }
 
