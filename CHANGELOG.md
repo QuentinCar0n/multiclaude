@@ -1,5 +1,11 @@
 # MultiClaude release notes
 
+## 1.7.1 (build 15), 2026-11-08
+
+### Fixed
+- **Claude Code usage lands on the right account.** A session read before its account listed it stayed under Terminal for good. It now moves to the account once the account claims it, with its past days and its archived transcript.
+- **Chat limits no longer risk a crash.** Two refreshes at once could write the cookie key at the same time. The key is now behind a lock, and macOS still asks for the Keychain only once.
+
 ## 1.7 (build 14), 2026-11-08
 
 ### New
