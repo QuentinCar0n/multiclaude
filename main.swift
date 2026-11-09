@@ -2442,6 +2442,15 @@ struct UsageTotals: Codable, Equatable {
         Self(input: a.input + b.input, output: a.output + b.output, cacheWrite: a.cacheWrite + b.cacheWrite,
              cacheRead: a.cacheRead + b.cacheRead, messages: a.messages + b.messages)
     }
+    static func - (a: Self, b: Self) -> Self {
+        Self(input: a.input - b.input, output: a.output - b.output, cacheWrite: a.cacheWrite - b.cacheWrite,
+             cacheRead: a.cacheRead - b.cacheRead, messages: a.messages - b.messages)
+    }
+    // `t`, cut down field by field to what this holds.
+    func clamped(to t: Self) -> Self {
+        Self(input: min(input, t.input), output: min(output, t.output), cacheWrite: min(cacheWrite, t.cacheWrite),
+             cacheRead: min(cacheRead, t.cacheRead), messages: min(messages, t.messages))
+    }
 }
 
 // One transcript source: a folder of JSONL files, and whose files they are.
@@ -2558,6 +2567,16 @@ final class UsageScan: @unchecked Sendable {
                 let path = f.path
                 guard let size = (try? f.resourceValues(forKeys: [.fileSizeKey]))?.fileSize.map(UInt64.init) else { continue }
                 var mark = state.files[path] ?? FileMark(offset: 0, owner: src.owner(f))
+                // A Code session is credited to Terminal until an account lists it, and its transcript can be
+                // read before that list is. Once an account claims it, what was counted moves over.
+                if mark.owner == Self.terminal, case let now = src.owner(f), now != Self.terminal {
+                    reassign(f, upTo: mark.offset, from: mark.owner, to: now)
+                    if archiveEnabled { try? fm.removeItem(at: archivePath(f, root: src.root, as: src.archiveName, owner: mark.owner)) }
+                    mark.owner = now
+                    state.files[path] = mark
+                    changed = true
+                    if archiveEnabled, size <= mark.offset { archive(f, root: src.root, as: src.archiveName, owner: now) }
+                }
                 if size < mark.offset { mark.offset = 0 }   // rewritten: counted ids are skipped anyway
                 guard size > mark.offset else { continue }
                 mark.offset = autoreleasepool { read(f, from: mark.offset, owner: mark.owner) }
@@ -2572,24 +2591,48 @@ final class UsageScan: @unchecked Sendable {
 
     // Parses complete lines from `offset`; returns the offset after the last complete line.
     private func read(_ f: URL, from offset: UInt64, owner: String) -> UInt64 {
+        usageLines(f, from: offset, upTo: .max) { count($0, owner: owner) }
+    }
+
+    // Calls `body` on each complete line holding usage between `offset` and `end`; returns the offset after
+    // the last complete line read.
+    private func usageLines(_ f: URL, from offset: UInt64, upTo end: UInt64, _ body: (Data) -> Void) -> UInt64 {
         guard let h = try? FileHandle(forReadingFrom: f) else { return offset }
         defer { try? h.close() }
         try? h.seek(toOffset: offset)
         var pos = offset
         var carry = Data()
         let marker = Data("\"usage\"".utf8)
-        while let chunk = try? h.read(upToCount: 4 << 20), !chunk.isEmpty {
+        while pos < end, let chunk = try? h.read(upToCount: 4 << 20), !chunk.isEmpty {
             carry.append(chunk)
             var start = carry.startIndex
-            while let nl = carry[start...].firstIndex(of: 0x0A) {
+            while pos < end, let nl = carry[start...].firstIndex(of: 0x0A) {
                 let line = carry[start..<nl]
-                if line.range(of: marker) != nil { autoreleasepool { count(line, owner: owner) } }
+                if line.range(of: marker) != nil { autoreleasepool { body(line) } }
                 pos += UInt64(nl - start + 1)
                 start = carry.index(after: nl)
             }
             carry = Data(carry[start...])
         }
         return pos
+    }
+
+    // Moves what the first `offset` bytes of `f` added under `old` to `new`. A reply also counted from
+    // another file was only added once, so no bucket is taken below zero.
+    private func reassign(_ f: URL, upTo offset: UInt64, from old: String, to new: String) {
+        guard offset > 0 else { return }
+        _ = usageLines(f, from: 0, upTo: offset) { line in
+            guard let (day, model, t) = Self.parse(line) else { return }
+            let have = state.days[day]?[old]?[model] ?? UsageTotals()
+            let moved = have.clamped(to: t)
+            guard moved != UsageTotals() else { return }
+            let left = have - moved
+            state.days[day, default: [:]][old, default: [:]][model] = left == UsageTotals() ? nil : left
+            if state.days[day]?[old]?.isEmpty == true { state.days[day]?[old] = nil }
+            state.days[day, default: [:]][new, default: [:]][model, default: UsageTotals()] =
+                (state.days[day]?[new]?[model] ?? UsageTotals()) + moved
+        }
+        Log.write("usage: a Code session moved from Terminal to a profile")
     }
 
     static let dayFormat: DateFormatter = {
@@ -2601,29 +2644,43 @@ final class UsageScan: @unchecked Sendable {
 
     private func count(_ line: Data, owner: String) {
         guard let j = try? JSONSerialization.jsonObject(with: line) as? [String: Any],
-              let m = j["message"] as? [String: Any], let u = m["usage"] as? [String: Any],
-              let model = m["model"] as? String, model != "<synthetic>" else { return }
+              let m = j["message"] as? [String: Any] else { return }
         let key = (m["id"] as? String ?? "") + "|" + (j["requestId"] as? String ?? "")
+        guard let (day, model, t) = Self.parse(j) else { return }
         if key != "|" {
             guard seen.insert(Self.fnv(key)).inserted else { return }
         }
+        state.days[day, default: [:]][owner, default: [:]][model, default: UsageTotals()] =
+            (state.days[day]?[owner]?[model] ?? UsageTotals()) + t
+    }
+
+    static func parse(_ line: Data) -> (day: String, model: String, totals: UsageTotals)? {
+        guard let j = try? JSONSerialization.jsonObject(with: line) as? [String: Any] else { return nil }
+        return parse(j)
+    }
+
+    static func parse(_ j: [String: Any]) -> (day: String, model: String, totals: UsageTotals)? {
+        guard let m = j["message"] as? [String: Any], let u = m["usage"] as? [String: Any],
+              let model = m["model"] as? String, model != "<synthetic>" else { return nil }
         let stamp = (j["timestamp"] as? String).flatMap { try? Date($0, strategy: .iso8601) } ?? Date()
-        let day = Self.dayFormat.string(from: stamp)
         var t = UsageTotals()
         t.input = u["input_tokens"] as? Int ?? 0
         t.output = u["output_tokens"] as? Int ?? 0
         t.cacheWrite = u["cache_creation_input_tokens"] as? Int ?? 0
         t.cacheRead = u["cache_read_input_tokens"] as? Int ?? 0
         t.messages = 1
-        state.days[day, default: [:]][owner, default: [:]][model, default: UsageTotals()] =
-            (state.days[day]?[owner]?[model] ?? UsageTotals()) + t
+        return (dayFormat.string(from: stamp), model, t)
     }
 
     // APFS clone of the transcript under Archive/<owner>/<source>/<path>: takes no space while Claude
     // keeps the original, and survives Claude Code's cleanup.
-    private func archive(_ f: URL, root: URL, as name: String, owner: String) {
+    private func archivePath(_ f: URL, root: URL, as name: String, owner: String) -> URL {
         let rel = String(f.standardizedFileURL.path.dropFirst(root.standardizedFileURL.path.count)).trimmingCharacters(in: CharacterSet(charactersIn: "/"))
-        let dest = archiveURL.appendingPathComponent(owner).appendingPathComponent(name).appendingPathComponent(rel)
+        return archiveURL.appendingPathComponent(owner).appendingPathComponent(name).appendingPathComponent(rel)
+    }
+
+    private func archive(_ f: URL, root: URL, as name: String, owner: String) {
+        let dest = archivePath(f, root: root, as: name, owner: owner)
         let fm = FileManager.default
         // Transcripts hold whole conversations: only this user may open the archive.
         if !fm.fileExists(atPath: archiveURL.path) {
@@ -2648,9 +2705,16 @@ enum ChatLimits {
     struct Limit: Equatable { let percent: Double; let resetsAt: Date? }
     struct Snapshot: Equatable { var fiveHour: Limit?; var week: Limit?; var error: String? }
 
-    nonisolated(unsafe) static var aesKey: Data?
+    // Several fetches run at once (one Task per refresh), and turning the setting off clears the key from
+    // the main actor: the cache sits behind a lock. Held across the Keychain read so macOS asks only once.
+    private static let keyLock = NSLock()
+    nonisolated(unsafe) private static var aesKey: Data?
+
+    static func forgetKey() { keyLock.withLock { aesKey = nil } }
 
     static func safeStorageKey() -> Data? {
+        keyLock.lock()
+        defer { keyLock.unlock() }
         if let aesKey { return aesKey }
         let q: [String: Any] = [kSecClass as String: kSecClassGenericPassword,
                                 kSecAttrService as String: "Claude Safe Storage",
@@ -2836,7 +2900,7 @@ final class Usage: ObservableObject {
             }
         } else if !e.isOn(.chatLimits) && !limits.isEmpty {
             limits = [:]
-            ChatLimits.aesKey = nil
+            ChatLimits.forgetKey()
         }
     }
 
@@ -5387,6 +5451,29 @@ if args.count == 2, args[1] == "--selftest-usage" {
     check("transcript archived under its account", (try? String(contentsOf: archived, encoding: .utf8))?.contains("m5") == true)
     check("archive keeps a transcript Claude deleted", { try? fm.removeItem(at: s1); return fm.fileExists(atPath: archived.path) }())
     check("transcript turns merge a reply's blocks", Transcript.turns(archived.path).map(\.role) == ["user", "assistant", "assistant", "assistant"])
+    // A Code session read before its account lists it goes to Terminal, then moves once the account claims it.
+    do {
+        let late = tmp.appendingPathComponent("late/-q")
+        try? fm.createDirectory(at: late, withIntermediateDirectories: true)
+        let s3 = late.appendingPathComponent("s3.jsonl")
+        try? ([reply("m6", "r6", 19), reply("m7", "r7", 23, day: "2026-10-14")].joined(separator: "\n") + "\n").write(to: s3, atomically: true, encoding: .utf8)
+        var claimed = false
+        let lateSrc = UsageSource(root: tmp.appendingPathComponent("late"), archiveName: "code") { _ in claimed ? "C" : UsageScan.terminal }
+        let ls = UsageScan(); ls.folder = tmp.appendingPathComponent("store-late")
+        s = ls.scan(sources: [lateSrc])
+        check("unclaimed session credited to Terminal", out(UsageScan.terminal) == 42 && out("C") == 0)
+        claimed = true
+        s = ls.scan(sources: [lateSrc])
+        check("claimed session moves to its account", out(UsageScan.terminal) == 0 && out("C") == 42)
+        check("no empty Terminal entry left", !s.days.values.contains { $0[UsageScan.terminal] != nil })
+        check("moved session keeps its days", s.days["2026-10-14"]?["C"]?["claude-test"]?.output == 23)
+        check("moved session archived under its account",
+              fm.fileExists(atPath: ls.archiveURL.appendingPathComponent("C/code/-q/s3.jsonl").path)
+              && !fm.fileExists(atPath: ls.archiveURL.appendingPathComponent("terminal/code/-q/s3.jsonl").path))
+        let reload = UsageScan(); reload.folder = ls.folder
+        s = reload.scan(sources: [lateSrc])
+        check("move survives a restart", out(UsageScan.terminal) == 0 && out("C") == 42)
+    }
     // Cookie format: encrypt like Chromium, decrypt with ChatLimits.
     let key = Data((0..<16).map { UInt8($0) })
     for version in [23, 24] {
