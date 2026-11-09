@@ -7,6 +7,8 @@
 
 <div align="center">
 
+<img src="preview/icon.png" width="128" alt="The MultiClaude icon: the Claude asterisk glowing inside frosted glass">
+
 # MultiClaude
 
 **All your Claude accounts, open at once.** A free menu bar app for macOS.
@@ -91,8 +93,8 @@ MultiClaude is that trick with a proper interface.
 - **Quit them all together.** Turn on **Quit Profiles with MultiClaude** and quitting MultiClaude closes every account it opened.
 - **Global shortcuts.** ⌃⌥⌘M opens the panel; turn on Profile Shortcuts and ⌃⌥1 to ⌃⌥9 jump straight to each account.
 - **Updates itself.** Once a day MultiClaude checks for a new release, installs it in the background and restarts while the panel is closed. Your Claude windows stay open.
-- **Launch at login**, light and dark mode, colored menu bar icon.
-- **Small.** A single Swift file, no dependencies, a 1.6 MB download.
+- **Launch at login**, light and dark mode, colored menu bar icon. The menu bar, the panel and the About window all wear the same asterisk as the app icon.
+- **Small.** A single Swift file plus its icon, no dependencies, a 3.6 MB download.
 
 <p align="center">
 <picture>
@@ -123,7 +125,7 @@ Requires macOS 15 or later and the [Claude desktop app](https://claude.ai/downlo
 
 ## Use
 
-1. Click the ✳ icon in the menu bar.
+1. Click the asterisk icon in the menu bar.
 2. Click **New Profile**, type a name such as `Work`, press Return.
 3. Click the new profile. A fresh Claude window opens: sign in to your work account there.
 4. From now on, click `Work` to open or focus it, and hover it to quit it.

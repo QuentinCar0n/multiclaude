@@ -1,5 +1,10 @@
 # MultiClaude release notes
 
+## Unreleased
+
+### Changed
+- **Icons match the new app icon.** The menu bar shows the rounded asterisk from the app icon instead of the system asterisk, the panel header carries the app icon, and the fallback tiles use the same asterisk.
+
 ## 1.7.1 (build 15), 2026-11-08
 
 ### Fixed
