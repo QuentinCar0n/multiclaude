@@ -1,6 +1,6 @@
 # MultiClaude release notes
 
-## Unreleased
+## 1.7 (build 14), 2026-11-08
 
 ### New
 - **Delete Profile…** in a profile's right-click menu closes the account and moves its data folder, its Claude Code folder and its app to the Trash, after you confirm. **Remove from List** still keeps the data.
@@ -8,6 +8,14 @@
 ### Changed
 - **App for Each Profile is now Colored Claude Icon per Account.** The old name didn't say it gives every account its own colored Claude icon in the Dock, ⌘-Tab and Mission Control, so it was easy to miss next to Colored Menu Bar Icon. The setting itself is unchanged.
 - **Turning it on says which accounts to reopen.** An account that is already open keeps the plain icon until it is reopened from MultiClaude, and the panel now names those accounts.
+- **New app icon.** The Claude asterisk now glows inside frosted glass, the same look as the other Soma Labs apps.
+
+### Fixed
+- **Dock tiles no longer go missing.** Changing two pinned profiles within a few seconds could leave the first one's tile off the Dock for good.
+- **A saved list that can't be read deletes nothing.** MultiClaude rebuilds the list with new ids in that case, and it used to take every profile app and profile copy for an orphan and delete them. They now stay until the next launch.
+- **`MultiClaude --list` only reads.** It could close a profile's Claude window that had started without its folder, and never reopen it.
+- **Only one MultiClaude runs at a time.** A second copy (from Homebrew and from ~/Applications, say) now brings the first one forward and quits, instead of writing its own profile list over the first one's.
+- **Two rare crashes** on unexpected data from Claude's cookie store and from claude.ai are gone.
 
 ## 1.6.1 (build 13), 2026-10-21
 

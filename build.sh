@@ -1,8 +1,8 @@
 #!/bin/zsh
 # Build MultiClaude.app and install it to ~/Applications.
 set -e
-VERSION=${VERSION:-1.6.1}   # bump with a CHANGELOG.md entry; CI sets it from the tag
-BUILD=${BUILD:-13}
+VERSION=${VERSION:-1.7}   # bump with a CHANGELOG.md entry; CI sets it from the tag
+BUILD=${BUILD:-14}
 cd "${0:A:h}"
 APP=build/MultiClaude.app
 rm -rf build && mkdir -p $APP/Contents/MacOS
@@ -13,6 +13,7 @@ for ARCH in arm64 x86_64; do
 done
 lipo -create build/MultiClaude-arm64 build/MultiClaude-x86_64 -output $APP/Contents/MacOS/MultiClaude
 rm build/MultiClaude-arm64 build/MultiClaude-x86_64
+cp assets/AppIcon.png $APP/Contents/Resources/AppIcon.png
 $APP/Contents/MacOS/MultiClaude --export-iconset build/MultiClaude.iconset
 iconutil -c icns build/MultiClaude.iconset -o $APP/Contents/Resources/MultiClaude.icns
 cat > $APP/Contents/Info.plist <<PLIST
