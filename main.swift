@@ -3053,6 +3053,38 @@ enum Transcript {
     }
 }
 
+// The asterisk from the app icon: three rounded bars through the center, one upright and two at 30°.
+// Drawn as a path so the menu bar, the tiles and the panel all show the same mark as the app icon.
+enum Mark {
+    static func path(in r: NSRect) -> NSBezierPath {
+        let side = min(r.width, r.height)
+        let len = side, thick = side * 0.21
+        let c = NSPoint(x: r.midX, y: r.midY)
+        let out = NSBezierPath()
+        for angle in [90.0, 30.0, -30.0] {
+            let bar = NSBezierPath(roundedRect: NSRect(x: -len / 2, y: -thick / 2, width: len, height: thick),
+                                   xRadius: thick / 2, yRadius: thick / 2)
+            var t = AffineTransform(translationByX: c.x, byY: c.y)
+            t.rotate(byDegrees: angle)
+            bar.transform(using: t)
+            out.append(bar)
+        }
+        out.windingRule = .nonZero
+        return out
+    }
+
+    // A menu bar sized image of the mark; with no color it is a template image.
+    static func image(_ side: CGFloat, color: NSColor?) -> NSImage {
+        let img = NSImage(size: NSSize(width: side, height: side), flipped: false) { r in
+            (color ?? .black).setFill()
+            path(in: r.insetBy(dx: r.width * 0.06, dy: r.height * 0.06)).fill()
+            return true
+        }
+        img.isTemplate = color == nil
+        return img
+    }
+}
+
 // MARK: - App icon (drawn, so the bundle needs no image files)
 
 enum AppIcon {
@@ -3089,11 +3121,8 @@ enum AppIcon {
             NSGradient(colors: [base.blended(withFraction: 0.18, of: .white) ?? base,
                                 base.blended(withFraction: 0.12, of: .black) ?? base])?.draw(in: path, angle: -90)
             func asterisk(size: CGFloat, center: NSPoint) {
-                let cfg = NSImage.SymbolConfiguration(pointSize: size, weight: .semibold)
-                    .applying(.init(paletteColors: [.white]))
-                guard let sym = NSImage(systemSymbolName: "asterisk", accessibilityDescription: nil)?.withSymbolConfiguration(cfg) else { return }
-                let s = sym.size
-                sym.draw(in: NSRect(x: center.x - s.width / 2, y: center.y - s.height / 2, width: s.width, height: s.height))
+                NSColor.white.setFill()
+                Mark.path(in: NSRect(x: center.x - size / 2, y: center.y - size / 2, width: size, height: size)).fill()
             }
             guard let letter, !letter.isEmpty else {
                 asterisk(size: tile.width * 0.5, center: NSPoint(x: tile.midX, y: tile.midY))
@@ -4555,6 +4584,7 @@ struct MenuView: View {
         VStack(alignment: .leading, spacing: 0) {
             // The switch reads "any profile running": on opens every profile, off quits them all.
             HStack {
+                Image(nsImage: AppIcon.image(64)).resizable().interpolation(.high).frame(width: 20, height: 20)
                 Text("MultiClaude").font(.system(size: 13, weight: .bold))
                 Spacer()
                 // Keep-awake on or off at a glance; durations and options are in the section below.
@@ -4828,6 +4858,8 @@ enum AboutWindow {
 // image, so macOS draws it in the menu bar's own color; with any color both marks are drawn as given.
 @MainActor
 enum MenuBarIcon {
+    static let side: CGFloat = 16
+
     static func symbol(_ name: String, _ color: NSColor?) -> NSImage? {
         let img = NSImage(systemSymbolName: name, accessibilityDescription: nil)
         guard let color else { return img }
@@ -4836,15 +4868,14 @@ enum MenuBarIcon {
 
     static func make(tint: NSColor?, bolt: NSColor??) -> NSImage? {
         guard let bolt else {
-            let img = symbol("asterisk", tint)
-            img?.isTemplate = tint == nil
-            img?.accessibilityDescription = "MultiClaude"
+            let img = Mark.image(side, color: tint)
+            img.accessibilityDescription = "MultiClaude"
             return img
         }
         let template = tint == nil && bolt == nil
         let colored = !template
-        guard let a = symbol("asterisk", colored ? tint ?? .labelColor : nil),
-              let z = symbol("bolt.fill", colored ? bolt ?? .labelColor : nil) else { return nil }
+        let a = Mark.image(side, color: colored ? tint ?? .labelColor : nil)
+        guard let z = symbol("bolt.fill", colored ? bolt ?? .labelColor : nil) else { return nil }
         let gap: CGFloat = 2
         let size = NSSize(width: a.size.width + gap + z.size.width, height: max(a.size.height, z.size.height))
         let img = NSImage(size: size, flipped: false) { _ in
