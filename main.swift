@@ -3267,7 +3267,11 @@ enum Runtimes {
                 if stamped == stamp(p, version: current) && hasLook(rt) { return rt }
                 // macOS guards an app bundle once it has run (App Management), so the icon can fail on an
                 // older copy. A fresh clone isn't guarded yet: same version, so it is made again below.
-                if applyLook(p, to: rt, version: current) || current != sourceVersion { return rt }
+                if applyLook(p, to: rt, version: current) { return rt }
+                // Claude's updater replaced this copy in place, so it is ahead of Claude.app. The new bundle
+                // keeps the custom-icon flag but not its Icon\r, so the Dock showed a plain folder, and it is
+                // guarded. Clone the copy itself, which keeps its newer Claude and takes the icon.
+                if current != sourceVersion { return reclone(p, rt, version: current) }
                 Log.write("profile copy \(rt.lastPathComponent): made again to take its icon")
             }
             try? fm.removeItem(at: rt)
@@ -3287,15 +3291,44 @@ enum Runtimes {
         return want
     }
 
+    // A closed copy, cloned again from itself into its own place with the profile's icon. Returns the copy
+    // as it was when the clone or its icon fails.
+    static func reclone(_ p: Profile, _ rt: URL, version: String) -> URL {
+        let fm = FileManager.default
+        let fresh = dir(p.id).appendingPathComponent("fresh.app")
+        try? fm.removeItem(at: fresh)
+        guard clonefile(rt.path, fresh.path, 0) == 0 else {
+            Log.write("profile copy \(rt.lastPathComponent): clone for its icon failed (\(String(cString: strerror(errno))))")
+            return rt
+        }
+        // The clone carries the stale custom-icon flag; drop it so a failed icon shows Claude's, not a folder.
+        _ = setIcon(nil, fresh)
+        guard applyLook(p, to: fresh, version: version, register: false) else {
+            try? fm.removeItem(at: fresh)
+            return rt
+        }
+        let want = target(p)
+        guard (try? fm.removeItem(at: rt)) != nil, (try? fm.moveItem(at: fresh, to: want)) != nil else {
+            try? fm.removeItem(at: fresh)
+            return current(p.id) ?? rt
+        }
+        LSRegisterURL(want as CFURL, true)
+        Log.write("profile copy \(want.lastPathComponent): made again from itself to take its icon")
+        return want
+    }
+
     // A folder's custom icon lives in an "Icon\r" file at its root, outside the sealed Contents.
     static func hasLook(_ app: URL) -> Bool {
         FileManager.default.fileExists(atPath: app.appendingPathComponent("Icon\r").path)
     }
 
+    // Swappable so the self-test can play a bundle that macOS guards.
+    nonisolated(unsafe) static var setIcon: (NSImage?, URL) -> Bool = { NSWorkspace.shared.setIcon($0, forFile: $1.path, options: []) }
+
     @discardableResult
     static func applyLook(_ p: Profile, to app: URL, version: String, register: Bool = true) -> Bool {
         let fm = FileManager.default
-        let ok = NSWorkspace.shared.setIcon(AppIcon.finderIcon(color: p.nsTint, letter: p.initial), forFile: app.path, options: [])
+        let ok = setIcon(AppIcon.finderIcon(color: p.nsTint, letter: p.initial), app)
         Log.write("profile copy \(app.lastPathComponent): icon \(ok ? "set" : "FAILED"), Claude \(version)")
         try? fm.setAttributes([.modificationDate: Date()], ofItemAtPath: app.path)
         if register { LSRegisterURL(app as CFURL, true) }
@@ -5252,6 +5285,15 @@ if args.count == 2, args[1] == "--selftest-launchers" {
     check("closed runtime follows a Claude update", Runtimes.version(Runtimes.current(rp.id)!) == "2.0")
     _ = Runtimes.ensure(rp, from: v1, running: { _ in false })
     check("runtime ahead of Claude is kept", Runtimes.version(Runtimes.current(rp.id)!) == "2.0")
+    // Claude's updater swapped the bundle: no Icon\r, and macOS refuses a new icon on that bundle.
+    let guarded = Runtimes.current(rp.id)!
+    try? fm.removeItem(at: guarded.appendingPathComponent("Icon\r"))
+    let realSetIcon = Runtimes.setIcon
+    Runtimes.setIcon = { img, url in url.standardizedFileURL.path == guarded.standardizedFileURL.path ? false : realSetIcon(img, url) }
+    _ = Runtimes.ensure(rp, from: v1, running: { _ in false })
+    Runtimes.setIcon = realSetIcon
+    check("updated copy that refuses its icon is cloned from itself", Runtimes.version(Runtimes.current(rp.id)!) == "2.0"
+          && Runtimes.hasLook(Runtimes.current(rp.id)!) && Runtimes.current(rp.id)!.lastPathComponent == Launchers.fileName(rp.dockAppName))
     var renamed = rp; renamed.appName = "Claude \"Quoted\""
     _ = Runtimes.ensure(renamed, from: v2, running: { _ in false })
     check("rename renames the bundle", Runtimes.current(rp.id)!.lastPathComponent == "Claude \"Quoted\".app")
