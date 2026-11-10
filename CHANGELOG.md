@@ -1,5 +1,10 @@
 # MultiClaude release notes
 
+## Unreleased
+
+### Fixed
+- **Profile copies keep their colored icon after Claude updates them.** Claude's updater replaces an open account's copy in place. The new copy lost its icon and showed a plain folder in the Dock, and macOS then refused a new icon on it. The 1.6.1 fix made a fresh copy from Claude.app, but not when the copy was newer than Claude.app, so the folder stayed until Claude.app caught up. MultiClaude now makes a fresh copy of the updated copy itself, which keeps its newer Claude and takes the icon.
+
 ## 1.7.1 (build 15), 2026-11-08
 
 ### Fixed
