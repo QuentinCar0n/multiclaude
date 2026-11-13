@@ -34,12 +34,27 @@ jobs:
           echo "version=$v" >> "$GITHUB_OUTPUT"
           echo "BUILD=${{ github.run_number }}" >> "$GITHUB_ENV"
 
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: cli/go.mod
+          cache-dependency-path: cli/go.sum
+
+      - name: Test the command line tool
+        working-directory: cli
+        run: |
+          test -z "$(gofmt -l .)" || { gofmt -l .; exit 1; }
+          go vet ./...
+          go test ./...
+
       - name: Build
         run: |
           swiftc --version
+          go version
           ./build.sh --no-install
           lipo -archs build/MultiClaude.app/Contents/MacOS/MultiClaude
-          codesign -v build/MultiClaude.app
+          codesign --verify --deep --strict build/MultiClaude.app
+          lipo -archs build/MultiClaude.app/Contents/Helpers/multiclaude
+          build/MultiClaude.app/Contents/Helpers/multiclaude version | grep -qx "multiclaude $VERSION"
           build/MultiClaude.app/Contents/MacOS/MultiClaude --selftest-update
           build/MultiClaude.app/Contents/MacOS/MultiClaude --selftest-version
           build/MultiClaude.app/Contents/MacOS/MultiClaude --selftest-profiles

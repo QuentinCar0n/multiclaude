@@ -130,6 +130,30 @@ Requires macOS 15 or later and the [Claude desktop app](https://claude.ai/downlo
 
 Your default Claude account is always the first profile. It uses the app's normal data folder, so nothing changes for it.
 
+### From the terminal
+
+MultiClaude comes with a `multiclaude` command. Homebrew puts it on your `PATH`; with a manual install, link it yourself:
+
+```bash
+ln -s /Applications/MultiClaude.app/Contents/Helpers/multiclaude /usr/local/bin/multiclaude
+```
+
+```console
+$ multiclaude list
+#  ACCOUNT  STATE   FOLDER
+1  Claude   open    ~/Library/Application Support/Claude
+2  Work     closed  ~/Library/Application Support/Claude-Work
+
+$ multiclaude open work          # open it, or bring it forward
+$ multiclaude quit work          # also --all
+$ multiclaude code work          # Claude Code signed in as Work (extra arguments go to claude)
+$ eval "$(multiclaude env work)" # point this shell's Claude Code at Work
+$ multiclaude usage --days 30    # Claude Code tokens per account
+$ multiclaude awake 90           # keep the Mac awake 90 minutes; awake off, awake status
+```
+
+An account can be named by its number, its name in any case, or the start of it. `list` and `usage` take `--json`. The command reads the accounts MultiClaude saved and asks the app to open, quit and keep awake, so profile icons and the sign-in relay keep working. It's written in Go and lives in [`cli/`](cli).
+
 ## How it works
 
 - **Opening** a profile runs `open -n -b com.anthropic.claudefordesktop --args --user-data-dir=<folder>`, the alias with Claude found by its bundle id. The default profile runs `open -b com.anthropic.claudefordesktop`.
@@ -150,7 +174,7 @@ MultiClaude has **no analytics**. Its only network requests are the daily update
 No. MultiClaude is an independent open source tool. It launches the official Claude app and does not change it.
 
 **Does it work with Claude Code?**
-Yes. In the desktop app, each Claude window and the Code tab inside it run with the account of its profile. For the CLI, right-click a profile and choose **Open Claude Code in Terminal**, or **Copy Claude Code Alias** for your shell. Each profile gets its own `~/.claude-<name>` folder, and Claude Code keeps a separate sign-in for each.
+Yes. In the desktop app, each Claude window and the Code tab inside it run with the account of its profile. For the CLI, run `multiclaude code <profile>`, right-click a profile and choose **Open Claude Code in Terminal**, or **Copy Claude Code Alias** for your shell. Each profile gets its own `~/.claude-<name>` folder, and Claude Code keeps a separate sign-in for each.
 
 **Can I still use my aliases?**
 Yes. MultiClaude reads the same folders, so an account opened from an alias shows as running in the panel. Right-click a profile and choose **Copy Shell Alias** to get one for a new profile.
@@ -179,7 +203,7 @@ cd multiclaude
 ./build.sh --no-install # stops after build/MultiClaude-<version>.zip
 ```
 
-Needs Xcode command line tools with Swift 6. Everything is in [`main.swift`](main.swift): SwiftUI views inside an AppKit menu bar panel.
+Needs Xcode command line tools with Swift 6 and Go 1.26. The app is all in [`main.swift`](main.swift): SwiftUI views inside an AppKit menu bar panel. The `multiclaude` command is in [`cli/`](cli); test it with `cd cli && go test ./...`. `./build.sh` links it into `~/.local/bin` when that folder is on your `PATH`.
 
 Screenshots for this README come from a demo mode with sample profiles:
 

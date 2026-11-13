@@ -1089,13 +1089,27 @@ final class Engine: ObservableObject {
         Dock.update(moved: [], removed: [url])
     }
 
-    // multiclaude://open?profile=<id>, sent by a profile's app. Opens or brings forward that profile.
+    // Links sent by a profile's app and by the multiclaude command line tool (cli/):
+    //   multiclaude://open?profile=<id>   opens or brings forward that profile
+    //   multiclaude://quit?profile=<id>   quits it, the same way the panel does
+    //   multiclaude://awake?minutes=<n>   starts keep-awake (0 = until turned off; no minutes = last length)
+    //   multiclaude://awake?off=1         stops keep-awake
     func handleOwnLink(_ link: String) {
-        guard let c = URLComponents(string: link), c.host == "open",
-              let id = c.queryItems?.first(where: { $0.name == "profile" })?.value.flatMap(UUID.init(uuidString:)),
-              let p = profiles.first(where: { $0.id == id }) else { NSSound.beep(); return }
-        refresh()   // MultiClaude may have just been launched by this link
-        open(p)
+        guard let c = URLComponents(string: link) else { NSSound.beep(); return }
+        let query = { (name: String) in c.queryItems?.first(where: { $0.name == name })?.value }
+        switch c.host {
+        case "open", "quit":
+            guard let id = query("profile").flatMap(UUID.init(uuidString:)),
+                  let p = profiles.first(where: { $0.id == id }) else { NSSound.beep(); return }
+            refresh()   // MultiClaude may have just been launched by this link
+            c.host == "open" ? open(p) : quit(p)
+        case "awake":
+            if query("off") != nil { Awake.shared.deactivate(); return }
+            let minutes = query("minutes").flatMap(Int.init).map { max(0, $0) }
+            Awake.shared.activate(minutes: minutes)
+        default:
+            NSSound.beep()
+        }
     }
 
     func move(_ p: Profile, by delta: Int) {
