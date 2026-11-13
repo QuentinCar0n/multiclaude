@@ -1,6 +1,6 @@
 # MultiClaude release notes
 
-## Unreleased
+## 1.8 (build 16), 2026-11-13
 
 ### New
 - **`multiclaude` in the terminal.** The app now carries a command line tool, written in Go: `list`, `open`, `quit` (each with `--all`), `code` to run Claude Code as an account, `env` and `path`, `usage` for Claude Code tokens per account, and `awake` for keep-awake. It finds accounts by number or name and asks the app to open and quit them, so profile icons and the sign-in relay still apply. Homebrew links it; see the README for a manual install.
