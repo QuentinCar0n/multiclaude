@@ -17,14 +17,53 @@ import (
 // The app's defaults domain. Profiles live there under "profiles", as JSON data written by the app.
 const domain = "me.somalabs.multiclaude"
 
-// Profile mirrors the Swift Profile struct in main.swift. Only the fields the CLI needs.
+// Profile mirrors the Swift Profile struct in main.swift. Keys the CLI doesn't know are kept in raw
+// and written back untouched, so a list saved by a newer app survives a CLI edit.
 type Profile struct {
-	ID      string  `json:"id"`
-	Name    string  `json:"name"`
-	Dir     *string `json:"dir"` // nil = the default Claude profile, launched without --user-data-dir
-	Color   *int    `json:"color,omitempty"`
-	CodeDir *string `json:"codeDir,omitempty"`
-	AppName *string `json:"appName,omitempty"`
+	ID           string  `json:"id"`
+	Name         string  `json:"name"`
+	Dir          *string `json:"dir,omitempty"` // nil = the default Claude profile, launched without --user-data-dir
+	Color        *int    `json:"color,omitempty"`
+	OpenAtLaunch *bool   `json:"openAtLaunch,omitempty"`
+	CodeDir      *string `json:"codeDir,omitempty"`
+	AppName      *string `json:"appName,omitempty"`
+
+	raw map[string]json.RawMessage
+}
+
+type profileFields Profile // the same fields without the methods, so encoding doesn't recurse
+
+func (p *Profile) UnmarshalJSON(b []byte) error {
+	var f profileFields
+	if err := json.Unmarshal(b, &f); err != nil {
+		return err
+	}
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(b, &raw); err != nil {
+		return err
+	}
+	*p = Profile(f)
+	p.raw = raw
+	return nil
+}
+
+func (p Profile) MarshalJSON() ([]byte, error) {
+	known, err := json.Marshal(profileFields(p))
+	if err != nil {
+		return nil, err
+	}
+	var out map[string]json.RawMessage
+	if err := json.Unmarshal(known, &out); err != nil {
+		return nil, err
+	}
+	for k, v := range p.raw {
+		switch k {
+		case "id", "name", "dir", "color", "openAtLaunch", "codeDir", "appName":
+		default:
+			out[k] = v
+		}
+	}
+	return json.Marshal(out)
 }
 
 func (p Profile) IsDefault() bool { return p.Dir == nil }
@@ -88,13 +127,16 @@ func decodeProfiles(data []byte) ([]Profile, error) {
 	return list, nil
 }
 
-var errNoProfiles = errors.New("no accounts yet: open MultiClaude once so it can find your Claude accounts")
+var errNoProfiles = errors.New("no accounts yet: run multiclaude list to find your Claude accounts")
 
 // loadProfiles asks cfprefsd (through `defaults export`), so it sees what the running app last saved,
 // not a stale plist on disk. MULTICLAUDE_PROFILES_JSON points at a JSON file instead, for tests.
 func loadProfiles() ([]Profile, error) {
 	if f := os.Getenv("MULTICLAUDE_PROFILES_JSON"); f != "" {
 		data, err := os.ReadFile(f)
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, errNoProfiles
+		}
 		if err != nil {
 			return nil, err
 		}
