@@ -140,19 +140,36 @@ ln -s /Applications/MultiClaude.app/Contents/Helpers/multiclaude /usr/local/bin/
 
 ```console
 $ multiclaude list
-#  ACCOUNT  STATE   FOLDER
-1  Claude   open    ~/Library/Application Support/Claude
-2  Work     closed  ~/Library/Application Support/Claude-Work
+#  ACCOUNT  COLOR   STATE   FOLDER
+1  Claude   orange  open    ~/Library/Application Support/Claude
+2  Work     blue    closed  ~/Library/Application Support/Claude-Work
 
+$ multiclaude add Client         # new account with its own Claude folder
+$ multiclaude login client       # sign in to it in its own window
 $ multiclaude open work          # open it, or bring it forward
 $ multiclaude quit work          # also --all
+$ multiclaude rename client Acme # the folder follows once it's closed
+$ multiclaude duplicate work Lab # copy an account, sign-in and chats included
+$ multiclaude remove lab         # off the list, folder kept
+$ multiclaude delete lab         # folder and Claude Code sign-in to the Trash (asks first)
+$ multiclaude color work teal    # also: move work up, mcp work, mcp copy work acme
 $ multiclaude code work          # Claude Code signed in as Work (extra arguments go to claude)
 $ eval "$(multiclaude env work)" # point this shell's Claude Code at Work
 $ multiclaude usage --days 30    # Claude Code tokens per account
 $ multiclaude awake 90           # keep the Mac awake 90 minutes; awake off, awake status
 ```
 
-An account can be named by its number, its name in any case, or the start of it. `list` and `usage` take `--json`. The command reads the accounts MultiClaude saved and asks the app to open, quit and keep awake, so profile icons and the sign-in relay keep working. It's written in Go and lives in [`cli/`](cli).
+An account can be named by its number, its name in any case, or the start of it. `list` and `usage` take `--json`.
+
+The app is optional. The command and the app share one account list. While MultiClaude runs, the command hands it each action, so profile icons and the sign-in relay keep working, and it tells the app to reload the list after a change. Without the app, the command does the work itself and never starts the app:
+
+- it builds the first account list and adopts new `Claude-*` folders, like the app does at launch;
+- `open` starts Claude with the account's folder, `quit` asks Claude to quit;
+- `login` closes your other accounts, opens this one alone so the browser sign-in can only come back to it, waits for the sign-in in Claude's log, then reopens the others;
+- `usage` reads the Claude Code transcripts itself and keeps the same counts file as the app;
+- `awake` runs `caffeinate` in the background, for the set minutes or until `awake off`.
+
+It's written in Go and lives in [`cli/`](cli).
 
 ## How it works
 

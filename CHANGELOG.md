@@ -1,5 +1,11 @@
 # MultiClaude release notes
 
+## 1.9 (build 17), 2026-11-14
+
+### New
+- **`multiclaude` works without the app.** The command now manages accounts on its own: `add`, `rename`, `duplicate`, `remove`, `delete`, `color`, `move`, `mcp` and `mcp copy`, plus `login` to sign an account in. Without MultiClaude running, `open`, `quit`, `usage` and `awake` no longer start the app: the command opens Claude itself, counts Claude Code tokens itself and keeps the Mac awake with `caffeinate`.
+- **`multiclaude://reload` and `multiclaude://signin?profile=<id>` links.** The command sends `reload` after it changes the account list, so a running app takes the new list.
+
 ## 1.8 (build 16), 2026-11-13
 
 ### New

@@ -1,9 +1,10 @@
 // multiclaude is the command line side of MultiClaude: list, open and quit your Claude accounts,
 // start Claude Code signed in as one of them, read token usage and drive keep-awake.
 //
-// It reads the accounts the MultiClaude app saved and hands actions to the app through
-// multiclaude:// links, so the app's own logic (profile copies, sign-in relay, Dock apps) still runs.
-// When the app isn't installed, open and quit fall back to starting and signalling Claude directly.
+// It works with or without the MultiClaude app. Both share one account list (the app's defaults).
+// While the app runs, the CLI hands it actions through multiclaude:// links so its own logic (profile
+// copies, sign-in relay, Dock apps) still runs; otherwise the CLI does the work itself and never
+// launches the app.
 package main
 
 import (
@@ -26,20 +27,35 @@ var version = "dev" // set by build.sh with -ldflags "-X main.version=..."
 
 const usageText = `multiclaude: your Claude accounts from the terminal
 
-Usage:
+Accounts:
   multiclaude list [--json]              accounts, open or closed
   multiclaude open <account>... | --all  open or bring forward
   multiclaude quit <account>... | --all  quit
+  multiclaude login <account>            sign in to the account in its own window
+  multiclaude add <name>                 new account (its own Claude folder)
+  multiclaude rename <account> <name>    rename (the folder follows once it's closed)
+  multiclaude duplicate <account> <name> copy an account, sign-in and chats included
+  multiclaude remove <account>           take off the list, keep its folder
+  multiclaude delete <account> [--yes]   move its folder and Claude Code sign-in to the Trash
+  multiclaude color <account> <color>    orange, blue, green, purple, pink, teal, yellow, graphite
+  multiclaude move <account> <up|down|N> reorder
+  multiclaude mcp <account>              its MCP servers
+  multiclaude mcp copy <from> <to>       copy MCP servers between accounts
+
+Claude Code:
   multiclaude code <account> [args...]   run Claude Code signed in as that account
   multiclaude env <account>              shell line that points Claude Code at it:
                                            eval "$(multiclaude env work)"
   multiclaude path <account>             the account's Claude data folder
   multiclaude usage [--days N] [--json]  Claude Code tokens per account (default 7 days)
+
+Mac:
   multiclaude awake [on|off|<minutes>|status]
                                          keep the Mac awake (0 minutes = until off)
   multiclaude version
 
 <account> is a name (any case), the start of one, or its number in "multiclaude list".
+The MultiClaude app is optional: the CLI shares its account list and hands it actions while it runs.
 `
 
 func main() {
@@ -72,6 +88,24 @@ func run(args []string, out io.Writer) error {
 		return cmdUsage(rest, out)
 	case "awake":
 		return cmdAwake(rest, out)
+	case "login", "signin":
+		return cmdLogin(rest, out)
+	case "add", "new":
+		return cmdAdd(rest, out)
+	case "rename":
+		return cmdRename(rest, out)
+	case "duplicate", "dup":
+		return cmdDuplicate(rest, out)
+	case "remove", "rm":
+		return cmdRemove(rest, out)
+	case "delete":
+		return cmdDelete(rest, out)
+	case "color":
+		return cmdColor(rest, out)
+	case "move", "mv":
+		return cmdMove(rest, out)
+	case "mcp":
+		return cmdMCP(rest, out)
 	case "version", "--version", "-v":
 		fmt.Fprintln(out, "multiclaude", version)
 		return nil
@@ -108,6 +142,7 @@ type listRow struct {
 	Folder  string `json:"folder"`
 	CodeDir string `json:"codeConfigDir"`
 	Default bool   `json:"default"`
+	Color   string `json:"color"`
 }
 
 func cmdList(args []string, out io.Writer) error {
@@ -116,7 +151,7 @@ func cmdList(args []string, out io.Writer) error {
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	list, err := loadProfiles()
+	list, err := loadForEdit()
 	if err != nil {
 		return err
 	}
@@ -128,7 +163,7 @@ func cmdList(args []string, out io.Writer) error {
 			code = home() + "/.claude"
 		}
 		rows[i] = listRow{Number: i + 1, ID: p.ID, Name: p.Name, PID: running[p.ID], Open: running[p.ID] != 0,
-			Folder: p.Folder(), CodeDir: code, Default: p.IsDefault()}
+			Folder: p.Folder(), CodeDir: code, Default: p.IsDefault(), Color: colorName(p)}
 	}
 	if *asJSON {
 		enc := json.NewEncoder(out)
@@ -136,15 +171,22 @@ func cmdList(args []string, out io.Writer) error {
 		return enc.Encode(rows)
 	}
 	tw := tabwriter.NewWriter(out, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(tw, "#\tACCOUNT\tSTATE\tFOLDER")
+	fmt.Fprintln(tw, "#\tACCOUNT\tCOLOR\tSTATE\tFOLDER")
 	for _, r := range rows {
 		state := "closed"
 		if r.Open {
 			state = "open"
 		}
-		fmt.Fprintf(tw, "%d\t%s\t%s\t%s\n", r.Number, r.Name, state, tildePath(r.Folder))
+		fmt.Fprintf(tw, "%d\t%s\t%s\t%s\t%s\n", r.Number, r.Name, r.Color, state, tildePath(r.Folder))
 	}
 	return tw.Flush()
+}
+
+func colorName(p Profile) string {
+	if p.Color == nil {
+		return paletteNames[0]
+	}
+	return paletteNames[((*p.Color)%len(paletteNames)+len(paletteNames))%len(paletteNames)]
 }
 
 // MARK: open / quit
@@ -210,12 +252,8 @@ func openURL(u string) error {
 
 func openOne(p Profile, list []Profile, running map[string]int, wait bool, out io.Writer) error {
 	was := running[p.ID] != 0
-	// Through the app first, like a profile's Dock app: it opens MultiClaude if needed, then the
-	// account from its own copy of Claude, or brings a running one forward.
-	if err := openURL(link("open", url.Values{"profile": {p.ID}})); err != nil {
-		if err := openDirect(p, len(running) > 0); err != nil {
-			return err
-		}
+	if err := openProfile(p, list); err != nil {
+		return err
 	}
 	if was {
 		fmt.Fprintf(out, "%s brought forward\n", p.Name)
@@ -230,6 +268,27 @@ func openOne(p Profile, list []Profile, running map[string]int, wait bool, out i
 		return nil
 	}
 	return errors.New("Claude didn't start within 30 s")
+}
+
+// openProfile opens an account or brings it forward. A running MultiClaude does it, so its own logic
+// (profile copies, Dock apps, update watch) applies; otherwise the CLI starts Claude itself and never
+// launches the app.
+func openProfile(p Profile, list []Profile) error {
+	running := runningClaudes(list)
+	if multiClaudeRunning() && openURL(link("open", url.Values{"profile": {p.ID}})) == nil {
+		return nil
+	}
+	if pid := running[p.ID]; pid != 0 {
+		return bringForward(pid)
+	}
+	return openDirect(p, len(running) > 0)
+}
+
+// bringForward activates one Claude process by pid, through AppKit from JavaScript for Automation
+// (NSRunningApplication needs no Automation permission, unlike System Events).
+func bringForward(pid int) error {
+	js := fmt.Sprintf(`ObjC.import("AppKit"); var a = $.NSRunningApplication.runningApplicationWithProcessIdentifier(%d); if (a) { a.unhide; a.activateWithOptions(3) }`, pid)
+	return exec.Command("/usr/bin/osascript", "-l", "JavaScript", "-e", js).Run()
 }
 
 // openDirect starts Claude without MultiClaude, with the same arguments as Launch.openArgs.
@@ -361,10 +420,16 @@ func cmdUsage(args []string, out io.Writer) error {
 		return err
 	}
 	list, _ := loadProfiles() // names only; usage still prints with ids when the list is missing
+	// The app counts as it runs; without it, the CLI catches up on the transcripts itself.
+	if !multiClaudeRunning() {
+		if err := scanUsage(list); err != nil {
+			return fmt.Errorf("couldn't count tokens: %w", err)
+		}
+	}
 	s, err := loadUsage()
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
-			return errors.New("no usage yet: MultiClaude counts tokens while it runs")
+			return errors.New("no usage yet (token tracking may be off in MultiClaude's settings)")
 		}
 		return err
 	}
@@ -412,68 +477,4 @@ func short(n int) string {
 		return strconv.FormatFloat(float64(n)/1e3, 'f', 1, 64) + "K"
 	}
 	return strconv.Itoa(n)
-}
-
-// MARK: keep-awake
-
-func cmdAwake(args []string, out io.Writer) error {
-	sub := "status"
-	if len(args) > 0 {
-		sub = args[0]
-	}
-	switch sub {
-	case "status":
-		if awakeHeld() {
-			fmt.Fprintln(out, "Keep-awake is on")
-		} else {
-			fmt.Fprintln(out, "Keep-awake is off")
-		}
-		return nil
-	case "off", "stop":
-		return sendAwake(url.Values{"off": {"1"}}, false, out)
-	case "on", "start":
-		return sendAwake(url.Values{}, true, out)
-	}
-	m, err := strconv.Atoi(strings.TrimSuffix(sub, "m"))
-	if err != nil || m < 0 {
-		return fmt.Errorf("awake takes on, off, status or a number of minutes, not %q", sub)
-	}
-	return sendAwake(url.Values{"minutes": {strconv.Itoa(m)}}, true, out)
-}
-
-func sendAwake(q url.Values, on bool, out io.Writer) error {
-	if err := openURL(link("awake", q)); err != nil {
-		return errors.New("keep-awake needs the MultiClaude app (brew install --cask quentincar0n/tap/multiclaude)")
-	}
-	deadline := time.Now().Add(5 * time.Second)
-	for awakeHeld() != on {
-		if time.Now().After(deadline) {
-			return errors.New("MultiClaude didn't change keep-awake (update the app to 1.8 or later)")
-		}
-		time.Sleep(200 * time.Millisecond)
-	}
-	if on {
-		fmt.Fprintln(out, "Keep-awake is on")
-	} else {
-		fmt.Fprintln(out, "Keep-awake is off")
-	}
-	return nil
-}
-
-// awakeHeld is true while MultiClaude holds a sleep assertion, which is what its keep-awake is.
-func awakeHeld() bool {
-	b, err := exec.Command("/usr/bin/pmset", "-g", "assertions").Output()
-	if err != nil {
-		return false
-	}
-	return assertionHeld(string(b))
-}
-
-func assertionHeld(pmset string) bool {
-	for _, line := range strings.Split(pmset, "\n") {
-		if strings.Contains(line, "(MultiClaude)") && strings.Contains(line, "PreventUserIdle") {
-			return true
-		}
-	}
-	return false
 }

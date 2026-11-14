@@ -1103,6 +1103,21 @@ final class Engine: ObservableObject {
                   let p = profiles.first(where: { $0.id == id }) else { NSSound.beep(); return }
             refresh()   // MultiClaude may have just been launched by this link
             c.host == "open" ? open(p) : quit(p)
+        case "signin":
+            guard let id = query("profile").flatMap(UUID.init(uuidString:)),
+                  let p = profiles.first(where: { $0.id == id }) else { NSSound.beep(); return }
+            refresh()
+            beginSignIn(p)
+        case "reload":
+            // The command line tool saved a new account list: take it instead of saving the old one over it.
+            CFPreferencesAppSynchronize(kCFPreferencesCurrentApplication)
+            guard let data = defaults.data(forKey: "profiles"),
+                  let list = try? JSONDecoder().decode([Profile].self, from: data) else { return }
+            profiles = list
+            for i in profiles.indices where profiles[i].color == nil { profiles[i].color = nextColor() }
+            save()
+            alignFolders()
+            refresh()
         case "awake":
             if query("off") != nil { Awake.shared.deactivate(); return }
             let minutes = query("minutes").flatMap(Int.init).map { max(0, $0) }
