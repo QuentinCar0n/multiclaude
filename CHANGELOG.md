@@ -1,5 +1,12 @@
 # MultiClaude release notes
 
+## Unreleased
+
+### New
+- **Ask before updating.** The Update MultiClaude setting now has three modes: Automatically (as before), Ask First and Off. Ask First shows a window with the release notes and Install, Later or Skip This Version. If you had turned automatic updates off, it stays Off.
+- **Check for Updates…** in the panel checks right away, whatever the mode, and says when MultiClaude is up to date.
+- **`multiclaude update`** installs the latest release from the terminal (`--check` only looks). With the app running, the app installs it and restarts once its panel is closed. The `multiclaude://update` link does the same as Check for Updates, and `multiclaude://update?install=1` installs without asking.
+
 ## 1.9 (build 17), 2026-11-14
 
 ### New
