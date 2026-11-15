@@ -221,3 +221,22 @@ func TestNames(t *testing.T) {
 		t.Fatal(names(l))
 	}
 }
+
+func TestAppFromPath(t *testing.T) {
+	cases := map[string]string{
+		"/Users/x/Applications/MultiClaude.app/Contents/MacOS/MultiClaude": "/Users/x/Applications/MultiClaude.app",
+		"/Applications/MultiClaude.app/Contents/Helpers/multiclaude":       "/Applications/MultiClaude.app",
+		"/Users/x/.local/bin/multiclaude":                                  "",
+	}
+	for in, want := range cases {
+		if got := appFromPath(in); got != want {
+			t.Errorf("%s: got %q", in, got)
+		}
+	}
+	if lastLine("a\nb\n") != "b" {
+		t.Fatal("lastLine")
+	}
+	if err := run([]string{"update", "--bogus"}, &bytes.Buffer{}); err == nil {
+		t.Fatal("unknown flag should fail")
+	}
+}

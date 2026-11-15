@@ -52,6 +52,7 @@ Claude Code:
 Mac:
   multiclaude awake [on|off|<minutes>|status]
                                          keep the Mac awake (0 minutes = until off)
+  multiclaude update [--check]           install the latest MultiClaude (--check only looks)
   multiclaude version
 
 <account> is a name (any case), the start of one, or its number in "multiclaude list".
@@ -106,6 +107,8 @@ func run(args []string, out io.Writer) error {
 		return cmdMove(rest, out)
 	case "mcp":
 		return cmdMCP(rest, out)
+	case "update", "upgrade":
+		return cmdUpdate(rest, out)
 	case "version", "--version", "-v":
 		fmt.Fprintln(out, "multiclaude", version)
 		return nil

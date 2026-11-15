@@ -176,7 +176,7 @@ enum Setting: String, CaseIterable, Identifiable {
         switch self {
         case .manageClaude: "Manage Claude Accounts"
         case .launchAtLogin: "Launch at Login"
-        case .autoUpdate: "Update MultiClaude Automatically"
+        case .autoUpdate: "Update MultiClaude"
         case .routeSignIn: "Sign In in Each Account's Window"
         case .reopenAfterUpdate: "Reopen After Claude Updates"
         case .shortcut: "Keyboard Shortcut"
@@ -220,9 +220,37 @@ enum Setting: String, CaseIterable, Identifiable {
         switch self {
         case .shortcut: "⌃⌥⌘M"
         case .profileShortcuts: "⌃⌥1 to 9"
+        case .autoUpdate: UpdateMode.current.label
         default: nil
         }
     }
+}
+
+// How new releases arrive: installed on their own, offered in a window, or not looked for at all.
+// Before 1.10 this was the autoUpdate switch; turned off, it meant no checks, so it maps to .off.
+enum UpdateMode: String, CaseIterable {
+    case auto, ask, off
+
+    static func from(mode: String?, legacy: Bool?) -> UpdateMode {
+        if let m = mode.flatMap(UpdateMode.init(rawValue:)) { return m }
+        return legacy == false ? .off : .auto
+    }
+
+    static var current: UpdateMode {
+        let d = UserDefaults.standard
+        return from(mode: d.string(forKey: "updateMode"), legacy: d.object(forKey: "autoUpdate") as? Bool)
+    }
+
+    var label: String {
+        switch self {
+        case .auto: "Automatically"
+        case .ask: "Ask First"
+        case .off: "Off"
+        }
+    }
+
+    // A tap on the row moves to the next mode.
+    var next: UpdateMode { self == .auto ? .ask : self == .ask ? .off : .auto }
 }
 
 // MARK: - Engine
@@ -348,11 +376,18 @@ final class Engine: ObservableObject {
 
     func isOn(_ s: Setting) -> Bool {
         if s == .launchAtLogin { return SMAppService.mainApp.status == .enabled }
+        if s == .autoUpdate { return UpdateMode.current != .off }
         if Setting.onByDefault.contains(s) && defaults.object(forKey: s.rawValue) == nil { return true }
         return defaults.bool(forKey: s.rawValue)
     }
 
     func toggle(_ s: Setting) {
+        if s == .autoUpdate {
+            objectWillChange.send()
+            defaults.set(UpdateMode.current.next.rawValue, forKey: "updateMode")
+            Updater.checkIfDue(force: false)
+            return
+        }
         let on = !isOn(s)
         if s == .chatLimits && on && !Dialogs.confirmChatLimits() { return }
         objectWillChange.send()
@@ -1118,6 +1153,9 @@ final class Engine: ObservableObject {
             save()
             alignFolders()
             refresh()
+        case "update":
+            // From `multiclaude update`: install=1 installs without asking, otherwise the same as Check for Updates.
+            Updater.checkNow(install: query("install") != nil)
         case "awake":
             if query("off") != nil { Awake.shared.deactivate(); return }
             let minutes = query("minutes").flatMap(Int.init).map { max(0, $0) }
@@ -1143,8 +1181,9 @@ final class Engine: ObservableObject {
     }
 }
 
-// Self-update from GitHub releases. Checks at launch and then once a day, installs in the background,
-// and relaunches only while the panel is closed. Claude windows are left alone.
+// Self-update from GitHub releases. Checks at launch and then once a day. In Automatically mode it installs
+// in the background; in Ask First it shows UpdatePrompt instead. Either way it relaunches only while the
+// panel is closed, and Claude windows are left alone. Check for Updates runs the same check on demand.
 enum UpdateError: Error { case download, invalid, signature, command(String) }
 
 enum Updater {
@@ -1162,7 +1201,7 @@ enum Updater {
         return URLSession(configuration: c)
     }()
 
-    struct Release { let version: String; let zip: URL; let signature: URL }
+    struct Release { let version: String; let zip: URL; let signature: URL; var notes = "" }
 
     static var currentVersion: String { ProcessInfo.processInfo.environment["MULTICLAUDE_FAKE_VERSION"] ?? appVersion }
 
@@ -1175,13 +1214,34 @@ enum Updater {
 
     @MainActor static func checkIfDue(force: Bool) {
         let d = UserDefaults.standard
-        guard Engine.shared.isOn(.autoUpdate), !busy, installedPending == nil else { return }
+        let mode = UpdateMode.current
+        guard mode != .off, !busy, installedPending == nil, UpdatePrompt.shown == nil else { return }
         if !force, let last = d.object(forKey: "lastUpdateCheck") as? Date, -last.timeIntervalSinceNow < 86_400 { return }
         // A test build (1.5-rc1, 0.0.0-ci) is never replaced by a release behind the tester's back.
         guard !currentVersion.contains("-") else { return }
         let target = Bundle.main.bundleURL
-        guard target.pathExtension == "app",
-              FileManager.default.isWritableFile(atPath: target.deletingLastPathComponent().path) else {
+        if mode == .ask {
+            busy = true
+            Task.detached {
+                let found: Result<Release?, Error>
+                do { found = .success(try await latest()) } catch { found = .failure(error) }
+                await MainActor.run {
+                    busy = false
+                    switch found {
+                    case .failure(let e):
+                        Log.write("update check failed: \(e)")
+                        d.set(Date().addingTimeInterval(-86_400 + 3 * 3600), forKey: "lastUpdateCheck")
+                    case .success(let r):
+                        d.set(Date(), forKey: "lastUpdateCheck")
+                        // A version the user chose to skip only comes back through Check for Updates.
+                        guard let r, isNewer(r.version, than: currentVersion), d.string(forKey: "skippedUpdate") != r.version else { return }
+                        UpdatePrompt.show(r)
+                    }
+                }
+            }
+            return
+        }
+        guard canInstall(at: target) else {
             if force { Log.write("update: skipped, \(target.deletingLastPathComponent().path) isn't writable") }
             return
         }
@@ -1202,6 +1262,88 @@ enum Updater {
                 }
             }
         }
+    }
+
+    static func canInstall(at target: URL) -> Bool {
+        target.pathExtension == "app" && FileManager.default.isWritableFile(atPath: target.deletingLastPathComponent().path)
+    }
+
+    // Check for Updates (and multiclaude://update): runs whatever the mode, and always answers, so a
+    // click never seems to do nothing. With install, a newer release goes in without the window.
+    @MainActor static func checkNow(install: Bool = false) {
+        if let pending = installedPending {
+            Dialogs.alert("MultiClaude \(pending) is installed", "It starts once you close the MultiClaude panel.", buttons: ["OK"])
+            return
+        }
+        if let shown = UpdatePrompt.shown {
+            if !install { shown.front(); return }
+            shown.dismiss()
+        }
+        guard !busy else { return }
+        busy = true
+        Task.detached {
+            let found: Result<Release?, Error>
+                do { found = .success(try await latest()) } catch { found = .failure(error) }
+            await MainActor.run {
+                busy = false
+                switch found {
+                case .failure(let e):
+                    Log.write("update check failed: \(e)")
+                    if !install { Dialogs.alert("Couldn't check for updates", "GitHub didn't answer. Check your connection and try again.", buttons: ["OK"], style: .warning) }
+                case .success(let r):
+                    UserDefaults.standard.set(Date(), forKey: "lastUpdateCheck")
+                    guard let r, isNewer(r.version, than: currentVersion) else {
+                        if !install { Dialogs.alert("MultiClaude is up to date", "Version \(currentVersion) is the latest.", buttons: ["OK"]) }
+                        return
+                    }
+                    if install && canInstall(at: Bundle.main.bundleURL) { installNow(r) } else { UpdatePrompt.show(r) }
+                }
+            }
+        }
+    }
+
+    // Installs a release the user asked for, then relaunches as soon as the panel is closed.
+    @MainActor static func installNow(_ r: Release) {
+        let target = Bundle.main.bundleURL
+        guard !busy, installedPending == nil else { return }
+        busy = true
+        Task.detached {
+            let outcome: Result<Void, Error>
+            do { try await install(r, at: target); outcome = .success(()) } catch { outcome = .failure(error) }
+            await MainActor.run {
+                busy = false
+                if case .failure(let e) = outcome {
+                    Log.write("update failed: \(e)")
+                    let (choice, _) = Dialogs.alert("Couldn't install MultiClaude \(r.version)",
+                                                    "You can download it from GitHub and replace the app yourself.",
+                                                    buttons: ["Open GitHub", "Cancel"], style: .warning)
+                    if choice == 0 { NSWorkspace.shared.open(releasesURL) }
+                    return
+                }
+                UserDefaults.standard.removeObject(forKey: "skippedUpdate")
+                installedPending = r.version
+                Log.write("update: installed \(r.version) on request")
+                relaunchWhenIdle(version: r.version, app: target)
+            }
+        }
+    }
+
+    static let releasesURL = URL(string: "https://github.com/QuentinCar0n/multiclaude/releases/latest")!
+
+    // Release notes for the window: the CHANGELOG section without Markdown marks or the install footer.
+    static func plainNotes(_ body: String) -> String {
+        var lines: [String] = []
+        for raw in body.components(separatedBy: .newlines) {
+            var l = raw.trimmingCharacters(in: .whitespaces)
+            if l.hasPrefix("**Install:**") { break }
+            if l.hasPrefix("#") { l = l.drop(while: { $0 == "#" }).trimmingCharacters(in: .whitespaces) }
+            if l.hasPrefix("- ") { l = "• " + l.dropFirst(2) }
+            l = l.replacingOccurrences(of: "**", with: "").replacingOccurrences(of: "`", with: "")
+            if l.isEmpty && (lines.last?.isEmpty ?? true) { continue }
+            lines.append(l)
+        }
+        while lines.last?.isEmpty == true { lines.removeLast() }
+        return lines.joined(separator: "\n")
     }
 
     // Returns the version it installed, or nil when the app is already up to date.
@@ -1226,7 +1368,8 @@ enum Updater {
               let sigAsset = assets.first(where: { $0["name"] as? String == name + ".sig" }),
               let url = trusted(asset["browser_download_url"]), let sigURL = trusted(sigAsset["browser_download_url"])
         else { return nil }
-        return Release(version: tag.hasPrefix("v") ? String(tag.dropFirst()) : tag, zip: url, signature: sigURL)
+        return Release(version: tag.hasPrefix("v") ? String(tag.dropFirst()) : tag, zip: url, signature: sigURL,
+                       notes: plainNotes(json["body"] as? String ?? ""))
     }
 
     static func trusted(_ any: Any?) -> URL? {
@@ -1318,6 +1461,74 @@ enum Updater {
         Awake.shared.saveForRelaunch()
         relaunching = true
         NSApp.terminate(nil)
+    }
+}
+
+// The Ask First window: an NSAlert shown as a plain window rather than run modally, so MultiClaude's
+// timers (keep-awake, account watching) go on while it waits for an answer.
+@MainActor
+final class UpdatePrompt: NSObject {
+    static var shown: UpdatePrompt?
+    private let alert = NSAlert()
+    private let release: Updater.Release
+
+    private init(_ r: Updater.Release) {
+        release = r
+        super.init()
+        let canInstall = Updater.canInstall(at: Bundle.main.bundleURL)
+        alert.messageText = "MultiClaude \(r.version) is available"
+        alert.informativeText = "You have \(Updater.currentVersion)."
+            + (canInstall ? " MultiClaude restarts once you close its panel. Your Claude windows stay open."
+                          : " MultiClaude can't replace itself where it is, so download it from GitHub.")
+        alert.icon = AppIcon.image(128)
+        for (i, title) in [canInstall ? "Install" : "Open GitHub", "Later", "Skip This Version"].enumerated() {
+            let b = alert.addButton(withTitle: title)
+            b.tag = i
+            b.target = self
+            b.action = #selector(clicked(_:))
+        }
+        if !r.notes.isEmpty {
+            let text = NSTextView(frame: NSRect(x: 0, y: 0, width: 340, height: 150))
+            text.string = r.notes
+            text.isEditable = false
+            text.font = .systemFont(ofSize: 11)
+            text.textContainerInset = NSSize(width: 4, height: 4)
+            let scroll = NSScrollView(frame: text.frame)
+            scroll.documentView = text
+            scroll.hasVerticalScroller = true
+            scroll.borderType = .bezelBorder
+            alert.accessoryView = scroll
+        }
+        alert.layout()
+    }
+
+    static func show(_ r: Updater.Release) {
+        if let shown { shown.front(); return }
+        let p = UpdatePrompt(r)
+        shown = p
+        p.front()
+    }
+
+    func front() {
+        PanelController.shared.close()
+        NSApp.activate()
+        alert.window.center()
+        alert.window.makeKeyAndOrderFront(nil)
+    }
+
+    func dismiss() {
+        alert.window.orderOut(nil)
+        UpdatePrompt.shown = nil
+    }
+
+    @objc private func clicked(_ sender: NSButton) {
+        dismiss()
+        switch sender.tag {
+        case 0:
+            if Updater.canInstall(at: Bundle.main.bundleURL) { Updater.installNow(release) } else { NSWorkspace.shared.open(Updater.releasesURL) }
+        case 2: UserDefaults.standard.set(release.version, forKey: "skippedUpdate")
+        default: break   // Later: the next daily check asks again
+        }
     }
 }
 
@@ -4664,6 +4875,7 @@ struct MenuView: View {
 
             Divider().padding(.horizontal, 14)
             VStack(spacing: 0) {
+                PlainRow(title: "Check for Updates…") { PanelController.shared.close(); Updater.checkNow() }
                 PlainRow(title: "About") { PanelController.shared.close(); AboutWindow.show() }
                 PlainRow(title: "Quit") { NSApp.terminate(nil) }
             }
@@ -5175,6 +5387,13 @@ if args.count == 2, args[1] == "--selftest-profiles" {
           Updater.trusted("https://github.com/QuentinCar0n/multiclaude/releases/download/v1/x.zip") != nil
           && Updater.trusted("https://github.com/QuentinCar0n/multiclaude/releases/download/../../../evil/x.zip") == nil
           && Updater.trusted("https://github.com:8443/QuentinCar0n/multiclaude/releases/download/v1/x.zip") == nil)
+    check("update mode: saved mode wins, old switch off means off, default is automatic",
+          UpdateMode.from(mode: "ask", legacy: false) == .ask && UpdateMode.from(mode: nil, legacy: false) == .off
+          && UpdateMode.from(mode: nil, legacy: true) == .auto && UpdateMode.from(mode: nil, legacy: nil) == .auto
+          && UpdateMode.from(mode: "bogus", legacy: nil) == .auto)
+    check("update mode row cycles through all three", UpdateMode.auto.next.next.next == .auto && Set([UpdateMode.auto.next, UpdateMode.auto.next.next]) == [.ask, .off])
+    check("release notes lose Markdown and the install footer",
+          Updater.plainNotes("### New\n- **Thing.** Use `x`.\n\n\n**Install:** brew") == "New\n• Thing. Use x.")
     try? FileManager.default.removeItem(at: tmp)
     exit(ok ? 0 : 1)
 }
