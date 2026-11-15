@@ -1,6 +1,6 @@
 # MultiClaude release notes
 
-## Unreleased
+## 1.10 (build 18), 2026-11-14
 
 ### New
 - **Ask before updating.** The Update MultiClaude setting now has three modes: Automatically (as before), Ask First and Off. Ask First shows a window with the release notes and Install, Later or Skip This Version. If you had turned automatic updates off, it stays Off.
