@@ -146,6 +146,7 @@ type listRow struct {
 	CodeDir string `json:"codeConfigDir"`
 	Default bool   `json:"default"`
 	Color   string `json:"color"`
+	Group   string `json:"group,omitempty"`
 }
 
 func cmdList(args []string, out io.Writer) error {
@@ -167,20 +168,44 @@ func cmdList(args []string, out io.Writer) error {
 		}
 		rows[i] = listRow{Number: i + 1, ID: p.ID, Name: p.Name, PID: running[p.ID], Open: running[p.ID] != 0,
 			Folder: p.Folder(), CodeDir: code, Default: p.IsDefault(), Color: colorName(p)}
+		if p.Group != nil {
+			rows[i].Group = *p.Group
+		}
 	}
-	if *asJSON {
+	return writeList(rows, out, *asJSON)
+}
+
+// writeList prints the accounts; the GROUP column only shows once some account has a group.
+func writeList(rows []listRow, out io.Writer, asJSON bool) error {
+	if asJSON {
 		enc := json.NewEncoder(out)
 		enc.SetIndent("", "  ")
 		return enc.Encode(rows)
 	}
+	grouped := false
+	for _, r := range rows {
+		grouped = grouped || r.Group != ""
+	}
 	tw := tabwriter.NewWriter(out, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(tw, "#\tACCOUNT\tCOLOR\tSTATE\tFOLDER")
+	if grouped {
+		fmt.Fprintln(tw, "#\tACCOUNT\tCOLOR\tGROUP\tSTATE\tFOLDER")
+	} else {
+		fmt.Fprintln(tw, "#\tACCOUNT\tCOLOR\tSTATE\tFOLDER")
+	}
 	for _, r := range rows {
 		state := "closed"
 		if r.Open {
 			state = "open"
 		}
-		fmt.Fprintf(tw, "%d\t%s\t%s\t%s\t%s\n", r.Number, r.Name, r.Color, state, tildePath(r.Folder))
+		if grouped {
+			g := r.Group
+			if g == "" {
+				g = "-"
+			}
+			fmt.Fprintf(tw, "%d\t%s\t%s\t%s\t%s\t%s\n", r.Number, r.Name, r.Color, g, state, tildePath(r.Folder))
+		} else {
+			fmt.Fprintf(tw, "%d\t%s\t%s\t%s\t%s\n", r.Number, r.Name, r.Color, state, tildePath(r.Folder))
+		}
 	}
 	return tw.Flush()
 }

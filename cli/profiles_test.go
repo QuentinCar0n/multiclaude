@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 )
 
@@ -57,5 +58,24 @@ func TestGroupRoundTrip(t *testing.T) {
 	json.Unmarshal(b, &back)
 	if back["group"] != "Work" || back["future"] != true {
 		t.Errorf("round trip lost fields: %s", b)
+	}
+}
+
+func TestListShowsGroupOnlyWhenUsed(t *testing.T) {
+	var plain, grouped strings.Builder
+	rows := []listRow{{Number: 1, Name: "Claude", Color: "orange", Folder: "/f"}}
+	if err := writeList(rows, &plain, false); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(plain.String(), "GROUP") {
+		t.Errorf("no group set, but GROUP column shown:\n%s", plain.String())
+	}
+	rows = append(rows, listRow{Number: 2, Name: "Augura", Color: "green", Folder: "/g", Group: "Entreprise"})
+	if err := writeList(rows, &grouped, false); err != nil {
+		t.Fatal(err)
+	}
+	out := grouped.String()
+	if !strings.Contains(out, "GROUP") || !strings.Contains(out, "Entreprise") || !strings.Contains(out, "-") {
+		t.Errorf("GROUP column missing:\n%s", out)
 	}
 }
