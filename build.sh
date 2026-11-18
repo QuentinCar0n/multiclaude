@@ -9,7 +9,7 @@ rm -rf build && mkdir -p $APP/Contents/MacOS
 mkdir -p $APP/Contents/Resources
 # Universal binary, so the release runs on Apple silicon and Intel Macs.
 for ARCH in arm64 x86_64; do
-  swiftc -O -target $ARCH-apple-macos15.0 -o build/MultiClaude-$ARCH main.swift -framework AppKit
+  swiftc -O -target $ARCH-apple-macos15.0 -o build/MultiClaude-$ARCH main.swift Groups.swift -framework AppKit
 done
 lipo -create build/MultiClaude-arm64 build/MultiClaude-x86_64 -output $APP/Contents/MacOS/MultiClaude
 rm build/MultiClaude-arm64 build/MultiClaude-x86_64

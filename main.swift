@@ -54,11 +54,12 @@ struct Profile: Codable, Identifiable, Hashable {
     var openAtLaunch: Bool?
     var codeDir: String?   // pinned Claude Code folder, kept when the data folder is renamed
     var appName: String?   // name of this profile's Dock app; nil = "Claude <name>"
+    var group: String?     // account group (see Groups); nil = its own Claude Code folder, as before groups
 
     init(id: UUID = UUID(), name: String, dir: String?, color: Int? = nil, openAtLaunch: Bool? = nil,
-         codeDir: String? = nil, appName: String? = nil) {
+         codeDir: String? = nil, appName: String? = nil, group: String? = nil) {
         (self.id, self.name, self.dir, self.color) = (id, name, dir, color)
-        (self.openAtLaunch, self.codeDir, self.appName) = (openAtLaunch, codeDir, appName)
+        (self.openAtLaunch, self.codeDir, self.appName, self.group) = (openAtLaunch, codeDir, appName, group)
     }
 
     // Lenient, so a list saved by another version still loads: a missing field falls back instead of
@@ -73,6 +74,8 @@ struct Profile: Codable, Identifiable, Hashable {
         openAtLaunch = try? c.decodeIfPresent(Bool.self, forKey: .openAtLaunch)
         codeDir = try? c.decodeIfPresent(String.self, forKey: .codeDir)
         appName = try? c.decodeIfPresent(String.self, forKey: .appName)
+        group = (try? c.decodeIfPresent(String.self, forKey: .group))?.trimmingCharacters(in: .whitespaces)
+        if group?.isEmpty == true { group = nil }
     }
 
     var isDefault: Bool { dir == nil }
@@ -102,7 +105,14 @@ struct Profile: Codable, Identifiable, Hashable {
 
     // Claude Code keeps its sign-in per config folder (and per Keychain entry on macOS),
     // so each profile gets ~/.claude-<folder suffix>. The default profile keeps ~/.claude.
+    // A profile in a group uses the group's folder instead (nil when that is ~/.claude).
     var codeConfigDir: String? {
+        if let codeDir, dir != nil { return codeDir }
+        if let group {
+            let home = FileManager.default.homeDirectoryForCurrentUser.path
+            let f = Groups.folder(group: group, home: home)
+            return f == home + "/.claude" ? nil : f
+        }
         guard let dir else { return nil }
         if let codeDir { return codeDir }
         let suffix = URL(fileURLWithPath: dir).lastPathComponent.replacingOccurrences(of: "Claude-", with: "").lowercased()
@@ -5736,6 +5746,31 @@ if args.count == 2, args[1] == "--selftest-usage" {
     let sample = #"{"five_hour":{"utilization":42.0,"resets_at":"2026-10-15T15:00:00Z"},"seven_day":{"utilization":7.5,"resets_at":null}}"#
     let parsed = ChatLimits.parse(try! JSONSerialization.jsonObject(with: Data(sample.utf8)))
     check("limits parsed", parsed.fiveHour?.percent == 42 && parsed.week?.percent == 7.5 && parsed.fiveHour?.resetsAt != nil)
+    exit(ok ? 0 : 1)
+}
+if args.count == 2, args[1] == "--selftest-groups" {
+    var ok = true
+    func check(_ name: String, _ cond: Bool) { print(cond ? "PASS" : "FAIL", name); ok = ok && cond }
+    let home = FileManager.default.homeDirectoryForCurrentUser.path
+    check("slug lowercases", Groups.slug("Entreprise") == "entreprise")
+    check("slug folds accents and separators", Groups.slug("Mon Groupe/é") == "mon-groupe-e")
+    check("slug of blank is group", Groups.slug("  ") == "group")
+    check("named group folder", Groups.folder(group: "Work", home: "/h") == "/h/.claude-work")
+    check("Personal group folder is ~/.claude", Groups.folder(group: "Personal", home: "/h") == "/h/.claude")
+    check("pinned codeDir wins over group",
+          Profile(name: "A", dir: "/x/Claude-A", codeDir: "/pinned", group: "Work").codeConfigDir == "/pinned")
+    check("grouped profile uses group folder",
+          Profile(name: "A", dir: "/x/Claude-A", group: "Work").codeConfigDir == home + "/.claude-work")
+    check("ungrouped profile keeps its own folder",
+          Profile(name: "A", dir: "/x/Claude-Augura").codeConfigDir == home + "/.claude-augura")
+    check("grouped default profile uses group folder",
+          Profile(name: "D", dir: nil, group: "Work").codeConfigDir == home + "/.claude-work")
+    check("default profile in Personal keeps ~/.claude",
+          Profile(name: "D", dir: nil, group: "Personal").codeConfigDir == nil)
+    let old = try? JSONDecoder().decode(Profile.self, from: Data(#"{"name":"A","dir":"/x/Claude-A"}"#.utf8))
+    check("saved profile without group decodes as ungrouped", old != nil && old?.group == nil)
+    let round = try? JSONDecoder().decode(Profile.self, from: JSONEncoder().encode(Profile(name: "A", dir: "/d", group: "Work")))
+    check("group survives encode and decode", round?.group == "Work")
     exit(ok ? 0 : 1)
 }
 if args.count == 2, args[1] == "--selftest-version" {

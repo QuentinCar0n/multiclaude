@@ -27,6 +27,7 @@ type Profile struct {
 	OpenAtLaunch *bool   `json:"openAtLaunch,omitempty"`
 	CodeDir      *string `json:"codeDir,omitempty"`
 	AppName      *string `json:"appName,omitempty"`
+	Group        *string `json:"group,omitempty"` // account group; nil = its own Claude Code folder
 
 	raw map[string]json.RawMessage
 }
@@ -58,7 +59,7 @@ func (p Profile) MarshalJSON() ([]byte, error) {
 	}
 	for k, v := range p.raw {
 		switch k {
-		case "id", "name", "dir", "color", "openAtLaunch", "codeDir", "appName":
+		case "id", "name", "dir", "color", "openAtLaunch", "codeDir", "appName", "group":
 		default:
 			out[k] = v
 		}
@@ -78,12 +79,16 @@ func (p Profile) Folder() string {
 
 // CodeConfigDir matches Profile.codeConfigDir in main.swift: the default profile keeps ~/.claude
 // (returned as ""), the others get their pinned codeDir or ~/.claude-<folder suffix>.
+// A profile in a group uses the group's folder (see groupFolder).
 func (p Profile) CodeConfigDir() string {
+	if p.CodeDir != nil && p.Dir != nil {
+		return *p.CodeDir
+	}
+	if p.Group != nil && strings.TrimSpace(*p.Group) != "" {
+		return groupFolder(*p.Group)
+	}
 	if p.Dir == nil {
 		return ""
-	}
-	if p.CodeDir != nil {
-		return *p.CodeDir
 	}
 	suffix := strings.ToLower(strings.ReplaceAll(filepath.Base(*p.Dir), "Claude-", ""))
 	return home() + "/.claude-" + suffix
@@ -236,4 +241,55 @@ func tildePath(p string) string {
 		return "~" + p[len(h):]
 	}
 	return p
+}
+
+// groupSlug matches Groups.slug in Groups.swift: lowercase ASCII letters and digits, other runs as "-".
+func groupSlug(name string) string {
+	var b strings.Builder
+	dash := false
+	for _, r := range strings.ToLower(foldAccents(name)) {
+		if r < 128 && (unicode.IsLetter(r) || unicode.IsDigit(r)) {
+			if dash && b.Len() > 0 {
+				b.WriteByte('-')
+			}
+			b.WriteRune(r)
+			dash = false
+		} else {
+			dash = true
+		}
+	}
+	if b.Len() == 0 {
+		return "group"
+	}
+	return b.String()
+}
+
+// groupFolder is a group's Claude Code folder; "" for the Personal group, which is ~/.claude.
+func groupFolder(group string) string {
+	s := groupSlug(group)
+	if s == groupSlug("Personal") {
+		return ""
+	}
+	return home() + "/.claude-" + s
+}
+
+// foldAccents drops accents from common Latin letters (the standard library has no Unicode
+// normalization, and the CLI keeps to golang.org/x/sys only). Other letters pass through.
+func foldAccents(s string) string {
+	const from = "àáâãäåāăąçćčďèéêëēėęěìíîïīįłñńňòóôõöøōőŕřśšşťùúûüūůűųýÿźżžÀÁÂÃÄÅĀĂĄÇĆČĎÈÉÊËĒĖĘĚÌÍÎÏĪĮŁÑŃŇÒÓÔÕÖØŌŐŔŘŚŠŞŤÙÚÛÜŪŮŰŲÝŸŹŻŽ"
+	const to = "aaaaaaaaacccdeeeeeeeeiiiiiilnnnoooooooorrssstuuuuuuuuyyzzzAAAAAAAAACCCDEEEEEEEEIIIIIILNNNOOOOOOOORRSSSTUUUUUUUUYYZZZ"
+	src, dst := []rune(from), []rune(to)
+	m := make(map[rune]rune, len(src))
+	for i, r := range src {
+		if i < len(dst) {
+			m[r] = dst[i]
+		}
+	}
+	out := []rune(s)
+	for i, r := range out {
+		if f, ok := m[r]; ok {
+			out[i] = f
+		}
+	}
+	return string(out)
 }
