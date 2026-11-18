@@ -99,3 +99,14 @@ Success: the user never stops on "limit reached" while another account of the sa
 - Phase 2, local proxy: Claude Code requests go through a local proxy that swaps the account inside a group mid-turn on a 429 or at the threshold. Off by default, needs stored tokens per account (`claude setup-token`), its own spec, and a decision on Anthropic's terms before it ships in the public build. Switching accounts to get around usage limits may break those terms and put both accounts at risk.
 - claude.ai chats and Cowork sessions.
 - Merging or sorting the history already mixed in `~/.claude`.
+
+## Spike results (2026-11-18, Claude desktop 5.11492.5, Claude Code 2.1.325)
+
+Test rig: a clone of the default profile's folder (`Claude-Spike`, APFS clone, same personal account) launched with `open -n -a Claude.app --env CLAUDE_CONFIG_DIR=~/.claude-spike --args --user-data-dir=...`. No second personal account exists yet, so nothing was tested across two real accounts.
+
+1. **Config folder passthrough: partly proven.** The variable reaches the desktop main process (`ps -E`) and the app itself uses it: it created `sessions/`, `plugins/` and `backups/` in `~/.claude-spike`, and its import dialog read from there. The app's code reads `process.env.CLAUDE_CONFIG_DIR` and also offers `CLAUDE_CONFIG_DIR` in Desktop Settings. Not yet seen: the variable on a spawned Code tab `claude` process (needs one session started by hand in the clone).
+2. **Hand-written session record: not listed.** A record copied into the clone's `<account>/<org>` folder with the four account fields removed survived a relaunch, but the sidebar did not show it (accessibility tree search). Its `cwd` was outside the trusted folders, which may be the reason; not retested.
+3. **Deep link: a supported import exists.** `claude://claude.ai/resume?session=<cliSessionId>` makes the app import a Claude Code CLI session from its config folder (`importCliSession`). It only imports sessions whose folder is trusted: for an untrusted folder the app shows "No sessions to import. Only sessions in your trusted folders can be imported". A retry in a trusted folder gave no visible result through accessibility; not confirmed. Other routes: `claude://code/new?folder=...&prompt=...`, `claude://code/continue?session=last`.
+4. **Limit marker: found.** An assistant line with `"isApiErrorMessage":true` and `"error":"rate_limit"`, text "You've hit your session limit · resets <time>" or "You've hit your weekly limit · resets <time>". Seen 400+ times in the author's transcripts.
+
+Consequence for the design: the relay should use the app's own import link (`claude://claude.ai/resume?session=<cliSessionId>`, sent to the target instance's pid) instead of hand-written records, once it is confirmed by hand. Task 5 (record copying) is then not needed.
