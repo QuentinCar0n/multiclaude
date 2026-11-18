@@ -61,6 +61,26 @@ enum Groups {
         try fm.createDirectory(atPath: path, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
     }
 
+    struct Section { let title: String?; let profiles: [Profile]; var key: String { title ?? "" } }
+
+    // The panel's profile list cut by group, in the order each group first appears, so the user's own
+    // order still rules. One untitled section when there is only one group (or none).
+    static func sections(_ list: [Profile]) -> [Section] {
+        func key(_ p: Profile) -> String { p.group.map { slug($0) } ?? "" }
+        var order: [String] = []
+        var byKey: [String: [Profile]] = [:]
+        for p in list {
+            let k = key(p)
+            if byKey[k] == nil { order.append(k) }
+            byKey[k, default: []].append(p)
+        }
+        guard order.count > 1 else { return [Section(title: nil, profiles: list)] }
+        return order.map { k in
+            let ps = byKey[k] ?? []
+            return Section(title: k.isEmpty ? "No Group" : ps.first?.group, profiles: ps)
+        }
+    }
+
     // Why a profile's group can't change now, or nil. An open account would keep writing to its old folder.
     static func changeRefusal(name: String, running: Bool) -> String? {
         running ? "Quit \(name) first, then change its group." : nil

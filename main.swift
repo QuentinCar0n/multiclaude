@@ -299,7 +299,9 @@ final class Engine: ObservableObject {
     private init() {
         if isDemo {
             profiles = ["Personal", "Work", "Client", "Research"].enumerated().map { i, n in
-                Profile(name: n, dir: i == 0 ? nil : "/tmp/multiclaude-demo/Claude-\(n)")
+                Profile(name: n, dir: i == 0 ? nil : "/tmp/multiclaude-demo/Claude-\(n)",
+                        group: ProcessInfo.processInfo.environment["MULTICLAUDE_DEMO_GROUPS"] == nil ? nil
+                            : (i == 1 ? "Work" : "Personal"))
             }
             for i in profiles.indices { profiles[i].color = i }
             demoRunning = [profiles[0].id, profiles[1].id]
@@ -4986,7 +4988,18 @@ struct MenuView: View {
                               open: $profilesOpen)
                 if profilesOpen {
                     VStack(spacing: 0) {
-                        ForEach(engine.profiles) { ProfileRow(profile: $0, editing: $editing) }
+                        ForEach(Groups.sections(engine.profiles), id: \.key) { section in
+                            if let title = section.title {
+                                Text(title)
+                                    .font(.system(size: 11, weight: .semibold))
+                                    .foregroundStyle(.tertiary)
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                                    .padding(.horizontal, 10)
+                                    .padding(.top, 6)
+                                    .padding(.bottom, 2)
+                            }
+                            ForEach(section.profiles) { ProfileRow(profile: $0, editing: $editing) }
+                        }
                         NewProfileRow().id(panel.closed)
                     }
                     .padding(.horizontal, 6)
@@ -5933,6 +5946,15 @@ if args.count == 2, args[1] == "--selftest-groups" {
           && !FileManager.default.fileExists(atPath: dst.appendingPathComponent("projects").path))
     check("setup copy keeps what is already there", (try? Groups.seed(from: src.path, to: dst.path)) != nil)
     try? FileManager.default.removeItem(at: gtmp)
+    // Panel sections
+    let a = Profile(name: "A", dir: "/a", group: "Personal"), b = Profile(name: "B", dir: "/b", group: "Work")
+    let c = Profile(name: "C", dir: "/c", group: "Personal"), d = Profile(name: "D", dir: "/d")
+    check("one section without groups", Groups.sections([d, Profile(name: "E", dir: "/e")]).map(\.title) == [nil])
+    check("one section when all share a group", Groups.sections([a, c]).map(\.title) == [nil])
+    let secs = Groups.sections([a, b, c, d])
+    check("sections in order of first appearance", secs.map(\.title) == ["Personal", "Work", "No Group"])
+    check("sections keep the list order inside", secs.first?.profiles.map(\.name) == ["A", "C"])
+    check("group names compare by folder", Groups.sections([a, Profile(name: "F", dir: "/f", group: "personal ")]).count == 1)
     check("group change refused while open", Groups.changeRefusal(name: "Augura", running: true) != nil)
     check("group change allowed when closed", Groups.changeRefusal(name: "Augura", running: false) == nil)
     // Isolation check of running Claude Code sessions
