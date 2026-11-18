@@ -81,14 +81,14 @@ func (p Profile) Folder() string {
 // (returned as ""), the others get their pinned codeDir or ~/.claude-<folder suffix>.
 // A profile in a group uses the group's folder (see groupFolder).
 func (p Profile) CodeConfigDir() string {
-	if p.CodeDir != nil && p.Dir != nil {
-		return *p.CodeDir
-	}
 	if p.Group != nil && strings.TrimSpace(*p.Group) != "" {
-		return groupFolder(*p.Group)
+		return groupFolder(*p.Group) // before any pinned codeDir, which a folder rename may have left
 	}
 	if p.Dir == nil {
 		return ""
+	}
+	if p.CodeDir != nil {
+		return *p.CodeDir
 	}
 	suffix := strings.ToLower(strings.ReplaceAll(filepath.Base(*p.Dir), "Claude-", ""))
 	return home() + "/.claude-" + suffix
@@ -247,12 +247,15 @@ func tildePath(p string) string {
 func groupSlug(name string) string {
 	var b strings.Builder
 	dash := false
-	for _, r := range strings.ToLower(foldAccents(name)) {
+	for _, r := range foldAccents(name) {
+		if unicode.Is(unicode.Mn, r) {
+			continue // combining mark of a decomposed name
+		}
 		if r < 128 && (unicode.IsLetter(r) || unicode.IsDigit(r)) {
 			if dash && b.Len() > 0 {
 				b.WriteByte('-')
 			}
-			b.WriteRune(r)
+			b.WriteRune(unicode.ToLower(r))
 			dash = false
 		} else {
 			dash = true
@@ -276,8 +279,8 @@ func groupFolder(group string) string {
 // foldAccents drops accents from common Latin letters (the standard library has no Unicode
 // normalization, and the CLI keeps to golang.org/x/sys only). Other letters pass through.
 func foldAccents(s string) string {
-	const from = "àáâãäåāăąçćčďèéêëēėęěìíîïīįłñńňòóôõöøōőŕřśšşťùúûüūůűųýÿźżžÀÁÂÃÄÅĀĂĄÇĆČĎÈÉÊËĒĖĘĚÌÍÎÏĪĮŁÑŃŇÒÓÔÕÖØŌŐŔŘŚŠŞŤÙÚÛÜŪŮŰŲÝŸŹŻŽ"
-	const to = "aaaaaaaaacccdeeeeeeeeiiiiiilnnnoooooooorrssstuuuuuuuuyyzzzAAAAAAAAACCCDEEEEEEEEIIIIIILNNNOOOOOOOORRSSSTUUUUUUUUYYZZZ"
+	const from = "àáâãäåāăąçćčďèéêëēėęěğìíîïīįıłñńňòóôõöøōőŕřśšşșťțùúûüūůűųýÿźżžÀÁÂÃÄÅĀĂĄÇĆČĎÈÉÊËĒĖĘĚĞÌÍÎÏĪĮIŁÑŃŇÒÓÔÕÖØŌŐŔŘŚŠŞȘŤȚÙÚÛÜŪŮŰŲÝŸŹŻŽ"
+	const to = "aaaaaaaaacccdeeeeeeeegiiiiiiilnnnoooooooorrssssttuuuuuuuuyyzzzAAAAAAAAACCCDEEEEEEEEGIIIIIIILNNNOOOOOOOORRSSSSTTUUUUUUUUYYZZZ"
 	src, dst := []rune(from), []rune(to)
 	m := make(map[rune]rune, len(src))
 	for i, r := range src {

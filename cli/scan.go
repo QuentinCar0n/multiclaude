@@ -290,14 +290,34 @@ func usageSources(list []Profile) []usageSource {
 			return terminalOwner
 		},
 	}}
+	// A group folder is shared: scan it once, crediting each session to the member that ran it (first
+	// member when unknown), like UsageScan.sources in main.swift.
+	members := map[string][]string{}
+	var folders []string
+	for _, p := range list {
+		if cfg := p.CodeConfigDir(); cfg != "" {
+			if _, seen := members[cfg]; !seen {
+				folders = append(folders, cfg)
+			}
+			members[cfg] = append(members[cfg], p.ID)
+		}
+	}
+	for _, cfg := range folders {
+		ids := members[cfg]
+		out = append(out, usageSource{root: filepath.Join(cfg, "projects"), archiveName: "code-" + filepath.Base(cfg), owner: func(f string) string {
+			if o, ok := owners[sessionID(f)]; ok && len(ids) > 1 {
+				for _, id := range ids {
+					if id == o {
+						return o
+					}
+				}
+			}
+			return ids[0]
+		}})
+	}
 	for _, p := range list {
 		id := p.ID
 		mine := func(string) string { return id }
-		if p.Dir != nil {
-			if cfg := p.CodeConfigDir(); cfg != "" {
-				out = append(out, usageSource{root: filepath.Join(cfg, "projects"), archiveName: "code-" + filepath.Base(cfg), owner: mine})
-			}
-		}
 		out = append(out, usageSource{root: filepath.Join(p.Folder(), "local-agent-mode-sessions"), archiveName: "cowork", owner: mine})
 	}
 	return out

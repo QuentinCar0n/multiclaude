@@ -319,21 +319,41 @@ func bringForward(pid int) error {
 	return exec.Command("/usr/bin/osascript", "-l", "JavaScript", "-e", js).Run()
 }
 
-// openDirect starts Claude without MultiClaude, with the same arguments as Launch.openArgs.
-func openDirect(p Profile, anyClaudeRunning bool) error {
-	var args []string
+// openDirectArgs are the `open` arguments of Launch.openArgs in main.swift: a grouped profile gets its
+// group's Claude Code folder as CLAUDE_CONFIG_DIR.
+func openDirectArgs(p Profile, anyClaudeRunning bool) []string {
+	var env []string
+	if p.Group != nil {
+		if dir := p.CodeConfigDir(); dir != "" {
+			env = []string{"--env", "CLAUDE_CONFIG_DIR=" + dir}
+		}
+	}
+	base := []string{"-n", "-b", "com.anthropic.claudefordesktop"}
 	switch {
 	case p.Dir != nil:
+		return append(append(base, env...), "--args", "--user-data-dir="+*p.Dir)
+	case anyClaudeRunning || len(env) > 0:
+		return append(base, env...)
+	default:
+		return []string{"-b", "com.anthropic.claudefordesktop"}
+	}
+}
+
+// openDirect starts Claude without MultiClaude, with the same arguments as Launch.openArgs.
+func openDirect(p Profile, anyClaudeRunning bool) error {
+	if p.Dir != nil {
 		if err := os.MkdirAll(*p.Dir, 0o755); err != nil {
 			return err
 		}
-		args = []string{"-n", "-b", "com.anthropic.claudefordesktop", "--args", "--user-data-dir=" + *p.Dir}
-	case anyClaudeRunning:
-		args = []string{"-n", "-b", "com.anthropic.claudefordesktop"}
-	default:
-		args = []string{"-b", "com.anthropic.claudefordesktop"}
 	}
-	if err := exec.Command("/usr/bin/open", args...).Run(); err != nil {
+	if p.Group != nil {
+		if dir := p.CodeConfigDir(); dir != "" {
+			if err := os.MkdirAll(dir, 0o700); err != nil {
+				return err
+			}
+		}
+	}
+	if err := exec.Command("/usr/bin/open", openDirectArgs(p, anyClaudeRunning)...).Run(); err != nil {
 		return errors.New("Claude isn't installed (get it at claude.ai/download)")
 	}
 	return nil

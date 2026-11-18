@@ -106,8 +106,9 @@ struct Profile: Codable, Identifiable, Hashable {
     // Claude Code keeps its sign-in per config folder (and per Keychain entry on macOS),
     // so each profile gets ~/.claude-<folder suffix>. The default profile keeps ~/.claude.
     // A profile in a group uses the group's folder instead (nil when that is ~/.claude).
+    // The group comes first: a codeDir pinned by a folder rename must not keep a grouped profile in
+    // another folder.
     var codeConfigDir: String? {
-        if let codeDir, dir != nil { return codeDir }
         if let group {
             let home = FileManager.default.homeDirectoryForCurrentUser.path
             let f = Groups.folder(group: group, home: home)
@@ -295,6 +296,7 @@ final class Engine: ObservableObject {
     private var failedMoves: Set<String> = []
     private var isolationAt: Date?            // last check of where grouped profiles' Code sessions write
     private var isolationWarned: Set<UUID> = []
+    private var isolationNotice: String?      // the last isolation warning shown, cleared once fixed
 
     private init() {
         if isDemo {
@@ -687,25 +689,30 @@ final class Engine: ObservableObject {
         if let t = isolationAt, now.timeIntervalSince(t) < 60 { return }
         isolationAt = now
         let home = FileManager.default.homeDirectoryForCurrentUser.path
+        isolationWarned = isolationWarned.filter { running[$0] != nil }   // a quit profile starts over
         let grouped = profiles.filter { $0.group != nil && running[$0.id] != nil }
-        guard !grouped.isEmpty else { isolationWarned = []; return }
-        let sessions = Groups.codeSessions()
+        let sessions = grouped.isEmpty ? [] : Groups.codeSessions()
+        var warning: String?
         for p in grouped {
             let prefix = Folders.canonical(p.folderURL.path) + "/claude-code/"
             let seen = sessions.filter { Folders.canonical($0.path).hasPrefix(prefix) }.map { $0.configDir }
             let expected = p.codeConfigDir
+            let target = expected ?? home + "/.claude"
             if Groups.misplaced(expected: expected, seen: seen, home: home) > 0 {
-                guard !isolationWarned.contains(p.id) else { continue }
-                isolationWarned.insert(p.id)
-                let target = expected ?? home + "/.claude"
-                notice = "\(p.name)'s Claude Code sessions don't use the \(p.group ?? "") folder yet. In \(p.name), "
-                    + "open Settings, Claude Code, environment variables, add CLAUDE_CONFIG_DIR=\(target), then start a new session."
-                Log.write("isolation: \(p.name) has \(seen.count) Code session(s), some outside \(target)")
-                onChange?()
-            } else if isolationWarned.remove(p.id) != nil {
-                Log.write("isolation: \(p.name) sessions now use \(expected ?? "~/.claude")")
+                if isolationWarned.insert(p.id).inserted {
+                    Log.write("isolation: \(p.name) has \(seen.count) Code session(s), some outside \(target)")
+                }
+            } else if !seen.isEmpty, isolationWarned.remove(p.id) != nil {
+                Log.write("isolation: \(p.name) sessions now use \(target)")
+            }
+            if warning == nil, isolationWarned.contains(p.id) {
+                warning = "\(p.name)'s Claude Code sessions don't use the \(p.group ?? "") folder yet. In \(p.name), "
+                    + "open Settings, Claude Code, environment variables, set CLAUDE_CONFIG_DIR=\(target), then start a new session."
             }
         }
+        let next = signIn != nil ? notice : Groups.nextNotice(panel: notice, ownLast: isolationNotice, warning: warning)
+        isolationNotice = warning
+        if next != notice { notice = next; onChange?() }
     }
 
     // The profile whose own copy of Claude (see Runtimes) this process runs from, if any.
@@ -2891,12 +2898,25 @@ final class UsageScan: @unchecked Sendable {
         var list = [UsageSource(root: home.appendingPathComponent(".claude/projects"), archiveName: "code") { f in
             owners[sessionID(of: f)] ?? terminal
         }]
+        // A group folder is shared: scan it once, crediting each session to the member that ran it
+        // (first member when unknown).
+        var byFolder: [String: [String]] = [:]
+        var folderOrder: [String] = []
+        for p in profiles {
+            guard let cfg = p.codeConfigDir else { continue }
+            if byFolder[cfg] == nil { folderOrder.append(cfg) }
+            byFolder[cfg, default: []].append(p.id.uuidString)
+        }
+        for cfg in folderOrder {
+            let members = byFolder[cfg] ?? []
+            let first = members.first ?? terminal
+            list.append(UsageSource(root: URL(fileURLWithPath: cfg).appendingPathComponent("projects"),
+                                    archiveName: "code-" + URL(fileURLWithPath: cfg).lastPathComponent) { f in
+                members.count == 1 ? first : owners[sessionID(of: f)].flatMap { members.contains($0) ? $0 : nil } ?? first
+            })
+        }
         for p in profiles {
             let id = p.id.uuidString
-            if let cfg = p.codeConfigDir {
-                list.append(UsageSource(root: URL(fileURLWithPath: cfg).appendingPathComponent("projects"),
-                                        archiveName: "code-" + URL(fileURLWithPath: cfg).lastPathComponent) { _ in id })
-            }
             list.append(UsageSource(root: p.folderURL.appendingPathComponent("local-agent-mode-sessions"),
                                     archiveName: "cowork") { _ in id })
         }
@@ -3696,7 +3716,12 @@ enum Launchers {
     static func script(for p: Profile) -> String {
         let rt = shellQuote(Runtimes.dir(p.id).path), real = shellQuote(realClaudeApp().path)
         let fallback = "app=$(ls -d \(rt)/*.app 2>/dev/null | head -n 1); [ -d \"$app\" ] || app=\(real)\n"
-            + (p.dir.map { "exec /usr/bin/open -n -a \"$app\" --args \(shellQuote("--user-data-dir=" + $0))" } ?? "exec /usr/bin/open -a \"$app\"")
+            + { () -> String in
+                // Same arguments as Launch.openArgs, with the group's folder for a grouped profile.
+                let env = (p.group == nil ? nil : p.codeConfigDir).map { " --env \(shellQuote("CLAUDE_CONFIG_DIR=" + $0))" } ?? ""
+                if let dir = p.dir { return "exec /usr/bin/open -n -a \"$app\"\(env) --args \(shellQuote("--user-data-dir=" + dir))" }
+                return env.isEmpty ? "exec /usr/bin/open -a \"$app\"" : "exec /usr/bin/open -n -a \"$app\"\(env)"
+            }()
         return """
         #!/bin/sh
         # Made by MultiClaude for the profile \(shellQuote(String(p.name.filter { !$0.isNewline }))). MultiClaude rewrites this app; edits are lost.
@@ -3708,7 +3733,7 @@ enum Launchers {
 
     // Everything that shows in the app; a change in any of it rewrites the app.
     static func stamp(for p: Profile, name: String) -> String {
-        "\(format)|\(name)|\(p.initial)|\(p.color ?? 0)|\(p.dir ?? "")|\(p.name)"
+        "\(format)|\(name)|\(p.initial)|\(p.color ?? 0)|\(p.dir ?? "")|\(p.name)|\(p.group ?? "")"
     }
 
     static func info(for p: Profile, name: String) -> [String: Any] {
@@ -4196,6 +4221,7 @@ enum Dialogs {
         let (choice, name) = alert("Group of \(p.name)",
                                    "Accounts in the same group share Claude Code: memory, CLAUDE.md, skills, plugins and session history. "
                                    + "An account alone in its group keeps all of that to itself. \(Groups.defaultName) uses ~/.claude. "
+                                   + "Claude Code in Terminal signs in once per group, so in a shared group it runs as the account that signed in last. "
                                    + "Leave it empty for no group." + known,
                                    buttons: ["Set Group", "Cancel"], field: p.group ?? "")
         guard choice == 0 else { return }
@@ -4204,8 +4230,19 @@ enum Dialogs {
             _ = alert("\"\(g)\" is the same group as \"\(clash)\"", "Both names give the folder ~/.claude-\(Groups.slug(g)). Use \"\(clash)\" or another name.", buttons: ["OK"])
             return
         }
+        if !g.isEmpty, let owner = Groups.folderOwner(group: g, profiles: e.profiles.filter { $0.id != p.id }) {
+            _ = alert("\"\(g)\" would share \(owner)'s own folder",
+                      "\(owner) has no group and already uses \(Groups.folder(group: g, home: FileManager.default.homeDirectoryForCurrentUser.path)) for its Claude Code history and sign-in. Pick another name, or put \(owner) in \(g) too.",
+                      buttons: ["OK"])
+            return
+        }
+        let from = p.group
         let (ok, newFolder) = e.setGroup(p, g)
-        guard ok, let newFolder else { return }
+        guard ok else { return }
+        if let hint = Groups.leaveHint(name: p.name, from: from, to: g.isEmpty ? nil : g) {
+            _ = alert("\(p.name) left \(from ?? "")", hint, buttons: ["OK"])
+        }
+        guard let newFolder else { return }
         let home = FileManager.default.homeDirectoryForCurrentUser.path
         let (copy, _) = alert("Start \(g) with your setup?",
                               "Copies CLAUDE.md, skills, plugins, agents, commands and settings.json from ~/.claude into \(newFolder). "
@@ -5906,8 +5943,15 @@ if args.count == 2, args[1] == "--selftest-groups" {
     check("slug of blank is group", Groups.slug("  ") == "group")
     check("named group folder", Groups.folder(group: "Work", home: "/h") == "/h/.claude-work")
     check("Personal group folder is ~/.claude", Groups.folder(group: "Personal", home: "/h") == "/h/.claude")
-    check("pinned codeDir wins over group",
-          Profile(name: "A", dir: "/x/Claude-A", codeDir: "/pinned", group: "Work").codeConfigDir == "/pinned")
+    check("group wins over a pinned codeDir (review C1)",
+          Profile(name: "A", dir: "/x/Claude-A", codeDir: home + "/.claude-work", group: "Entreprise").codeConfigDir == home + "/.claude-entreprise")
+    check("pinned codeDir still applies without a group",
+          Profile(name: "A", dir: "/x/Claude-A", codeDir: "/pinned").codeConfigDir == "/pinned")
+    // Same slugs as the Go CLI (review I3): one table in both test suites.
+    let slugTable: [(String, String)] = [("Straße", "stra-e"), ("Łódź", "lodz"), ("Ørsted", "orsted"), ("Ğüzel", "guzel"),
+                                         ("Ș", "s"), ("ﬁx", "x"), ("Pe\u{301}rsonal", "personal"), ("Mon Groupe/é", "mon-groupe-e"),
+                                         ("  ", "group"), ("Entreprise", "entreprise")]
+    for (name, want) in slugTable { check("slug \(name) = \(want)", Groups.slug(name) == want) }
     check("grouped profile uses group folder",
           Profile(name: "A", dir: "/x/Claude-A", group: "Work").codeConfigDir == home + "/.claude-work")
     check("ungrouped profile keeps its own folder",
@@ -5955,6 +5999,29 @@ if args.count == 2, args[1] == "--selftest-groups" {
     check("sections in order of first appearance", secs.map(\.title) == ["Personal", "Work", "No Group"])
     check("sections keep the list order inside", secs.first?.profiles.map(\.name) == ["A", "C"])
     check("group names compare by folder", Groups.sections([a, Profile(name: "F", dir: "/f", group: "personal ")]).count == 1)
+    // A group folder that is an ungrouped profile's own folder (review I4)
+    let own = Profile(name: "W", dir: "/x/Claude-Work")
+    check("group folder clashing with an ungrouped profile is found", Groups.folderOwner(group: "Work", profiles: [own]) == "W")
+    check("no clash with a grouped profile of that group",
+          Groups.folderOwner(group: "Work", profiles: [Profile(name: "W", dir: "/x/Claude-Work", group: "Work")]) == nil)
+    // Leaving a group (review I5)
+    check("leaving a group says which setting to change",
+          Groups.leaveHint(name: "Augura", from: "Work", to: nil)?.contains("CLAUDE_CONFIG_DIR") == true)
+    check("no hint when the profile had no group", Groups.leaveHint(name: "Augura", from: nil, to: "Work") == nil)
+    // Notice handling (review I6)
+    check("warning shows on an empty panel", Groups.nextNotice(panel: nil, ownLast: nil, warning: "w") == "w")
+    check("warning never covers another message", Groups.nextNotice(panel: "sign in", ownLast: nil, warning: "w") == "sign in")
+    check("fixed: own warning goes away", Groups.nextNotice(panel: "w", ownLast: "w", warning: nil) == nil)
+    check("fixed: other message stays", Groups.nextNotice(panel: "sign in", ownLast: "w", warning: nil) == "sign in")
+    // Usage of a shared group folder is counted once (review I8)
+    let ga = Profile(name: "GA", dir: "/x/Claude-GA", group: "Work"), gb = Profile(name: "GB", dir: "/x/Claude-GB", group: "Work")
+    let roots = UsageScan.sources([ga, gb]).map { $0.root.path }
+    check("group folder scanned once", roots.filter { $0 == home + "/.claude-work/projects" }.count == 1)
+    // Launchers and their stamp carry the group folder (review I2)
+    check("launcher script passes the group folder", Launchers.script(for: ga).contains("--env " + shellQuote("CLAUDE_CONFIG_DIR=" + home + "/.claude-work")))
+    check("launcher script of an ungrouped profile is unchanged", !Launchers.script(for: own).contains("--env"))
+    check("launcher stamp changes with the group",
+          Launchers.stamp(for: ga, name: "n") != Launchers.stamp(for: Profile(id: ga.id, name: "GA", dir: "/x/Claude-GA"), name: "n"))
     check("group change refused while open", Groups.changeRefusal(name: "Augura", running: true) != nil)
     check("group change allowed when closed", Groups.changeRefusal(name: "Augura", running: false) == nil)
     // Isolation check of running Claude Code sessions

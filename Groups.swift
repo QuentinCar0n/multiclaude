@@ -9,14 +9,20 @@ enum Groups {
     static let defaultName = "Personal"
 
     // A safe single path component: lowercase ASCII letters and digits, other runs turned into "-".
+    // The Go CLI (groupSlug in cli/profiles.go) uses the same table and steps, so both find one folder:
+    // fold the accented letters in the table, drop combining marks (a name in decomposed form), then
+    // keep ASCII letters and digits. Both test suites share one table of cases.
+    static let foldFrom = Array("àáâãäåāăąçćčďèéêëēėęěğìíîïīįıłñńňòóôõöøōőŕřśšşșťțùúûüūůűųýÿźżžÀÁÂÃÄÅĀĂĄÇĆČĎÈÉÊËĒĖĘĚĞÌÍÎÏĪĮIŁÑŃŇÒÓÔÕÖØŌŐŔŘŚŠŞȘŤȚÙÚÛÜŪŮŰŲÝŸŹŻŽ".unicodeScalars)
+    static let foldTo = Array("aaaaaaaaacccdeeeeeeeegiiiiiiilnnnoooooooorrssssttuuuuuuuuyyzzzAAAAAAAAACCCDEEEEEEEEGIIIIIIILNNNOOOOOOOORRSSSSTTUUUUUUUUYYZZZ".unicodeScalars)
     static func slug(_ name: String) -> String {
-        let folded = name.folding(options: [.diacriticInsensitive, .caseInsensitive], locale: Locale(identifier: "en_US_POSIX"))
         var out = ""
         var dash = false
-        for ch in folded.lowercased().unicodeScalars {
-            if ch.isASCII && (CharacterSet.alphanumerics.contains(ch)) {
+        for var ch in name.unicodeScalars {
+            if let i = foldFrom.firstIndex(of: ch) { ch = foldTo[i] }
+            if ch.properties.generalCategory == .nonspacingMark { continue }
+            if ch.isASCII, CharacterSet.alphanumerics.contains(ch) {
                 if dash && !out.isEmpty { out.append("-") }
-                out.unicodeScalars.append(ch)
+                out.unicodeScalars.append(contentsOf: String(ch).lowercased().unicodeScalars)
                 dash = false
             } else {
                 dash = true
@@ -59,6 +65,28 @@ enum Groups {
             return
         }
         try fm.createDirectory(atPath: path, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+    }
+
+    // The ungrouped profile whose own Claude Code folder is the folder this group would use, if any.
+    // Sharing it would mix that profile's history and CLI sign-in into the group.
+    static func folderOwner(group: String, profiles: [Profile]) -> String? {
+        let home = FileManager.default.homeDirectoryForCurrentUser.path
+        let f = folder(group: group, home: home)
+        return profiles.first { $0.group == nil && ($0.codeConfigDir ?? home + "/.claude") == f }?.name
+    }
+
+    // What to change in Claude after a profile leaves a group: a CLAUDE_CONFIG_DIR set in that account's
+    // Claude settings would keep its sessions in the old group's folder.
+    static func leaveHint(name: String, from: String?, to: String?) -> String? {
+        guard let from, slug(from) != to.map(slug) else { return nil }
+        return "If you set CLAUDE_CONFIG_DIR in \(name)'s Claude settings for \(from), change it or remove it, then start a new session."
+    }
+
+    // The panel's one-line message after an isolation check. Never covers another message; clears its
+    // own warning once fixed.
+    static func nextNotice(panel: String?, ownLast: String?, warning: String?) -> String? {
+        if let warning { return panel == nil || panel == ownLast ? warning : panel }
+        return panel == ownLast ? nil : panel
     }
 
     struct Section { let title: String?; let profiles: [Profile]; var key: String { title ?? "" } }
