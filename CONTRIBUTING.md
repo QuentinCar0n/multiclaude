@@ -1,6 +1,6 @@
 # Contributing to MultiClaude
 
-Thanks for helping. MultiClaude stays small on purpose: one Swift file, no dependencies, nothing that touches the network or Claude's data folders.
+Thanks for helping. MultiClaude stays small on purpose: two Swift files, no dependencies, nothing that touches the network or Claude's data folders.
 
 ## Report a bug
 

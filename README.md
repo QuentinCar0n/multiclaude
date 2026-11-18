@@ -66,6 +66,7 @@ MultiClaude is that trick with a proper interface.
 - **Know which account is in front.** While a Claude window is active, the menu bar shows its account name in that account's color.
 - **Live status.** A filled badge marks every account that is running. The menu bar shows how many are open.
 - **Survives Claude updates.** When Claude updates itself it relaunches on the default account, which breaks every `--user-data-dir` setup. MultiClaude notices and reopens each profile on its own account.
+- **Account groups.** Right-click a profile and choose **Group…**. Accounts in one group share Claude Code (memory, `CLAUDE.md`, skills, plugins, settings and session history); an account alone in its group keeps its own. Handy to keep a work account's Claude Code apart from your personal ones. MultiClaude checks that each grouped account's Code tab sessions really use the group's folder and tells you what to set if not.
 - **Claude Code per account.** Right-click a profile and choose **Open Claude Code in Terminal**: the CLI runs signed in as that account, with its own `CLAUDE_CONFIG_DIR`.
 - **Click to open, click again to focus.** No duplicate windows.
 - **Hover to quit** a single account. The header switch opens or quits all of them at once.
@@ -92,7 +93,7 @@ MultiClaude is that trick with a proper interface.
 - **Global shortcuts.** ⌃⌥⌘M opens the panel; turn on Profile Shortcuts and ⌃⌥1 to ⌃⌥9 jump straight to each account.
 - **Updates itself.** Once a day MultiClaude checks for a new release, installs it in the background and restarts while the panel is closed. Your Claude windows stay open. Set **Update MultiClaude** in Settings to **Ask First** to get a window with the release notes and Install, Later or Skip This Version instead, or to **Off** to stop checking. **Check for Updates…** in the panel, or `multiclaude update` in the terminal, checks right away in any mode.
 - **Launch at login**, light and dark mode, colored menu bar icon.
-- **Small.** A single Swift file, no dependencies, a 1.6 MB download.
+- **Small.** Two Swift files, no dependencies, a 1.6 MB download.
 
 <p align="center">
 <picture>
@@ -221,7 +222,7 @@ cd multiclaude
 ./build.sh --no-install # stops after build/MultiClaude-<version>.zip
 ```
 
-Needs Xcode command line tools with Swift 6 and Go 1.26. The app is all in [`main.swift`](main.swift): SwiftUI views inside an AppKit menu bar panel. The `multiclaude` command is in [`cli/`](cli); test it with `cd cli && go test ./...`. `./build.sh` links it into `~/.local/bin` when that folder is on your `PATH`.
+Needs Xcode command line tools with Swift 6 and Go 1.26. The app is in [`main.swift`](main.swift), SwiftUI views inside an AppKit menu bar panel, plus [`Groups.swift`](Groups.swift) for account groups. The `multiclaude` command is in [`cli/`](cli); test it with `cd cli && go test ./...`. `./build.sh` links it into `~/.local/bin` when that folder is on your `PATH`.
 
 Screenshots for this README come from a demo mode with sample profiles:
 

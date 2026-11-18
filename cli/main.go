@@ -146,6 +146,7 @@ type listRow struct {
 	CodeDir string `json:"codeConfigDir"`
 	Default bool   `json:"default"`
 	Color   string `json:"color"`
+	Group   string `json:"group,omitempty"`
 }
 
 func cmdList(args []string, out io.Writer) error {
@@ -167,20 +168,44 @@ func cmdList(args []string, out io.Writer) error {
 		}
 		rows[i] = listRow{Number: i + 1, ID: p.ID, Name: p.Name, PID: running[p.ID], Open: running[p.ID] != 0,
 			Folder: p.Folder(), CodeDir: code, Default: p.IsDefault(), Color: colorName(p)}
+		if p.Group != nil {
+			rows[i].Group = *p.Group
+		}
 	}
-	if *asJSON {
+	return writeList(rows, out, *asJSON)
+}
+
+// writeList prints the accounts; the GROUP column only shows once some account has a group.
+func writeList(rows []listRow, out io.Writer, asJSON bool) error {
+	if asJSON {
 		enc := json.NewEncoder(out)
 		enc.SetIndent("", "  ")
 		return enc.Encode(rows)
 	}
+	grouped := false
+	for _, r := range rows {
+		grouped = grouped || r.Group != ""
+	}
 	tw := tabwriter.NewWriter(out, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(tw, "#\tACCOUNT\tCOLOR\tSTATE\tFOLDER")
+	if grouped {
+		fmt.Fprintln(tw, "#\tACCOUNT\tCOLOR\tGROUP\tSTATE\tFOLDER")
+	} else {
+		fmt.Fprintln(tw, "#\tACCOUNT\tCOLOR\tSTATE\tFOLDER")
+	}
 	for _, r := range rows {
 		state := "closed"
 		if r.Open {
 			state = "open"
 		}
-		fmt.Fprintf(tw, "%d\t%s\t%s\t%s\t%s\n", r.Number, r.Name, r.Color, state, tildePath(r.Folder))
+		if grouped {
+			g := r.Group
+			if g == "" {
+				g = "-"
+			}
+			fmt.Fprintf(tw, "%d\t%s\t%s\t%s\t%s\t%s\n", r.Number, r.Name, r.Color, g, state, tildePath(r.Folder))
+		} else {
+			fmt.Fprintf(tw, "%d\t%s\t%s\t%s\t%s\n", r.Number, r.Name, r.Color, state, tildePath(r.Folder))
+		}
 	}
 	return tw.Flush()
 }
@@ -294,21 +319,41 @@ func bringForward(pid int) error {
 	return exec.Command("/usr/bin/osascript", "-l", "JavaScript", "-e", js).Run()
 }
 
-// openDirect starts Claude without MultiClaude, with the same arguments as Launch.openArgs.
-func openDirect(p Profile, anyClaudeRunning bool) error {
-	var args []string
+// openDirectArgs are the `open` arguments of Launch.openArgs in main.swift: a grouped profile gets its
+// group's Claude Code folder as CLAUDE_CONFIG_DIR.
+func openDirectArgs(p Profile, anyClaudeRunning bool) []string {
+	var env []string
+	if p.Group != nil {
+		if dir := p.CodeConfigDir(); dir != "" {
+			env = []string{"--env", "CLAUDE_CONFIG_DIR=" + dir}
+		}
+	}
+	base := []string{"-n", "-b", "com.anthropic.claudefordesktop"}
 	switch {
 	case p.Dir != nil:
+		return append(append(base, env...), "--args", "--user-data-dir="+*p.Dir)
+	case anyClaudeRunning || len(env) > 0:
+		return append(base, env...)
+	default:
+		return []string{"-b", "com.anthropic.claudefordesktop"}
+	}
+}
+
+// openDirect starts Claude without MultiClaude, with the same arguments as Launch.openArgs.
+func openDirect(p Profile, anyClaudeRunning bool) error {
+	if p.Dir != nil {
 		if err := os.MkdirAll(*p.Dir, 0o755); err != nil {
 			return err
 		}
-		args = []string{"-n", "-b", "com.anthropic.claudefordesktop", "--args", "--user-data-dir=" + *p.Dir}
-	case anyClaudeRunning:
-		args = []string{"-n", "-b", "com.anthropic.claudefordesktop"}
-	default:
-		args = []string{"-b", "com.anthropic.claudefordesktop"}
 	}
-	if err := exec.Command("/usr/bin/open", args...).Run(); err != nil {
+	if p.Group != nil {
+		if dir := p.CodeConfigDir(); dir != "" {
+			if err := os.MkdirAll(dir, 0o700); err != nil {
+				return err
+			}
+		}
+	}
+	if err := exec.Command("/usr/bin/open", openDirectArgs(p, anyClaudeRunning)...).Run(); err != nil {
 		return errors.New("Claude isn't installed (get it at claude.ai/download)")
 	}
 	return nil
