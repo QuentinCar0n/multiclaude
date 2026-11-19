@@ -1,6 +1,6 @@
 # MultiClaude release notes
 
-## Unreleased (1.11, build 19)
+## 1.11 (build 19), 2026-11-18
 
 ### New
 - **Account groups.** Right-click a profile and choose **Group…**. Accounts in the same group share Claude Code: memory, `CLAUDE.md`, skills, plugins, settings and session history, all in one folder (`~/.claude-<group>`, or `~/.claude` for a group named Personal). An account alone in its group keeps all of that to itself, so a work account no longer mixes its Claude Code history with your personal ones. A new group can start with a copy of your skills, plugins and `CLAUDE.md`; history and memory never move.
