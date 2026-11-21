@@ -9,7 +9,11 @@
 
 # MultiClaude
 
-**All your Claude accounts, open at once.** A free menu bar app for macOS.
+MultiClaude is a free, open source macOS menu bar app for people with more than one Claude account: it runs several Claude desktop accounts side by side, each in its own profile (its own `--user-data-dir` folder), and adds a `multiclaude` command for the terminal.
+
+**All your Claude accounts, open at once.** Apache 2.0, macOS 15 or later, Apple silicon and Intel, version 1.11.
+
+**Unofficial:** not affiliated with or endorsed by Anthropic.
 
 [![Release](https://img.shields.io/github/v/release/QuentinCar0n/multiclaude?color=D97757)](https://github.com/QuentinCar0n/multiclaude/releases/latest)
 [![Homebrew](https://img.shields.io/badge/brew-quentincar0n%2Ftap%2Fmulticlaude-D97757)](https://github.com/QuentinCar0n/homebrew-tap)
@@ -21,9 +25,25 @@
 brew install --cask quentincar0n/tap/multiclaude
 ```
 
-[**Download the latest release**](https://github.com/QuentinCar0n/multiclaude/releases/latest) &nbsp;&middot;&nbsp; [Website](https://quentincar0n.github.io/multiclaude/) &nbsp;&middot;&nbsp; [Why](#why) &nbsp;&middot;&nbsp; [Features](#features) &nbsp;&middot;&nbsp; [How it works](#how-it-works) &nbsp;&middot;&nbsp; [FAQ](#faq)
+[**Download the latest release**](https://github.com/QuentinCar0n/multiclaude/releases/latest) &nbsp;&middot;&nbsp; [Website](https://quentincar0n.github.io/multiclaude/) &nbsp;&middot;&nbsp; [Why](#why) &nbsp;&middot;&nbsp; [Features](#features) &nbsp;&middot;&nbsp; [How it works](#how-it-works) &nbsp;&middot;&nbsp; [FAQ](#faq) &nbsp;&middot;&nbsp; [Docs](#documentation)
 
 </div>
+
+## At a glance
+
+| | |
+| --- | --- |
+| What it is | A menu bar manager for several Claude desktop accounts on one Mac, with a `multiclaude` command line tool |
+| License | [Apache License 2.0](LICENSE) |
+| Written in | Swift (the app: [`main.swift`](main.swift) and [`Groups.swift`](Groups.swift), SwiftUI inside an AppKit panel) and Go (the [`cli/`](cli) tool) |
+| Platforms | macOS 15 or later, universal binary (arm64 and x86_64) |
+| Current version | 1.11 (build 19), released 2026-11-18 ([CHANGELOG](CHANGELOG.md)) |
+| Install | `brew install --cask quentincar0n/tap/multiclaude` |
+| Requires | The [Claude desktop app](https://claude.ai/download) in `/Applications` |
+| Dependencies | None for the app; `golang.org/x/sys` for the CLI |
+| Network use | A daily update check against GitHub; claude.ai only if you turn on Show Chat Limits. No analytics |
+| Homepage | [quentincar0n.github.io/multiclaude](https://quentincar0n.github.io/multiclaude/) |
+| Status | Independent and unofficial. Claude is a trademark of Anthropic, PBC |
 
 ## Why
 
@@ -60,40 +80,63 @@ MultiClaude is that trick with a proper interface.
 
 ## Features
 
+### Accounts and profiles
+
 - **One profile per account.** Each profile is its own Claude data folder, so sign-ins and chats never leak between accounts.
-- **A color per account.** Each profile gets its own color, so you can tell Personal from Work at a glance. Right-click to change it.
-- **An app and an icon for each account.** Turn on **Colored Claude Icon per Account** (App for Each Profile in earlier versions) and MultiClaude makes a small app per profile in `~/Applications/MultiClaude Launchers`, named "Claude Work", "Claude Client" and so on, with Claude's own icon recolored in the profile's color. Find them in Spotlight and Launchpad, or right-click a profile and choose **Add to Dock**. Rename one with **Rename App…**. Each account's window then runs with that icon too, in the Dock, ⌘-Tab and Mission Control, so you can tell them apart while they're open. The apps follow renames and color changes, and go away with their profile.
-- **Know which account is in front.** While a Claude window is active, the menu bar shows its account name in that account's color.
 - **Live status.** A filled badge marks every account that is running. The menu bar shows how many are open.
-- **Survives Claude updates.** When Claude updates itself it relaunches on the default account, which breaks every `--user-data-dir` setup. MultiClaude notices and reopens each profile on its own account.
-- **Account groups.** Right-click a profile and choose **Group…**. Accounts in one group share Claude Code (memory, `CLAUDE.md`, skills, plugins, settings and session history); an account alone in its group keeps its own. Handy to keep a work account's Claude Code apart from your personal ones. MultiClaude checks that each grouped account's Code tab sessions really use the group's folder and tells you what to set if not.
-- **Claude Code per account.** Right-click a profile and choose **Open Claude Code in Terminal**: the CLI runs signed in as that account, with its own `CLAUDE_CONFIG_DIR`.
 - **Click to open, click again to focus.** No duplicate windows.
 - **Hover to quit** a single account. The header switch opens or quits all of them at once.
 - **New Profile** in one line: type a name, press Return, sign in to the new account in the window that opens.
-- **Copy MCP servers between accounts.** Set your MCP servers up once, then right-click another profile and choose **Copy MCP Servers From**. Its config is backed up first.
 - **Open accounts at startup.** Right-click a profile and tick **Open When MultiClaude Starts**. With Launch at Login on, your accounts are waiting every morning.
 - **Duplicate a profile.** **Duplicate as New Profile** clones a profile's whole data folder, sign-in and chats included, into a new one. Handy for keeping your current history under a name like "Personal" before signing the default app in to another account. On APFS the copy is instant and takes no extra space.
 - **Right-click** a profile to rename it, move it, show its data folder in Finder, copy a shell alias for it, take it off the list, or delete it with **Delete Profile…**.
 - **Imports your setup.** First launch picks up your default Claude account, any `--user-data-dir` aliases in `~/.zshrc`, and any `Claude-*` folder in Application Support. A `Claude-*` folder created later, by an alias for example, joins the list on its own.
 - **Folders follow names.** Rename a profile and its folder becomes `Claude-<Name>` the next time that account is closed. A link stays at the old path, so old aliases and Claude's own saved paths keep working.
+- **Quit them all together.** Turn on **Quit Profiles with MultiClaude** and quitting MultiClaude closes every account it opened.
+- **Survives Claude updates.** When Claude updates itself it relaunches on the default account, which breaks every `--user-data-dir` setup. MultiClaude notices and reopens each profile on its own account.
+
+### Sign-in
+
 - **Sign-in that lands in the right window.** Claude's Google and SSO sign-in normally comes back to whichever Claude window opened first. MultiClaude makes each account sign in inside its own window, with nothing to click first.
-- **Keep your Mac awake.** The **Keep Awake** section holds off sleep until you turn it off or for a set time (15 minutes to 8 hours, or anything up to 24 hours on the slider), with a countdown and a bolt in the menu bar. Options cover the display, a closed lid, power and battery triggers, a left-click toggle and ⌃⌥⌘A. Handy for long Claude Code runs.
-- **Keep-awake only, if you like.** Turn off **Manage Claude Accounts** and MultiClaude leaves Claude alone and keeps just the keep-awake and scroll features. Your profiles wait for you to turn it back on.
+
+See [Fix Google or SSO sign-in for a second Claude account](docs/guides/fix-google-sso-sign-in-for-a-second-claude-account.md).
+
+### Telling accounts apart
+
+- **A color per account.** Each profile gets its own color, so you can tell Personal from Work at a glance. Right-click to change it.
+- **An app and an icon for each account.** Turn on **Colored Claude Icon per Account** (App for Each Profile in earlier versions) and MultiClaude makes a small app per profile in `~/Applications/MultiClaude Launchers`, named "Claude Work", "Claude Client" and so on, with Claude's own icon recolored in the profile's color. Find them in Spotlight and Launchpad, or right-click a profile and choose **Add to Dock**. Rename one with **Rename App…**. Each account's window then runs with that icon too, in the Dock, ⌘-Tab and Mission Control, so you can tell them apart while they're open. The apps follow renames and color changes, and go away with their profile.
+- **Know which account is in front.** While a Claude window is active, the menu bar shows its account name in that account's color.
+
+### Claude Code, MCP servers and usage
+
+- **Claude Code per account.** Right-click a profile and choose **Open Claude Code in Terminal**: the CLI runs signed in as that account, with its own `CLAUDE_CONFIG_DIR`.
+- **Account groups.** Right-click a profile and choose **Group…**. Accounts in one group share Claude Code (memory, `CLAUDE.md`, skills, plugins, settings and session history); an account alone in its group keeps its own. Handy to keep a work account's Claude Code apart from your personal ones. MultiClaude checks that each grouped account's Code tab sessions really use the group's folder and tells you what to set if not.
+- **Copy MCP servers between accounts.** Set your MCP servers up once, then right-click another profile and choose **Copy MCP Servers From**. Its config is backed up first.
 - **Token usage per account and in all.** Claude Code logs every reply's tokens on your Mac (Code tab, Cowork and terminal). MultiClaude credits each session to the account it ran in and shows today's output per account in the panel, plus a window with a 6-month heatmap, each account's share, and a by-model table. Regular chats keep no token counts on the Mac; turn on **Show Chat Limits** for each account's 5-hour and weekly limits from claude.ai.
 - **Keeps your Claude Code conversations.** Claude Code deletes transcripts after 30 days by default. MultiClaude keeps a copy of each one per account (an APFS clone, so no extra space while the original exists), lists them with search, shows them, and exports any one to Markdown.
+
+Guides: [Claude Code with multiple accounts](docs/guides/claude-code-multiple-accounts-claude-config-dir.md), [account groups](docs/guides/share-claude-code-between-accounts-with-groups.md), [MCP servers](docs/guides/copy-mcp-servers-between-claude-profiles.md), [token usage](docs/guides/track-claude-code-token-usage-per-account.md).
+
+### Keep Awake and scrolling
+
+- **Keep your Mac awake.** The **Keep Awake** section holds off sleep until you turn it off or for a set time (15 minutes to 8 hours, or anything up to 24 hours on the slider), with a countdown and a bolt in the menu bar. Options cover the display, a closed lid, power and battery triggers, a left-click toggle and ⌃⌥⌘A. Handy for long Claude Code runs.
 - **Lid closed, done right.** Turn on **Keep Awake with Lid Closed** for long agent runs. When the lid closes, each of these is its own option, on by default:
   - **Turn the Screen Off**, **Mute Sound** and **Pause Chat Apps** (Slack, WhatsApp and Discord with their helpers stop syncing and pinging; meeting and recording apps are never paused),
   - **Low Power Mode** while the lid is closed, and **Low Power Mode Below 40%** on battery,
   - **Ease Off When Hot**: Low Power Mode when the Mac runs hot, and the session ends when it gets critical.
 
   Opening the lid undoes all of it, and MultiClaude only turns off a Low Power Mode it turned on. If MultiClaude is gone while a session had changed something, a small recovery agent puts it back within a minute. **No Password Prompt** (optional) installs one sudoers rule so the sleep and Low Power Mode commands stop asking for your password. Design after [Insomnia](https://github.com/krishhgg/Insomnia).
+- **Keep-awake only, if you like.** Turn off **Manage Claude Accounts** and MultiClaude leaves Claude alone and keeps just the keep-awake and scroll features. Your profiles wait for you to turn it back on.
 - **Scroll your own way.** Reverse the scroll direction of a mouse and a trackpad separately, in Settings (needs Accessibility permission). Smooth-scrolling mice, like an MX Master with Logi Options+, follow the mouse setting.
-- **Quit them all together.** Turn on **Quit Profiles with MultiClaude** and quitting MultiClaude closes every account it opened.
+
+### The app
+
 - **Global shortcuts.** ⌃⌥⌘M opens the panel; turn on Profile Shortcuts and ⌃⌥1 to ⌃⌥9 jump straight to each account.
 - **Updates itself.** Once a day MultiClaude checks for a new release, installs it in the background and restarts while the panel is closed. Your Claude windows stay open. Set **Update MultiClaude** in Settings to **Ask First** to get a window with the release notes and Install, Later or Skip This Version instead, or to **Off** to stop checking. **Check for Updates…** in the panel, or `multiclaude update` in the terminal, checks right away in any mode.
 - **Launch at login**, light and dark mode, colored menu bar icon.
 - **Small.** Two Swift files, no dependencies, a 1.6 MB download.
+
+How updates are checked: [How MultiClaude updates are verified](docs/guides/how-multiclaude-updates-are-verified.md).
 
 <p align="center">
 <picture>
@@ -101,6 +144,17 @@ MultiClaude is that trick with a proper interface.
   <img src="preview/settings-light.png" width="300" alt="The MultiClaude panel with its Settings section open">
 </picture>
 </p>
+
+## Use cases
+
+- Use MultiClaude to keep a personal Pro or Max plan and a Team or Enterprise seat open at the same time.
+- Use MultiClaude to give each client its own Claude organization, so their projects and data never mix.
+- Use MultiClaude to try a setup on a test account before rolling it out to a team.
+- Use MultiClaude to run Claude Code signed in as a specific account (`multiclaude code work`), or to share one Claude Code memory and skill set between some accounts with [account groups](docs/guides/share-claude-code-between-accounts-with-groups.md).
+- Use MultiClaude to set MCP servers up once and copy them to every account.
+- Use MultiClaude to see Claude Code token usage per account and keep Claude Code transcripts past their 30-day cleanup.
+- Use MultiClaude to keep your Mac awake, lid closed if you like, during long Claude Code runs.
+- Use MultiClaude to replace a set of `--user-data-dir` shell aliases; it imports them on first launch.
 
 ## Install
 
@@ -171,7 +225,7 @@ The app is optional. The command and the app share one account list. While Multi
 - `usage` reads the Claude Code transcripts itself and keeps the same counts file as the app;
 - `awake` runs `caffeinate` in the background, for the set minutes or until `awake off`.
 
-It's written in Go and lives in [`cli/`](cli).
+It's written in Go and lives in [`cli/`](cli). Every command, alias and `multiclaude://` link: [multiclaude command line reference](docs/guides/multiclaude-cli-reference.md).
 
 ## How it works
 
@@ -187,13 +241,29 @@ It's written in Go and lives in [`cli/`](cli).
 
 MultiClaude has **no analytics**. Its only network requests are the daily update check and, if you turn on **Show Chat Limits**, claude.ai's usage numbers. The update check: it asks GitHub for this repo's latest release, and downloads it from GitHub when it's newer. Every release is signed with a private key kept outside this repository, and MultiClaude refuses any update whose signature doesn't match the public key built into the app. It also checks the bundle identifier, the version and the code signature before swapping itself. Set **Update MultiClaude** to **Off** in Settings to stop it. **Usage and conversations** are read and kept on your Mac only: MultiClaude reads Claude Code's transcripts (in `~/.claude` and each account's folder) to count tokens, and keeps copies in `~/Library/Application Support/MultiClaude/Archive`, readable only by you. Turn off **Track Token Usage** and **Keep Claude Code Conversations** to stop both; delete that folder to remove the copies. **Show Chat Limits** is off until you turn it on and confirm: it then reads each account's claude.ai sign-in cookie (macOS asks you to allow "Claude Safe Storage" in the Keychain) and sends it to claude.ai only, never anywhere else; it is kept in memory and never written or logged. It does not modify the Claude app. The scroll reverser, when you turn it on, flips the direction of scroll events as they pass and keeps nothing. **Keep Awake with Lid Closed** asks for your password for each `pmset` change, unless you install **No Password Prompt**: that writes `/etc/sudoers.d/multiclaude` (checked with `visudo`), which lets the four `pmset` commands for sleep and Low Power Mode run without a password. Any app running as you could run those four commands too. Remove the rule from the same row. Removing a profile only takes it off the list: the folder stays on disk until you delete it yourself.
 
+## Comparison with other ways to run several Claude accounts
+
+As of November 2026, based on how each approach works.
+
+| | Sign out and back in | claude.ai in separate browser profiles | `--user-data-dir` shell aliases | MultiClaude |
+| --- | :---: | :---: | :---: | :---: |
+| Accounts open at once | one | one per browser profile | one per alias | one per profile |
+| Uses the Claude desktop app | yes | no, the web app | yes | yes |
+| Extra software | none | none | none | MultiClaude (Apache 2.0) |
+| See which accounts are open | n/a | n/a | no | live, in the menu bar |
+| Google or SSO sign-in lands in the right window | n/a | n/a | not always | yes, with the sign-in relay |
+| Accounts reopen on their own folder after Claude updates | n/a | n/a | no | yes |
+| Claude Code per account | set `CLAUDE_CONFIG_DIR` yourself | set `CLAUDE_CONFIG_DIR` yourself | set `CLAUDE_CONFIG_DIR` yourself | `multiclaude code <account>`, or a menu item |
+
+More detail: [Run Claude desktop with a separate profile using --user-data-dir](docs/guides/run-claude-desktop-with-user-data-dir.md).
+
 ## FAQ
 
 **Is this made by Anthropic?**
 No. MultiClaude is an independent open source tool. It launches the official Claude app and does not change it.
 
 **Does it work with Claude Code?**
-Yes. In the desktop app, each Claude window and the Code tab inside it run with the account of its profile. For the CLI, run `multiclaude code <profile>`, right-click a profile and choose **Open Claude Code in Terminal**, or **Copy Claude Code Alias** for your shell. Each profile gets its own `~/.claude-<name>` folder, and Claude Code keeps a separate sign-in for each.
+Yes. In the desktop app, each Claude window and the Code tab inside it run with the account of its profile. For the CLI, run `multiclaude code <profile>`, right-click a profile and choose **Open Claude Code in Terminal**, or **Copy Claude Code Alias** for your shell. Each profile gets its own `~/.claude-<name>` folder, and Claude Code keeps a separate sign-in for each. `eval "$(multiclaude env work)"` points the current shell at an account. See [Use Claude Code with multiple accounts](docs/guides/claude-code-multiple-accounts-claude-config-dir.md).
 
 **Can I still use my aliases?**
 Yes. MultiClaude reads the same folders, so an account opened from an alias shows as running in the panel. Right-click a profile and choose **Copy Shell Alias** to get one for a new profile.
@@ -212,6 +282,51 @@ Right-click it and choose **Delete Profile…**. MultiClaude closes the account 
 
 **What about Windows and Linux?**
 MultiClaude is a native macOS app. A port is welcome.
+
+**How do I run two Claude accounts at the same time on a Mac?**
+Install MultiClaude, click **New Profile**, name it, click it and sign in to the second account in the window that opens. Each profile is its own Claude data folder. Step by step: [How to use two Claude accounts at the same time on a Mac](docs/guides/use-two-claude-accounts-at-the-same-time-on-mac.md).
+
+**Is MultiClaude free?**
+Yes. It's open source under the Apache License 2.0, with no paid tier. Each Claude account keeps its own Anthropic plan.
+
+**Does MultiClaude change the Claude app or see my password?**
+No. It starts the official Claude app with `--user-data-dir` and never touches Claude.app. Profile icons use APFS-cloned copies whose signed contents stay Anthropic's. You sign in inside Claude's own window; MultiClaude only reads a sign-in cookie if you turn on **Show Chat Limits**, and then sends it to claude.ai only.
+
+**Does MultiClaude collect data?**
+No. It has no analytics. Its only network requests are the daily update check on GitHub and, if you turn it on, claude.ai's usage numbers. See [Privacy](#privacy).
+
+**Can I share MCP servers between Claude accounts?**
+Yes. Right-click a profile, **Copy MCP Servers From**, or run `multiclaude mcp copy <from> <to>`. The target's `claude_desktop_config.json` is backed up first. See [Share MCP servers between Claude profiles](docs/guides/copy-mcp-servers-between-claude-profiles.md).
+
+**How do I know an update is genuine?**
+Each release zip is signed with an Ed25519 key kept outside the repository, and MultiClaude refuses any update whose signature doesn't match the public key built into the app. See [How MultiClaude updates are verified](docs/guides/how-multiclaude-updates-are-verified.md).
+
+**Why does macOS refuse to open MultiClaude the first time?**
+It isn't notarized by Apple yet. Right-click the app and choose **Open**, or run `xattr -dr com.apple.quarantine /Applications/MultiClaude.app`. Homebrew installs avoid the manual step.
+
+## Documentation
+
+Guides, one question each:
+
+- [How to use two Claude accounts at the same time on a Mac](docs/guides/use-two-claude-accounts-at-the-same-time-on-mac.md)
+- [How to run Claude desktop with a separate profile using --user-data-dir](docs/guides/run-claude-desktop-with-user-data-dir.md)
+- [How to use Claude Code with multiple accounts (CLAUDE_CONFIG_DIR)](docs/guides/claude-code-multiple-accounts-claude-config-dir.md)
+- [How to share Claude Code between some Claude accounts and keep others apart](docs/guides/share-claude-code-between-accounts-with-groups.md)
+- [How to fix Google or SSO sign-in for a second Claude account](docs/guides/fix-google-sso-sign-in-for-a-second-claude-account.md)
+- [How to share MCP servers between Claude profiles](docs/guides/copy-mcp-servers-between-claude-profiles.md)
+- [How to track Claude Code token usage per account](docs/guides/track-claude-code-token-usage-per-account.md)
+- [multiclaude command line reference](docs/guides/multiclaude-cli-reference.md)
+- [How to install MultiClaude with Homebrew](docs/guides/install-multiclaude-with-homebrew.md)
+- [How MultiClaude updates are verified (Ed25519 signatures)](docs/guides/how-multiclaude-updates-are-verified.md)
+
+Also in this repository:
+
+- [CHANGELOG.md](CHANGELOG.md): release notes for every version
+- [CONTRIBUTING.md](CONTRIBUTING.md): bug reports, feature ideas, pull requests
+- [AGENTS.md](AGENTS.md): build, test and layout notes for coding agents
+- [specs/](specs): design notes, such as account groups
+- [llms.txt](llms.txt): a map of these docs for language models
+- [Website](https://quentincar0n.github.io/multiclaude/)
 
 ## Build from source
 
@@ -238,6 +353,10 @@ Push a `v*` tag and [GitHub Actions](.github/workflows/release.yml) builds a uni
 ## Contributing
 
 Issues and pull requests are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md). Ideas on the list: notarized builds, keyboard and VoiceOver access to the profile rows, and a Windows port.
+
+## Related
+
+- [QuentinCar0n/homebrew-tap](https://github.com/QuentinCar0n/homebrew-tap): the Homebrew tap that carries the `multiclaude` cask.
 
 ## License
 
