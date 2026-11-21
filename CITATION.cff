@@ -1,0 +1,22 @@
+cff-version: 1.2.0
+message: "If you use MultiClaude in your work, please cite it as below."
+title: MultiClaude
+type: software
+authors:
+  - given-names: Quentin
+    family-names: Caron
+abstract: >-
+  A free, open source macOS menu bar app that runs several Claude desktop
+  accounts side by side, one profile (one --user-data-dir folder) per account,
+  with a Go command line tool, multiclaude. Not affiliated with Anthropic.
+version: "1.11"
+date-released: 2026-11-18
+license: Apache-2.0
+repository-code: https://github.com/QuentinCar0n/multiclaude
+url: https://quentincar0n.github.io/multiclaude/
+keywords:
+  - claude
+  - macos
+  - menu-bar-app
+  - multiple-accounts
+  - claude-code

@@ -1,0 +1,38 @@
+# MultiClaude
+
+> MultiClaude is a free, open source (Apache 2.0) macOS menu bar app that runs several Claude desktop accounts side by side on one Mac, one profile per account, each started with its own `--user-data-dir` folder. It routes Google and SSO sign-in to the right window, reopens profiles after Claude updates itself, runs Claude Code per account with `CLAUDE_CONFIG_DIR`, copies MCP servers between profiles, counts Claude Code tokens per account, keeps the Mac awake, and ships a Go command line tool, `multiclaude`. Current version 1.11 (2026-11-18). Unofficial: not affiliated with or endorsed by Anthropic.
+
+- Platforms: macOS 15 or later, Apple silicon and Intel (universal binary).
+- Install: `brew install --cask quentincar0n/tap/multiclaude`, or the zip from GitHub Releases (not notarized: right-click, Open the first time).
+- Requires the Claude desktop app in /Applications. MultiClaude launches it unchanged.
+- App: Swift (main.swift, Groups.swift), no dependencies. CLI: Go, in cli/.
+- Homepage: https://quentincar0n.github.io/multiclaude/
+
+## Docs
+
+- [README](https://github.com/QuentinCar0n/multiclaude/blob/main/README.md): overview, features, install, how it works, privacy, comparison, FAQ
+- [CHANGELOG](https://github.com/QuentinCar0n/multiclaude/blob/main/CHANGELOG.md): release notes for every version, 1.0 to 1.11
+- [CONTRIBUTING](https://github.com/QuentinCar0n/multiclaude/blob/main/CONTRIBUTING.md): bug reports, feature requests, pull requests
+- [AGENTS.md](https://github.com/QuentinCar0n/multiclaude/blob/main/AGENTS.md): build, test and repository layout for coding agents
+
+## Guides
+
+- [How to use two Claude accounts at the same time on a Mac](https://github.com/QuentinCar0n/multiclaude/blob/main/docs/guides/use-two-claude-accounts-at-the-same-time-on-mac.md): profiles, folders and the steps to add a second account
+- [How to run Claude desktop with a separate profile using --user-data-dir](https://github.com/QuentinCar0n/multiclaude/blob/main/docs/guides/run-claude-desktop-with-user-data-dir.md): the manual open command, alias limits, folder naming
+- [How to use Claude Code with multiple accounts (CLAUDE_CONFIG_DIR)](https://github.com/QuentinCar0n/multiclaude/blob/main/docs/guides/claude-code-multiple-accounts-claude-config-dir.md): one Claude Code folder per account, multiclaude code and env
+- [How to share Claude Code between some Claude accounts and keep others apart](https://github.com/QuentinCar0n/multiclaude/blob/main/docs/guides/share-claude-code-between-accounts-with-groups.md): account groups and their folders
+- [How to fix Google or SSO sign-in for a second Claude account](https://github.com/QuentinCar0n/multiclaude/blob/main/docs/guides/fix-google-sso-sign-in-for-a-second-claude-account.md): why claude:// links land in the wrong window and the fix
+- [How to share MCP servers between Claude profiles](https://github.com/QuentinCar0n/multiclaude/blob/main/docs/guides/copy-mcp-servers-between-claude-profiles.md): Copy MCP Servers From and multiclaude mcp copy
+- [How to track Claude Code token usage per account](https://github.com/QuentinCar0n/multiclaude/blob/main/docs/guides/track-claude-code-token-usage-per-account.md): usage window, multiclaude usage, conversation archive
+- [multiclaude command line reference](https://github.com/QuentinCar0n/multiclaude/blob/main/docs/guides/multiclaude-cli-reference.md): every command, alias and multiclaude:// link
+- [How to install MultiClaude with Homebrew](https://github.com/QuentinCar0n/multiclaude/blob/main/docs/guides/install-multiclaude-with-homebrew.md): cask, manual install, build from source
+- [How MultiClaude updates are verified (Ed25519 signatures)](https://github.com/QuentinCar0n/multiclaude/blob/main/docs/guides/how-multiclaude-updates-are-verified.md): signature, bundle and codesign checks, release workflow
+
+## Optional
+
+- [main.swift](https://github.com/QuentinCar0n/multiclaude/blob/main/main.swift): the app (profiles, sign-in relay, updater, usage, keep-awake)
+- [Groups.swift](https://github.com/QuentinCar0n/multiclaude/blob/main/Groups.swift): account groups and their Claude Code folders
+- [cli/main.go](https://github.com/QuentinCar0n/multiclaude/blob/main/cli/main.go): the multiclaude command and its usage text
+- [Account groups design](https://github.com/QuentinCar0n/multiclaude/blob/main/specs/2026-11-16-account-groups-design.md): design notes for account groups
+- [Release workflow](https://github.com/QuentinCar0n/multiclaude/blob/main/.github/workflows/release.yml): how releases are built, tested, signed and published
+- [LICENSE](https://github.com/QuentinCar0n/multiclaude/blob/main/LICENSE): Apache License 2.0
