@@ -25,9 +25,17 @@ MultiClaude is a free, open source macOS menu bar app for people with more than 
 brew install --cask quentincar0n/tap/multiclaude
 ```
 
-[**Download the latest release**](https://github.com/QuentinCar0n/multiclaude/releases/latest) &nbsp;&middot;&nbsp; [Website](https://quentincar0n.github.io/multiclaude/) &nbsp;&middot;&nbsp; [Why](#why) &nbsp;&middot;&nbsp; [Features](#features) &nbsp;&middot;&nbsp; [How it works](#how-it-works) &nbsp;&middot;&nbsp; [FAQ](#faq) &nbsp;&middot;&nbsp; [Docs](#documentation)
+[**Quick start**](#quick-start) &nbsp;&middot;&nbsp; [Download the latest release](https://github.com/QuentinCar0n/multiclaude/releases/latest) &nbsp;&middot;&nbsp; [Website](https://quentincar0n.github.io/multiclaude/) &nbsp;&middot;&nbsp; [Why](#why) &nbsp;&middot;&nbsp; [Features](#features) &nbsp;&middot;&nbsp; [How it works](#how-it-works) &nbsp;&middot;&nbsp; [FAQ](#faq) &nbsp;&middot;&nbsp; [Docs](#documentation)
 
 </div>
+
+## Quick start
+
+1. Install it with `brew install --cask quentincar0n/tap/multiclaude`. You'll also need the [Claude desktop app](https://claude.ai/download) in `/Applications`.
+2. Open MultiClaude from Applications. A ✳ icon shows up in the menu bar, and your current Claude account is already the first profile.
+3. Click the ✳, then **New Profile**, type a name like `Work` and press Return. Click the new profile and sign in to your other account in the Claude window that opens.
+
+No Homebrew? Grab the zip from [Install](#install).
 
 ## At a glance
 
