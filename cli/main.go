@@ -21,6 +21,8 @@ import (
 	"syscall"
 	"text/tabwriter"
 	"time"
+
+	"github.com/QuentinCar0n/multiclaude/cli/internal/logging"
 )
 
 var version = "dev" // set by build.sh with -ldflags "-X main.version=..."
@@ -59,8 +61,20 @@ Mac:
 The MultiClaude app is optional: the CLI shares its account list and hands it actions while it runs.
 `
 
+// startLogging installs the process logger in CLI mode: console lines on stderr, no timestamp.
+// Nothing is logged on the happy path; the user-facing output stays on stdout as it is. LOG_LEVEL=debug
+// adds the detail a bug report needs. out nil means stderr.
+func startLogging(out io.Writer) {
+	logging.Init(logging.Options{Service: "multiclaude", Version: version, Env: os.Getenv("ENV"), CLI: true, Out: out})
+}
+
 func main() {
+	startLogging(nil)
 	if err := run(os.Args[1:], os.Stdout); err != nil {
+		// The line the user reads stays as it is; the log line repeats it with its event name
+		// at debug, so it only shows with LOG_LEVEL=debug.
+		clog := logging.Module("cli")
+		clog.Debug().Err(err).Msg("command_failed")
 		fmt.Fprintln(os.Stderr, "multiclaude:", err)
 		os.Exit(1)
 	}
