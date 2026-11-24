@@ -67,14 +67,14 @@ func TestModuleTagsEveryLine(t *testing.T) {
 	var buf bytes.Buffer
 	Init(Options{Level: "info", Format: FormatJSON, Out: &buf})
 
-	moduleLogger := Module("soma")
+	moduleLogger := Module("app")
 	moduleLogger.Info().Msg("hello")
 
 	var line map[string]any
 	if err := json.Unmarshal(buf.Bytes(), &line); err != nil {
 		t.Fatalf("output is not JSON: %v", err)
 	}
-	if line["module"] != "soma" {
+	if line["module"] != "app" {
 		t.Fatalf("module tag missing: %v", line)
 	}
 }
@@ -106,7 +106,7 @@ func TestInitSetsTheZerologGlobal(t *testing.T) {
 	var buf bytes.Buffer
 	Init(Options{Level: "info", Format: FormatJSON, Out: &buf})
 
-	// This is the whole reason demeter's 394 sites need no edits: they call the
+	// This is the whole reason existing call sites need no edits: they call the
 	// package-level helpers of rs/zerolog/log, which delegate to this global.
 	zerologlog.Info().Msg("from the global")
 

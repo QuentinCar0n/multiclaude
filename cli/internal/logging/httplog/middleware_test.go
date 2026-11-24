@@ -13,10 +13,10 @@ import (
 )
 
 // harness builds a mux with the chain mounted, at debug so every level shows,
-// under the module "soma".
+// under the module "app".
 func harness(t *testing.T, register func(*http.ServeMux)) (*bytes.Buffer, http.Handler) {
 	t.Helper()
-	return harnessFor(t, "soma", register)
+	return harnessFor(t, "app", register)
 }
 
 // harnessFor is harness with the module named explicitly, so a test can check
@@ -214,8 +214,8 @@ func TestPanicBecomes500AndOneErrorLineWithAStack(t *testing.T) {
 }
 
 func TestFlusherAndHijackerSurviveTheWrapper(t *testing.T) {
-	// soma's sync_progress.go type-asserts http.Flusher behind an ok check for
-	// its text/event-stream response, and demeter's two WebSocket upgraders
+	// Handlers type-assert http.Flusher behind an ok check for
+	// a text/event-stream response, and WebSocket upgraders
 	// need http.Hijacker. A hand-rolled ResponseWriter wrapper answers false to
 	// both and breaks them silently.
 	var sawFlusher bool
@@ -237,7 +237,7 @@ func TestNonMuxHandlerStillWorks(t *testing.T) {
 	plain := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusTeapot)
 	})
-	h := Middleware(logger, "soma")(plain)
+	h := Middleware(logger, "app")(plain)
 
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, httptest.NewRequest("GET", "/x", nil))
@@ -252,10 +252,10 @@ func TestNonMuxHandlerStillWorks(t *testing.T) {
 
 // TestModuleFieldAppearsExactlyOnceAcrossModules is F4: hlog.NewHandler already
 // seeds the request logger with "module", so accessLine must not add it a
-// second time on any listener, soma and demeter (and every other module)
+// second time on any listener, whatever the module
 // alike.
 func TestModuleFieldAppearsExactlyOnceAcrossModules(t *testing.T) {
-	for _, module := range []string{"soma", "demeter"} {
+	for _, module := range []string{"app", "worker"} {
 		buf, h := harnessFor(t, module, func(mux *http.ServeMux) {
 			mux.HandleFunc("GET /x", func(w http.ResponseWriter, r *http.Request) {})
 		})
@@ -363,7 +363,7 @@ func TestPanicGives500(t *testing.T) {
 func TestNoMetricsOption(t *testing.T) {
 	var buf bytes.Buffer
 	logger := zerolog.New(&buf).Level(zerolog.DebugLevel)
-	h := Middleware(logger, "soma")(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	h := Middleware(logger, "app")(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusAccepted)
 	}))
 

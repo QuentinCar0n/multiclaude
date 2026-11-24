@@ -24,9 +24,8 @@ import (
 // hlog.AccessHandler does the ResponseWriter wrapping, and that is not a detail
 // to reimplement: its mutil.WrapWriter re-exposes http.Flusher, http.Hijacker
 // and io.ReaderFrom on the wrapped writer. A hand-rolled wrapper answers false
-// to the first two, which silently breaks soma's text/event-stream response in
-// sync_progress.go and both of demeter's WebSocket upgraders, one of which is
-// the connection the iOS app holds open.
+// to the first two, which silently breaks text/event-stream responses and
+// WebSocket upgraders.
 func Middleware(logger zerolog.Logger, module string, opts ...Option) func(http.Handler) http.Handler {
 	cfg := config{}
 	for _, opt := range opts {
@@ -67,7 +66,7 @@ func Middleware(logger zerolog.Logger, module string, opts ...Option) func(http.
 
 // Option customises Middleware. The shared package knows nothing about any
 // metrics library: a repo that wants counters supplies the hooks, see
-// WithMetrics in Soma_Backend's metrics.go.
+// WithMetrics in the canonical repo's metrics.go.
 type Option func(*config)
 
 // config holds the optional hooks. Both are nil-safe: Middleware never calls

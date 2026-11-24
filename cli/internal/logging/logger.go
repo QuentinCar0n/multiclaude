@@ -3,9 +3,8 @@
 //
 // This package is the canonical copy (see VERSION). Other repos hold identical
 // copies written by scripts/sync-logging.sh, so the shared files import only
-// the standard library and github.com/rs/zerolog. Anything specific to
-// Soma_Backend lives in backend.go and httplog/metrics.go, which are never
-// copied.
+// the standard library and github.com/rs/zerolog. Anything specific to the
+// canonical repo lives in files that are never copied.
 package logging
 
 import (
@@ -39,8 +38,8 @@ type Options struct {
 	// resolves to console when Out is a terminal and JSON otherwise.
 	Format string
 	// Out defaults to os.Stdout, or os.Stderr in CLI mode. Never stderr for a
-	// service: two streams of different nature in one container is what
-	// demeter used to do.
+	// service: two streams of different nature in one container is what one
+	// service used to do.
 	Out io.Writer
 	// Extra also receives every JSON line (an OTLP or Loki hook). Nil by
 	// default.

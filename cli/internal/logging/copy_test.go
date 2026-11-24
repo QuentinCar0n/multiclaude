@@ -11,7 +11,7 @@ import (
 )
 
 // sharedFiles is the list of files copied between repos and hashed, in hash
-// order. The sync script in Soma_Backend keeps the same list.
+// order. The sync script of the canonical repo keeps the same list.
 var sharedFiles = []string{
 	"VERSION",
 	"logger.go",
@@ -63,7 +63,7 @@ func readChecksumFile(t *testing.T) (importPath, sum string) {
 }
 
 // TestCopyChecksum fails when a shared file differs from the canonical copy.
-// Change the package in Soma_Backend/pkg/logging, then run
+// Change the canonical package, then run
 // scripts/sync-logging.sh again; never edit a copy by hand.
 func TestCopyChecksum(t *testing.T) {
 	importPath, want := readChecksumFile(t)
