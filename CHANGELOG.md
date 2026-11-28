@@ -1,5 +1,10 @@
 # MultiClaude release notes
 
+## 1.12 (build 20), 2026-11-27
+
+### New
+- **Screen Off After 1 Minute Idle.** A new Keep Awake setting under General. While keep-awake is on, the screen turns off after one minute without keyboard, mouse or trackpad input, to spare the display. The Mac itself stays awake, so Claude keeps working. Any input turns the screen back on, and the next idle minute turns it off again.
+
 ## 1.11 (build 19), 2026-11-18
 
 ### New

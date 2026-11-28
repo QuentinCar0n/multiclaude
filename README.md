@@ -128,6 +128,7 @@ Guides: [Claude Code with multiple accounts](docs/guides/claude-code-multiple-ac
 ### Keep Awake and scrolling
 
 - **Keep your Mac awake.** The **Keep Awake** section holds off sleep until you turn it off or for a set time (15 minutes to 8 hours, or anything up to 24 hours on the slider), with a countdown and a bolt in the menu bar. Options cover the display, a closed lid, power and battery triggers, a left-click toggle and ⌃⌥⌘A. Handy for long Claude Code runs.
+- **Screen off after a minute.** Turn on **Screen Off After 1 Minute Idle** and, while keep-awake runs, the screen turns off after one minute without input to spare the display. The Mac stays awake and any input brings the screen back.
 - **Lid closed, done right.** Turn on **Keep Awake with Lid Closed** for long agent runs. When the lid closes, each of these is its own option, on by default:
   - **Turn the Screen Off**, **Mute Sound** and **Pause Chat Apps** (Slack, WhatsApp and Discord with their helpers stop syncing and pinging; meeting and recording apps are never paused),
   - **Low Power Mode** while the lid is closed, and **Low Power Mode Below 40%** on battery,
