@@ -18,7 +18,8 @@ import (
 )
 
 // Keep-awake without the app: a detached caffeinate holds the same kind of assertion the app holds
-// (idle sleep, and display sleep unless the app's "Allow Display Sleep" is on), for a set time or
+// (idle sleep, and display sleep unless the app's "Allow Display Sleep" or "Screen Off After 1 Minute
+// Idle" is on; without the app the screen then follows the system's own display sleep), for a set time or
 // until `multiclaude awake off`. Its pid and end time live in cli-awake.json. With the app running,
 // the app does it, so its panel and timers stay in charge.
 
@@ -74,7 +75,7 @@ func caffeinateArgs(minutes int, allowDisplaySleep bool) []string {
 
 func startCLIAwake(minutes int) error {
 	stopCLIAwake()
-	cmd := exec.Command("/usr/bin/caffeinate", caffeinateArgs(minutes, readSettingBool("awake.allowDisplaySleep", false))...)
+	cmd := exec.Command("/usr/bin/caffeinate", caffeinateArgs(minutes, readSettingBool("awake.allowDisplaySleep", false) || readSettingBool("awake.screenOffIdle", false))...)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true} // outlives the terminal
 	if err := cmd.Start(); err != nil {
 		return fmt.Errorf("couldn't start caffeinate: %w", err)

@@ -2304,7 +2304,7 @@ enum Recovery {
 // MARK: - Keep awake and scroll direction (ported from Cocaine)
 
 enum AwakeSetting: String, CaseIterable, Identifiable {
-    case activateAtLaunch, leftClick, shortcut, allowDisplaySleep, lidClosed
+    case activateAtLaunch, leftClick, shortcut, allowDisplaySleep, screenOffIdle, lidClosed
     case lidScreenOff, lidMute, lidFreeze, lidLowPower
     case notifications, powerConnect, powerDisconnect, lowBattery, batteryLowPower, heatRules
 
@@ -2312,7 +2312,7 @@ enum AwakeSetting: String, CaseIterable, Identifiable {
     static let onByDefault: Set<AwakeSetting> = [.lidScreenOff, .lidMute, .lidFreeze, .heatRules]
     static let needsHelper: Set<AwakeSetting> = [.lidLowPower, .batteryLowPower]
     static let groups: [(String, [AwakeSetting])] = [
-        ("General", [.activateAtLaunch, .leftClick, .shortcut, .allowDisplaySleep, .notifications]),
+        ("General", [.activateAtLaunch, .leftClick, .shortcut, .allowDisplaySleep, .screenOffIdle, .notifications]),
         ("Lid", [.lidClosed, .lidScreenOff, .lidMute, .lidFreeze, .lidLowPower]),
         ("Power", [.powerConnect, .powerDisconnect, .lowBattery, .batteryLowPower, .heatRules]),
     ]
@@ -2327,6 +2327,7 @@ enum AwakeSetting: String, CaseIterable, Identifiable {
         case .leftClick: "Activate with Left Click"
         case .shortcut: "Keyboard Shortcut"
         case .allowDisplaySleep: "Allow Display Sleep"
+        case .screenOffIdle: "Screen Off After 1 Minute Idle"
         case .lidClosed: "Keep Awake with Lid Closed"
         case .lidScreenOff: "Turn the Screen Off"
         case .lidMute: "Mute Sound"
@@ -2347,6 +2348,7 @@ enum AwakeSetting: String, CaseIterable, Identifiable {
         case .leftClick: "cursorarrow.click"
         case .shortcut: "command"
         case .allowDisplaySleep: "moon"
+        case .screenOffIdle: "timer"
         case .lidClosed: "laptopcomputer.and.arrow.down"
         case .lidScreenOff: "display"
         case .lidMute: "speaker.slash"
@@ -2467,7 +2469,7 @@ final class Awake: ObservableObject {
         }
         defaults.set(on, forKey: s.key)
         if s == .shortcut { Engine.shared.updateHotKeys() }
-        if s == .allowDisplaySleep && holding { takeAssertion() }
+        if (s == .allowDisplaySleep || s == .screenOffIdle) && holding { takeAssertion() }
         if s == .lidClosed {
             if active { setLid(on) }
             if on { Recovery.installAgent() }
@@ -2539,10 +2541,13 @@ final class Awake: ObservableObject {
         return h > 0 ? String(format: "%d:%02d:%02d left", h, m, sec) : String(format: "%d:%02d left", m, sec)
     }
 
+    // Screen Off After 1 Minute Idle needs the display free to sleep, so it holds the system-only assertion.
+    var letsDisplaySleep: Bool { isOn(.allowDisplaySleep) || isOn(.screenOffIdle) }
+
     @discardableResult
     private func takeAssertion() -> Bool {
         if holding { IOPMAssertionRelease(assertion) }
-        let type = (isOn(.allowDisplaySleep)
+        let type = (letsDisplaySleep
             ? kIOPMAssertionTypePreventUserIdleSystemSleep
             : kIOPMAssertionTypePreventUserIdleDisplaySleep) as CFString
         holding = IOPMAssertionCreateWithName(type, IOPMAssertionLevel(kIOPMAssertionLevelOn),
@@ -2554,6 +2559,7 @@ final class Awake: ObservableObject {
     private func onTick() {
         tick = Date()
         if let endDate, tick >= endDate { deactivate(reason: "Time is up, your Mac can sleep again."); return }
+        screenOffWhenIdle()
         // Floors every 30 s: critical heat ends the session, the rest is Low Power Mode.
         guard Int(tick.timeIntervalSince1970) % 30 == 0 else { return }
         if isOn(.heatRules) && ProcessInfo.processInfo.thermalState == .critical {
@@ -2561,6 +2567,29 @@ final class Awake: ObservableObject {
             return
         }
         updateLowPower()
+    }
+
+    // Saves the screen during long sessions: after a minute with no keyboard, mouse or trackpad input the
+    // display sleeps, once per idle stretch, while the Mac itself stays awake.
+    static let screenOffAfter: TimeInterval = 60
+    private var screenOffDone = false
+
+    private func screenOffWhenIdle() {
+        guard isOn(.screenOffIdle) else { screenOffDone = false; return }
+        let idle = CGEventSource.secondsSinceLastEventType(.combinedSessionState, eventType: CGEventType(rawValue: ~0)!)
+        if idle < Awake.screenOffAfter { screenOffDone = false; return }
+        guard !screenOffDone else { return }
+        screenOffDone = true
+        if LidObserver.shared.closed { return }
+        Awake.displaySleepNow()
+        Log.write("keep-awake: screen off after \(Int(Awake.screenOffAfter)) s idle")
+    }
+
+    static func displaySleepNow() {
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/usr/bin/pmset")
+        p.arguments = ["displaysleepnow"]
+        try? p.run()
     }
 
     // Lid-closed awake needs `pmset disablesleep`, which only root can set: password-free with the helper,
@@ -2579,12 +2608,7 @@ final class Awake: ObservableObject {
     func lidChanged(_ closed: Bool) {
         guard lidActionsLive else { return }
         if closed {
-            if isOn(.lidScreenOff) {
-                let p = Process()
-                p.executableURL = URL(fileURLWithPath: "/usr/bin/pmset")
-                p.arguments = ["displaysleepnow"]
-                try? p.run()
-            }
+            if isOn(.lidScreenOff) { Awake.displaySleepNow() }
             if isOn(.lidMute), let d = OutputMute.defaultDevice(), !OutputMute.isMuted(d), OutputMute.set(d, muted: true) {
                 mutedDevice = d
                 recovery.muted = true
@@ -5772,6 +5796,10 @@ if args.count == 2, args[1] == "--selftest-awake" {
         }
         a.setMinutes(saved)
         check("not active at start", !a.active && a.remainingText == nil)
+        check("screen off after idle is off by default", !AwakeSetting.onByDefault.contains(.screenOffIdle))
+        check("screen off after idle waits one minute", Awake.screenOffAfter == 60)
+        check("screen off after idle is listed under General",
+              AwakeSetting.groups.first { $0.0 == "General" }?.1.contains(.screenOffIdle) == true)
         check("keep-awake-only mode keeps its way back and the scroll settings",
               Setting.claudeOnly.isDisjoint(with: [.manageClaude, .reverseMouse, .reverseTrackpad, .launchAtLogin, .autoUpdate]))
         check("managing Claude is on by default", Setting.onByDefault.contains(.manageClaude))
